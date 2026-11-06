@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+*.dylib
+*.so
+san_test_bin
+*.dSYM/
+*.parquet
+*.duckdb
+telemetry-diag.log
+*.log
+parquet_checkpoint/core/corpus/
+fuzz_reader
+fuzz_shift
+fuzz_standln
+.coverage
+.coverage.*
+# packaging (pyproject.toml; editable installs write egg-info here)
+*.egg-info/
+build/
+dist/
+.venv/

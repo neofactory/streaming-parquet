@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "streaming-parquet"
+version = "0.1.0"
+description = "Live telemetry streaming and parquet archival: an Arrow ring, crash-durable parquet, one SQL view."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    "pyarrow>=14",   # Flight; concat_tables(promote_options=); __arrow_c_stream__
+    "cffi",          # ABI mode: arrow_ring builds its C core with `make` on first import
+]
+
+[project.optional-dependencies]
+duckdb = ["duckdb"]   # the DuckDB views (duckdb_live, duckdb_archive, duckdb_all)
+s3 = ["boto3"]        # S3Sink and s3:// stores
+
+[tool.setuptools]
+packages = ["arrow_ring", "parquet_checkpoint", "streaming_parquet"]
+
+[tool.setuptools.package-data]
+arrow_ring = ["core/Makefile", "core/arrow_ring.c", "core/arrow_ring.h"]
