@@ -136,6 +136,7 @@ typedef struct Leaf {
 
 typedef struct Pin {
   int64_t lo, hi;
+  bool ranged;        /* ar_pin: the caller named [lo, hi); no lease */
   double duration_s, t0_mono;
   int64_t *var_lo;    /* per var-leaf elem_lo, indexed by var ordinal */
   struct Pin *next;
@@ -642,6 +643,12 @@ static ArStatus wait_recyclable(ArRing *r, int64_t seq, int64_t block_ms) {
     if (pin_blocking(r, victim, &copy) == NULL) return AR_OK;
     double t = now_mono();
     if (t >= deadline) {
+      if (copy.ranged)
+        return err(AR_ERR_PIN_STALLED,
+                   "writer stalled at seq %lld: recycling seq %lld is blocked "
+                   "by a range pin [%lld, %lld) held %.1fs, a whole ring "
+                   "behind the writer", (long long)seq, (long long)victim,
+                   (long long)copy.lo, (long long)copy.hi, t - copy.t0_mono);
       return err(AR_ERR_PIN_STALLED,
                  "writer stalled at seq %lld: recycling seq %lld is blocked "
                  "by a record set [%lld, %lld) held %.1fs against a %.1fs "
@@ -1060,20 +1067,12 @@ void ar_recordset_detach(ArRecordSet *rs) {
 int64_t ar_recordset_lo(const ArRecordSet *rs) { return rs->lo; }
 int64_t ar_recordset_hi(const ArRecordSet *rs) { return rs->hi; }
 
-ArStatus ar_relation(ArRing *r, double duration_s, ArRecordSet **out) {
-  *out = NULL;
-  double excl_d = r->rate_peak * (duration_s + r->lease_margin_s);
-  int64_t exclusion = (int64_t)excl_d;
-  if ((double)exclusion < excl_d) exclusion++;
-  /* Exclude the rows the writer will RECYCLE during an honest hold:
-   * the recycle frontier after the hold is pending + exclusion -
-   * capacity. A ring that is not near full excludes nothing (the
-   * naive oldest+exclusion formula broke the archive+hot union view
-   * on cold start -- found by the exerciser 2026-08-19). */
-  int64_t lo = atomic_load(&r->pending) + exclusion - r->capacity;
-  int64_t oldest = ar_oldest_seq(r);
-  if (lo < oldest) lo = oldest;
-  int64_t hi = atomic_load(&r->committed);
+/* The record set over [lo, hi), both already clamped to the readable
+ * window: pinned when non-empty. Shared by ar_relation (the ring picks
+ * the range from a lease) and ar_pin (the caller names it). */
+static ArStatus make_relation(ArRing *r, int64_t lo, int64_t hi,
+                              double duration_s, bool ranged,
+                              ArRecordSet **out) {
   ArRecordSet *rs = calloc(1, sizeof(ArRecordSet));
   if (!rs) return err(AR_ERR_NOMEM, "record set");
   atomic_init(&rs->refs, 1);
@@ -1088,6 +1087,7 @@ ArStatus ar_relation(ArRing *r, double duration_s, ArRecordSet **out) {
   rs->lo = lo; rs->hi = hi;
   Pin *pin = calloc(1, sizeof(Pin));
   pin->lo = lo; pin->hi = hi;
+  pin->ranged = ranged;
   pin->duration_s = duration_s;
   pin->t0_mono = now_mono();
   pin->var_lo = calloc((size_t)(r->n_var ? r->n_var : 1), sizeof(int64_t));
@@ -1102,6 +1102,39 @@ ArStatus ar_relation(ArRing *r, double duration_s, ArRecordSet **out) {
   rs->pin = pin;
   *out = rs;
   return AR_OK;
+}
+
+ArStatus ar_relation(ArRing *r, double duration_s, ArRecordSet **out) {
+  *out = NULL;
+  double excl_d = r->rate_peak * (duration_s + r->lease_margin_s);
+  int64_t exclusion = (int64_t)excl_d;
+  if ((double)exclusion < excl_d) exclusion++;
+  /* Exclude the rows the writer will RECYCLE during an honest hold:
+   * the recycle frontier after the hold is pending + exclusion -
+   * capacity. A ring that is not near full excludes nothing (the
+   * naive oldest+exclusion formula broke the archive+hot union view
+   * on cold start -- found by the exerciser 2026-08-19). */
+  int64_t lo = atomic_load(&r->pending) + exclusion - r->capacity;
+  int64_t oldest = ar_oldest_seq(r);
+  if (lo < oldest) lo = oldest;
+  int64_t hi = atomic_load(&r->committed);
+  return make_relation(r, lo, hi, duration_s, false, out);
+}
+
+ArStatus ar_pin(ArRing *r, int64_t lo, int64_t hi, ArRecordSet **out) {
+  *out = NULL;
+  if (lo < 0 || hi < lo)
+    return err(AR_ERR_INVALID, "ar_pin: bad range [%lld, %lld)",
+               (long long)lo, (long long)hi);
+  /* Clamp to the readable window: rows below the oldest are gone (the
+   * caller sees rs->lo > lo), rows at or above committed do not exist
+   * yet (rs->hi < hi). No lease, no exclusion: the pin holds exactly
+   * the rows asked for. */
+  int64_t oldest = ar_oldest_seq(r);
+  int64_t committed = atomic_load(&r->committed);
+  if (lo < oldest) lo = oldest;
+  if (hi > committed) hi = committed;
+  return make_relation(r, lo, hi, 0.0, true, out);
 }
 
 /* ---- export: chunk computation ------------------------------------------------- */

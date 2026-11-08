@@ -47,6 +47,7 @@ ring.append_batch(batch) / ring.append_table(table)
 ring.read_row(seq) -> Row            # MutableRow is its writable subclass
 ring.oldest_seq / ring.newest_seq
 ring.get_static_relation(duration_s) -> RecordSet
+ring.pin(lo, hi) -> RecordSet                      # exactly these rows, no lease
 ring.get_dynamic_relation(ttl_s=0.1, lease_s=5.0) -> DynamicRelation
 ring.wire_map([(path, offset, size), ...]) -> WireMap
 ring.from_wire(wmap, frame) / ring.to_wire(wmap, seq, frame_len) -> bytes   # frame: bytes or any buffer
@@ -136,6 +137,12 @@ with ring.get_static_relation(duration_s=2.0) as rs:
   oldest `peak_rate x (duration_s + margin)` rows so an honest holder
   never blocks the writer. The pin, not the lease, is the guarantee.
   Pins also hold the referenced pool segments (see below).
+- `pin(lo, hi)` — a pinned record set over exactly the rows named, and
+  no lease: for a caller that knows which rows it needs (the publish
+  and archive paths pin the rows they send or write, usually a few).
+  The writer meets this pin only after a whole ring of writes, and
+  then the holder is a leak. `lo` below the oldest row is raised to
+  it (the set's `lo` says so); `hi` above committed is lowered.
 - `RecordSet.table` — zero-copy `pyarrow.Table`. Chunk boundaries:
   the physical ring wrap, plus segment boundaries / re-writes in
   var-width columns (Arrow offsets must be gap-free per chunk). String

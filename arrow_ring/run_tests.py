@@ -181,6 +181,40 @@ def test_pin_blocks_writer_then_raises():
     assert ring.read_row(8).n == 8
 
 
+def test_pin_range_holds_only_its_rows():
+    # pin(lo, hi) pins the rows named and no others, with no lease: the
+    # writer recycles everything below lo freely and meets the pin only
+    # when it reaches lo, a whole ring after the rows were written.
+    ring = Ring(SCHEMA, capacity=8)
+    fill(ring, 8)
+    rs = ring.pin(6, 8)                      # the two newest rows
+    assert (rs.lo, rs.hi) == (6, 8) and rs.table.num_rows == 2
+    assert rs.table.column('n').to_pylist() == [6, 7]
+    fill(ring, 6, start=8)                   # seq 8..13 recycle 0..5: fine
+    with Raises(PinStalledError):
+        ring.get_mutable_row(block_s=0.05)   # seq 14 would recycle 6
+    rs.release()
+    fill(ring, 1, start=14)
+    # Below the oldest row, lo is raised (rows recycled): the set says so.
+    rs = ring.pin(0, 15)
+    assert rs.lo == ring.oldest_seq == 7 and rs.hi == 15
+    rs.release()
+    # Above committed, hi is lowered; an empty range pins nothing.
+    rs = ring.pin(15, 100)
+    assert (rs.lo, rs.hi) == (15, 15) and rs.table.num_rows == 0
+    rs.release()
+    fill(ring, 8, start=15)                  # a whole ring: no pin in the way
+    # A detached range pin rides the table and still holds only its rows.
+    rs = ring.pin(21, 23)
+    t = rs.detach()
+    fill(ring, 6, start=23)                  # recycles 15..20
+    with Raises(PinStalledError):
+        ring.get_mutable_row(block_s=0.05)   # seq 29 would recycle 21
+    del t, rs                                # the last references: pin drops
+    fill(ring, 1, start=29)
+    assert ring.read_row(29).n == 29
+
+
 def test_writer_unblocks_when_pin_released_concurrently():
     ring = Ring(SCHEMA, capacity=8)
     fill(ring, 8)

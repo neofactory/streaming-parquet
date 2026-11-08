@@ -81,6 +81,7 @@ int32_t ar_pool_segment_count(const ArRing *ring, int32_t leaf);
 int64_t ar_pool_oversized_count(const ArRing *ring, int32_t leaf);
 void ar_set_lease_margin(ArRing *ring, double margin_s);
 ArStatus ar_relation(ArRing *ring, double duration_s, ArRecordSet **out);
+ArStatus ar_pin(ArRing *ring, int64_t lo, int64_t hi, ArRecordSet **out);
 int64_t ar_recordset_lo(const ArRecordSet *rs);
 int64_t ar_recordset_hi(const ArRecordSet *rs);
 ArStatus ar_recordset_stream(ArRecordSet *rs, void *out_stream);
@@ -310,6 +311,24 @@ class Ring:
             for k, p in list(self._pins.items()):
                 if p[3] and now - p[2] > 30.0:
                     del self._pins[k]
+        return rec
+
+    def pin(self, lo, hi):
+        """Pin the rows [lo, hi) and no others: a record set for a
+        caller that knows which rows it needs (the publish and archive
+        paths: the rows they send or write). No lease: the writer
+        meets this pin only after a whole ring of writes, and then
+        the holder is a leak. lo below the oldest readable row is
+        raised to it (rec.lo > lo says rows were recycled); hi above
+        committed is lowered to it. Yours to release — release(),
+        detach(), or use as a context manager."""
+        out = ffi.new("ArRecordSet **")
+        _check(lib.ar_pin(self._c, int(lo), int(hi), out))
+        rs = out[0]
+        rec = RecordSet(self, rs, lib.ar_recordset_lo(rs),
+                        lib.ar_recordset_hi(rs), None)
+        self._pins[id(rec)] = [rec.lo, rec.hi, time.monotonic(), False,
+                               traceback.extract_stack(limit=9)[:-1]]
         return rec
 
     def _pins_report(self):

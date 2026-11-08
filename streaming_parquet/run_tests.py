@@ -992,6 +992,34 @@ def _():
         assert rs.table.num_rows == 60
 
 
+@test("a stuck subscriber holds only the rows sent to it; the writer recycles past it (2026-11-07)")
+def _():
+    # A subscriber queue nobody drains is what a stuck gRPC send looks
+    # like to the publisher: the batches stop moving and the pins riding
+    # them stay. The ring is full and the writer recycles at a steady
+    # rate for longer than any lease, fewer rows than a ring. The pin
+    # on each pushed batch covers the rows sent and no others, so the
+    # writer never meets one. (With the whole-window pin it stalled
+    # within 2 s: the brother-connector exit of 2026-11-07.)
+    from streaming_parquet._flight_server import _SubscriberQueue
+    s = sp.create_stream("v2test/stuck", SCHEMA, memory=Memory(lookback=20_000))
+    for i in range(40):                     # a full ring at ~5,000 rows/s
+        fill(s, 500, start=i * 500)
+        time.sleep(0.1)
+    stuck = _SubscriberQueue()
+    sp._flight_server._streams["v2test/stuck"].add_subscriber(stuck)
+    try:
+        for i in range(30):                 # 15,000 more rows over ~3 s
+            fill(s, 500, start=20_000 + i * 500)
+            time.sleep(0.1)
+    finally:
+        held = stuck._queue.qsize()
+        stuck.close()
+    assert held == 30, held                 # every batch still sits in the queue
+    assert s.memory_state().rows == 20_000
+    assert s.newest_row().tv == 34_999.0
+
+
 @test("wire seq alignment: mid-stream attach lands on publisher's axis")
 def _():
     s = sp.create_stream("v2test/seqax", SCHEMA, memory=Memory(lookback=500))
@@ -1094,10 +1122,14 @@ def _():
     with tempfile.TemporaryDirectory() as tmp:
         s = sp.create_stream("v2test/lost", SCHEMA, memory=Memory(lookback=64), store=tmp, archive=Archive(row_group_rows=32))
         s.start_parquet("LOST")
-        for k in range(10):              # 200 rows into a 64-row ring, no publish
-            fill(s, 20, start=k * 20)
+        # 200 rows in ONE commit into a 64-row ring: the flush pins the
+        # pending region at the commit, and by then rows 0..135 are
+        # recycled. (Before the range pin, commits of 20 rows showed a
+        # loss too, but a false one: the lease excluded rows that were
+        # still in the ring.)
+        fill(s, 200)
         st = s.archive_state()
-        assert st.lost_rows > 0, st
+        assert st.lost_rows == 136, st
         lost = st.lost_rows
         fill(s, 5, start=200)
         assert s.archive_state().lost_rows == lost, "never resets"

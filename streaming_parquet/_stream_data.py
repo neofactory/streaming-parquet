@@ -93,6 +93,16 @@ class _StreamData:
                 rs.clamp_hi(visible_hi)
         return rs
 
+    def pin(self, lo, hi):
+        """Pinned record set over exactly [lo, hi), clamped to the
+        visible window: the publish and archive paths' pin."""
+        rs = self.ring.pin(lo, hi)
+        if self._playback_clock is not None:
+            visible_hi = self.newest_visible_seq() + 1
+            if visible_hi < rs.hi:
+                rs.clamp_hi(visible_hi)
+        return rs
+
     # --- visibility (playback-aware) -----------------------------------
 
     def newest_visible_seq(self):
