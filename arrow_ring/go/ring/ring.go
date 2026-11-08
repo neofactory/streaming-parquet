@@ -533,6 +533,22 @@ func (r *Ring) StaticRelation(duration time.Duration) (*RecordSet, error) {
 		Hi: int64(C.ar_recordset_hi(rs))}, nil
 }
 
+// Pin pins the rows [lo, hi) and no others: the publish and archive
+// paths' record set, the rows they send or write. No lease: the writer
+// meets this pin only after a whole ring of writes, and then the
+// holder is a leak. lo below the oldest readable row is raised to it
+// (rs.Lo > lo: rows recycled); hi above committed is lowered to it.
+func (r *Ring) Pin(lo, hi int64) (*RecordSet, error) {
+	var rs *C.ArRecordSet
+	st := C.ar_pin(r.c, C.int64_t(lo), C.int64_t(hi), &rs)
+	if st != C.AR_OK {
+		return nil, r.err(st)
+	}
+	return &RecordSet{c: rs, ring: r,
+		Lo: int64(C.ar_recordset_lo(rs)),
+		Hi: int64(C.ar_recordset_hi(rs))}, nil
+}
+
 // Records exports the set as retained zero-copy record batches (they
 // reference ring memory and keep the pin's buffers alive). Release
 // each record when done with it.

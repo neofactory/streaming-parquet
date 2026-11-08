@@ -59,9 +59,6 @@ class Stream:
     #: a ticket is stale after three beats, and never sooner than this:
     #: one S3 ticket write has taken 5 s on the box
     TICKET_STALE_MIN_S = 30.0
-    #: lease estimate for the push task's detached relations: covers the
-    #: time batches sit in Flight queues in the normal case.
-    PUBLISH_LEASE_S = 2.0
     #: the heartbeat thread never sleeps longer than this between its
     #: time-due checks, whatever the cadences say
     HEARTBEAT_MAX_WAIT_S = 60.0
@@ -416,7 +413,13 @@ class Stream:
                     self._push_pending = False
                     return
                 self._flight_cursor = committed
-            rel = self._data.get_static_relation(self.PUBLISH_LEASE_S)
+            # Pin the rows being sent and no others. The pin rides the
+            # batches into the subscriber queues and the gRPC sends; a
+            # slow or stuck subscriber then holds a few rows, which the
+            # writer reaches only after a whole ring (2026-11-07: the
+            # whole-window pin stopped the writer 2.6 s into one slow
+            # send and the publisher exited).
+            rel = self._data.pin(lo, committed)
             table = rel.detach()        # the pin rides the batches
             if rel.lo > lo:
                 _diag.warning(
@@ -436,9 +439,9 @@ class Stream:
                 running += batch.num_rows
 
     def _submit_archive(self, committed):
-        """Pin, slice the pending region, submit the write or the tail
-        checkpoint. Under the lock: the cursors move here."""
-        rel = self._data.get_static_relation(self.PUBLISH_LEASE_S)
+        """Pin the pending region, slice it, submit the write or the
+        tail checkpoint. Under the lock: the cursors move here."""
+        rel = self._data.pin(self._pq_cursor, committed)
         table = rel.detach()
         with self._lock:
             if not self._recording or committed <= self._pq_cursor:
@@ -634,7 +637,7 @@ class Stream:
         if not self._recording or self._parquet is None:
             return
         committed = self._ring.newest_seq + 1
-        rel = self._data.get_static_relation(self.PUBLISH_LEASE_S)
+        rel = self._data.pin(self._pq_cursor, committed)
         table = rel.detach()
         with self._lock:
             if committed > self._pq_cursor:
@@ -664,7 +667,7 @@ class Stream:
             self._recording = False
         if recording:
             committed = self._ring.newest_seq + 1
-            rel = self._data.get_static_relation(self.PUBLISH_LEASE_S)
+            rel = self._data.pin(self._pq_cursor, committed)
             table = rel.detach()
             with self._lock:
                 if committed > self._pq_cursor:

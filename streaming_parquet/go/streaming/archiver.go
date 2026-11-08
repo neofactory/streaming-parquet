@@ -214,7 +214,7 @@ func (a *archiver) open(baseSeq int64) error {
 
 // region materializes ring rows [lo, hi) as records (retained).
 func (a *archiver) region(lo, hi int64) ([]arrow.RecordBatch, func(), error) {
-	rs, err := a.ring.StaticRelation(2 * time.Second)
+	rs, err := a.ring.Pin(lo, hi) // the pending region and no other rows
 	if err != nil {
 		return nil, nil, err
 	}

@@ -124,7 +124,10 @@ func (s *Stream) Publish() (int64, error) {
 	committed := s.ring.NewestSeq() + 1
 	var pushed int64
 	if committed > s.flightCursor {
-		rs, err := s.ring.StaticRelation(2 * time.Second)
+		// The rows being sent and no others: the pin rides the batches
+		// to the subscribers, and a slow one then holds a few rows,
+		// which the writer reaches only after a whole ring.
+		rs, err := s.ring.Pin(s.flightCursor, committed)
 		if err != nil {
 			return 0, err
 		}

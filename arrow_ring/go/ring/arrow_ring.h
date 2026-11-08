@@ -292,6 +292,16 @@ void     ar_set_lease_margin(ArRing *ring, double margin_s);
  * window yields an empty set. */
 ArStatus ar_relation(ArRing *ring, double duration_s, ArRecordSet **out);
 
+/* Pin a record set over the rows the caller names, [lo, hi), and no
+ * others. No lease and no exclusion: the writer meets this pin only
+ * after a whole ring of writes, and then the holder is a leak
+ * (AR_ERR_PIN_STALLED names the range). lo below the oldest readable
+ * row is raised to it (the set's lo says so: rows recycled); hi above
+ * committed is lowered to it. The publish and archive paths pin this
+ * way: the rows they send or write, usually a few. AR_ERR_INVALID
+ * when hi < lo. */
+ArStatus ar_pin(ArRing *ring, int64_t lo, int64_t hi, ArRecordSet **out);
+
 int64_t ar_recordset_lo (const ArRecordSet *rs);  /* first seq          */
 int64_t ar_recordset_hi (const ArRecordSet *rs);  /* one past the last  */
 

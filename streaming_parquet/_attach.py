@@ -509,7 +509,7 @@ class _Feeder:
         return True
 
     def _lifecycle_loop(self):
-        backoff = 1.0
+        backoff = 0.5
         while not self._closed:
             root_ok = self._refresh_ticket()
             if self._closed:
@@ -575,7 +575,7 @@ class _Feeder:
                         segment_bytes=self._segment_bytes)
 
                 self._state = "streaming"
-                backoff = 1.0
+                backoff = 0.5
                 self._receive(self._client,
                               flight.Ticket(ticket_str.encode("utf-8")))
             except Exception as e:

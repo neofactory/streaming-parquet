@@ -190,6 +190,47 @@ func TestPinStallsWriterLoudly(t *testing.T) {
 	}
 }
 
+// Pin(lo, hi) holds the rows named and no others: the writer recycles
+// everything below lo and meets the pin only when it reaches lo.
+func TestPinRangeHoldsOnlyItsRows(t *testing.T) {
+	r, err := NewRing(testSchema(), 64, &Options{LeaseMarginS: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	fill(t, r, 0, 64) // full
+	rs, err := r.Pin(60, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rs.Lo != 60 || rs.Hi != 64 {
+		t.Fatalf("pin [60,64) got [%d,%d)", rs.Lo, rs.Hi)
+	}
+	fill(t, r, 64, 60) // seq 64..123 recycle 0..59: no pin in the way
+	if _, err = r.RowBegin(30 * time.Millisecond); !IsPinStalled(err) {
+		t.Fatalf("seq 124 must stall on the pin at 60, got %v", err)
+	}
+	rs.Release()
+	if _, err := r.RowBegin(time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	// lo below the oldest row is raised to it; hi above committed is lowered.
+	rs, err = r.Pin(0, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rs.Lo != r.OldestSeq() || rs.Hi != r.NewestSeq()+1 {
+		t.Fatalf("clamped pin got [%d,%d), window [%d,%d)", rs.Lo, rs.Hi, r.OldestSeq(), r.NewestSeq()+1)
+	}
+	rs.Release()
+	if _, err := r.Pin(10, 5); err == nil {
+		t.Fatal("hi < lo must be refused")
+	}
+}
+
 func TestWireMapScatterGather(t *testing.T) {
 	schema := arrow.NewSchema([]arrow.Field{
 		{Name: "cnt", Type: arrow.PrimitiveTypes.Uint16},
