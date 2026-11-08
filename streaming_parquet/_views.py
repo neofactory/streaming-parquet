@@ -75,7 +75,9 @@ class TicketSource:
                   and ticket_revision (a live connection, or the
                   writer itself), or None (read on a schedule).
     run():        the run the memory holds, or None.
-    memory(d):    a ring record set held for d seconds, or None.
+    memory(lo):   the ring's rows from seq lo on, as (first_seq, batch)
+                  pairs read a chunk at a time (Ring.iter_chunks), or
+                  None.
     """
 
     def __init__(self, name, store, ticket=None, revisions=None, run=None,
@@ -98,30 +100,33 @@ class _MemoryProxy:
     """Per query: the ring's committed rows after `floor()`, with their
     row numbers in _seq (the view keeps the rows after its ticket's
     stored_row; floor is the oldest such seam a view version still in
-    use names). The rows are COPIED out and the ring released at once:
-    a query over the store can run for seconds, and a ring held that
-    long stalls its writer (2026-10-27: "writer stalled ... held 3.0s
-    against a 2.0s lease"). The copy is the rows since the archive's
-    last stored row: seconds of rows, not the ring."""
+    use names). Read a chunk at a time through Ring.iter_chunks, zero
+    copy: nothing is pinned until the scan reaches memory, which in a
+    query over the store may be seconds in, and then only the chunk in
+    hand. (2026-10-27 a whole-window pin held for such a query stalled
+    the writer; a copy patched it; the chunk read retires the copy.)
+    A reader with no connection yet scans an empty memory."""
 
-    def __init__(self, take, schema, floor):
-        self._take = take
+    def __init__(self, chunks, schema, floor):
+        self._chunks = chunks
         self._floor = floor
-        self._empty = _with_seq(pa.table(
-            {f.name: pa.array([], type=f.type) for f in schema}), 0)
+        self._schema = schema.append(pa.field('_seq', pa.int64()))
 
     def __arrow_c_stream__(self, requested_schema=None):
         try:
-            rs = self._take(0.5)
+            it = self._chunks(self._floor() + 1)
         except Exception:
-            return self._empty.__arrow_c_stream__(requested_schema)
-        try:
-            lo = max(rs.lo, self._floor() + 1)
-            t = rs.table.slice(lo - rs.lo)
-            t = t.take(pa.array(range(t.num_rows), type=pa.int64()))  # a copy
-        finally:
-            rs.release()
-        return _with_seq(t, lo).__arrow_c_stream__(requested_schema)
+            it = ()
+        # map, not a generator: a generator's loop variable would hold
+        # each batch, and its chunk's pin, until the next pull.
+        return pa.RecordBatchReader.from_batches(
+            self._schema, map(_seq_column, it)).__arrow_c_stream__(requested_schema)
+
+
+def _seq_column(pair):
+    first, batch = pair
+    return batch.append_column(
+        '_seq', pa.array(range(first, first + batch.num_rows), type=pa.int64()))
 
 
 def _with_seq(table, start):

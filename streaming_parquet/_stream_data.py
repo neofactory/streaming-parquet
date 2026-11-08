@@ -23,7 +23,10 @@ PLAYBACK STREAMS (replay mode) — set via set_playback_clock(col, fn):
   invisible until the clock catches up. No worker thread spinning.
 """
 
+import operator
 import threading
+
+import pyarrow as pa
 
 import arrow_ring
 from arrow_ring import StaleReadError
@@ -102,6 +105,22 @@ class _StreamData:
             if visible_hi < rs.hi:
                 rs.clamp_hi(visible_hi)
         return rs
+
+    def iter_chunks(self, lo=0, hi=None, chunk_rows=arrow_ring.Ring.CHUNK_ROWS):
+        """Ring.iter_chunks over the visible window: (first_seq, batch)
+        pairs, a pin per chunk and nothing between. A playback clock
+        bounds the read at the rows visible now."""
+        if self._playback_clock is not None:
+            visible_hi = self.newest_visible_seq() + 1
+            hi = visible_hi if hi is None else min(hi, visible_hi)
+        return self.ring.iter_chunks(lo, hi, chunk_rows)
+
+    def chunked_reader(self, lo=0, hi=None, chunk_rows=arrow_ring.Ring.CHUNK_ROWS):
+        """iter_chunks as a pyarrow.RecordBatchReader: what the DuckDB
+        live view registers."""
+        return pa.RecordBatchReader.from_batches(
+            self.schema,
+            map(operator.itemgetter(1), self.iter_chunks(lo, hi, chunk_rows)))
 
     # --- visibility (playback-aware) -----------------------------------
 

@@ -231,7 +231,7 @@ class Stream:
             self.name, self._store,
             ticket=lambda: self._ticket if self._ticket_revision else None,
             revisions=self, run=lambda: self._run,
-            memory=self._data.get_static_relation)
+            memory=self._data.iter_chunks)
 
     def _write_ticket(self):
         """Write the ticket if what it says changed or a beat passed.

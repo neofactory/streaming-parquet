@@ -335,10 +335,10 @@ def connect(name=None, store=None, memory=None, columns=None, ticket=None):
     if feeder_store is not None:
         from ._views import TicketSource
 
-        def take(duration_s, a=a):
-            return a._require().get_static_relation(duration_s)
+        def memory_chunks(lo, a=a):
+            return a._require().iter_chunks(lo)
         a._source = TicketSource(resolved_name, feeder_store, revisions=feeder,
-                                 run=lambda: feeder._run, memory=take)
+                                 run=lambda: feeder._run, memory=memory_chunks)
     with _lock:
         _feeders[id(feeder)] = feeder
         _attached[id(a)] = a

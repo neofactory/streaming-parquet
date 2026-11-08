@@ -263,14 +263,15 @@ class Attached:
 
     # ---- DuckDB views ------------------------------------------------------
 
-    def duckdb_live(self, con, name=None, ttl_s=0.1, lease_s=5.0):
+    def duckdb_live(self, con, name=None):
         """Memory as a DuckDB view that stays current: register once,
-        every query sees the current rows. Each query pins for its own
-        duration only."""
+        every query sees the current rows. A scan reads memory a chunk
+        at a time and pins only the chunk in hand, so a query holds
+        nothing of the ring between chunks, however long it runs."""
         from arrow_ring import DynamicRelation
         d = self._require()
         vname = name or f"sp_live_{_safe(d.name)}"
-        con.register(vname, DynamicRelation(d, ttl_s, lease_s))
+        con.register(vname, DynamicRelation(d))
         return View(con, vname, unregister=lambda: con.unregister(vname))
 
     def standing(self):
@@ -296,12 +297,12 @@ class Attached:
             return self._source
         feeder = self._feeder
 
-        def take(duration_s):
-            return self._require().get_static_relation(duration_s)
+        def memory_chunks(lo):
+            return self._require().iter_chunks(lo)
         return TicketSource(
             self.name, store, revisions=feeder,
             run=(lambda: feeder._run) if feeder is not None else None,
-            memory=take)
+            memory=memory_chunks)
 
     def duckdb_archive(self, con, name=None, store=None):
         """The stream's files as one DuckDB view: the finished files of

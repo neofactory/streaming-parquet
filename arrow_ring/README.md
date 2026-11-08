@@ -48,7 +48,9 @@ ring.read_row(seq) -> Row            # MutableRow is its writable subclass
 ring.oldest_seq / ring.newest_seq
 ring.get_static_relation(duration_s) -> RecordSet
 ring.pin(lo, hi) -> RecordSet                      # exactly these rows, no lease
-ring.get_dynamic_relation(ttl_s=0.1, lease_s=5.0) -> DynamicRelation
+ring.iter_chunks(lo=0, hi=None, chunk_rows=16384)  # -> (first_seq, RecordBatch)...: a pin per chunk
+ring.chunked_reader(lo=0, hi=None, chunk_rows=16384) -> pyarrow.RecordBatchReader
+ring.get_dynamic_relation(chunk_rows=16384) -> DynamicRelation
 ring.wire_map([(path, offset, size), ...]) -> WireMap
 ring.from_wire(wmap, frame) / ring.to_wire(wmap, seq, frame_len) -> bytes   # frame: bytes or any buffer
 RecordSet: .table .lo .hi .release() .detach() ; context manager
@@ -143,6 +145,14 @@ with ring.get_static_relation(duration_s=2.0) as rs:
   The writer meets this pin only after a whole ring of writes, and
   then the holder is a leak. `lo` below the oldest row is raised to
   it (the set's `lo` says so); `hi` above committed is lowered.
+- `iter_chunks(lo, hi, chunk_rows)` — the read for a consumer that
+  pulls batches one at a time (a DuckDB scan): nothing pinned at open;
+  the range fixed at the first chunk, not at open, so a consumer that
+  reaches memory late reads memory as it is then; each batch pins its
+  own rows and no others, dropping the pin when the batch is freed. A
+  row the writer recycles before the read reaches it raises
+  `StaleReadError` naming the rows: the read was lapped. `DynamicRelation`
+  is this read behind `__arrow_c_stream__`; it needs no lease.
 - `RecordSet.table` — zero-copy `pyarrow.Table`. Chunk boundaries:
   the physical ring wrap, plus segment boundaries / re-writes in
   var-width columns (Arrow offsets must be gap-free per chunk). String

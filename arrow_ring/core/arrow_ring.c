@@ -1399,6 +1399,85 @@ static void stream_release(struct ArrowArrayStream *s) {
   s->release = NULL;
 }
 
+/* ---- export: chunk cursor (a pin per chunk, nothing between) ----------------------- */
+
+struct ArChunkCursor {
+  ArRing *r;
+  int64_t hi;          /* as asked; lowered to committed at the first next */
+  int64_t next;        /* the next row to hand out */
+  int64_t chunk_rows;
+  bool started;
+};
+
+ArStatus ar_chunks_open(ArRing *r, int64_t lo, int64_t hi, int64_t chunk_rows,
+                        ArChunkCursor **out) {
+  *out = NULL;
+  if (lo < 0 || hi < lo || chunk_rows <= 0)
+    return err(AR_ERR_INVALID, "ar_chunks_open: bad range [%lld, %lld) or "
+               "chunk_rows %lld", (long long)lo, (long long)hi,
+               (long long)chunk_rows);
+  ArChunkCursor *c = calloc(1, sizeof(*c));
+  if (!c) return err(AR_ERR_NOMEM, "chunk cursor");
+  c->r = r;
+  ring_ref(r);
+  c->hi = hi;
+  c->next = lo;
+  c->chunk_rows = chunk_rows;
+  *out = c;
+  return AR_OK;
+}
+
+ArStatus ar_chunks_next(ArChunkCursor *c, struct ArrowArray *out,
+                        int64_t *first_seq) {
+  ArRing *r = c->r;
+  memset(out, 0, sizeof(*out));          /* release == NULL: the end */
+  if (!c->started) {
+    /* The range is fixed now, not at open: a consumer that reaches
+     * memory late reads memory as it is then. Rows gone before the
+     * read began were never part of it. */
+    c->started = true;
+    int64_t committed = atomic_load(&r->committed);
+    if (c->hi > committed) c->hi = committed;
+    int64_t oldest = ar_oldest_seq(r);
+    if (c->next < oldest) c->next = oldest;
+  }
+  *first_seq = c->next;
+  if (c->next >= c->hi) return AR_OK;
+  int64_t oldest = ar_oldest_seq(r);
+  if (c->next < oldest)
+    return err(AR_ERR_STALE, "chunked read lapped by the writer: rows "
+               "[%lld, %lld) recycled before the read reached them",
+               (long long)c->next,
+               (long long)(oldest < c->hi ? oldest : c->hi));
+  int64_t end = c->next + c->chunk_rows;
+  if (end > c->hi) end = c->hi;
+  ArRecordSet *rs;
+  ArStatus st = ar_pin(r, c->next, end, &rs);
+  if (st != AR_OK) return st;
+  if (rs->lo > c->next) {                /* recycled between the check and the pin */
+    int64_t gone = rs->lo;
+    ar_recordset_release(rs);
+    return err(AR_ERR_STALE, "chunked read lapped by the writer: rows "
+               "[%lld, %lld) recycled before the read reached them",
+               (long long)c->next, (long long)gone);
+  }
+  int32_t n;
+  Chunk *chunks = compute_chunks(r, rs->lo, rs->hi, &n);
+  Chunk ch = chunks[0];                  /* the first physical run; the rest next time */
+  free(chunks);
+  st = build_batch(rs, ch.a, ch.b, out);
+  if (st != AR_OK) { ar_recordset_release(rs); return st; }
+  c->next += ch.b - ch.a;
+  ar_recordset_detach(rs);               /* the pin rides this batch alone */
+  return AR_OK;
+}
+
+void ar_chunks_free(ArChunkCursor *c) {
+  if (c == NULL) return;
+  ring_unref(c->r);
+  free(c);
+}
+
 ArStatus ar_recordset_stream(ArRecordSet *rs, struct ArrowArrayStream *out) {
   StreamPriv *sp = calloc(1, sizeof(StreamPriv));
   if (!sp) return err(AR_ERR_NOMEM, "stream");

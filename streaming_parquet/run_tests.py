@@ -183,10 +183,10 @@ def _():
     fill(s, 20)
     a = sp.connect("v2test/dyn")
     con = duckdb.connect()
-    live = a.duckdb_live(con, ttl_s=0.02)
+    live = a.duckdb_live(con)
     assert con.sql(f"SELECT max(tv) FROM {live.name}").fetchall()[0][0] == 19.0
     fill(s, 20, start=20)
-    time.sleep(0.03)
+    wait_for(lambda: a._newest_seq == 39, what="rows over Flight")
     assert con.sql(f"SELECT max(tv) FROM {live.name}").fetchall()[0][0] == 39.0
     live.close()
 
