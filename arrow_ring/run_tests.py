@@ -215,6 +215,48 @@ def test_pin_range_holds_only_its_rows():
     assert ring.read_row(29).n == 29
 
 
+def test_chunked_read_pins_only_the_chunk_in_hand():
+    # iter_chunks: nothing pinned at open; the range is fixed at the
+    # first chunk; each batch pins its own rows until it is dropped; a
+    # read the writer laps ends with StaleReadError naming the rows.
+    ring = Ring(SCHEMA, capacity=1000)
+    fill(ring, 1000)                         # full: seq 0..999
+    it = ring.iter_chunks(chunk_rows=100)
+    fill(ring, 10, start=1000)               # before the first next: no pin yet
+    first, b = next(it)
+    assert first == 10 and b.num_rows == 100 # the range is fixed now: [10, 1010)
+    assert b.column('n').to_pylist()[:2] == [10, 11]
+    with Raises(PinStalledError):
+        ring.get_mutable_row(block_s=0.05)   # seq 1010 would recycle 10, pinned
+    del b                                    # the batch's pin drops
+    fill(ring, 100, start=1010)              # recycles 10..109 freely
+    rows, end = 100, first + 100
+    for first, b in it:                      # the rest, holding nothing
+        assert first == end                  # contiguous; the ring wrap cuts one chunk short
+        rows += b.num_rows
+        end = first + b.num_rows
+        del b
+    assert rows == 1000 and end == 1010      # [10, 1010): rows added after the first next are not in it
+    # lapped: a chunk the writer recycled before the read reached it
+    it = ring.iter_chunks(chunk_rows=100)
+    first, b = next(it)
+    del b
+    fill(ring, 1000, start=1110)             # a whole ring: everything behind the read is gone
+    with Raises(StaleReadError):
+        next(it)
+    # hi bounds the read; lo below the oldest row starts at the oldest
+    got = [f for f, _ in ring.iter_chunks(lo=0, hi=ring.oldest_seq + 250, chunk_rows=100)]
+    assert got == [ring.oldest_seq, ring.oldest_seq + 100, ring.oldest_seq + 200]
+    # var-width columns: the segment boundaries cut chunks too, and the
+    # data is zero copy and right
+    ring = Ring(MIXED, capacity=400, segment_bytes=4096)
+    fill_mixed(ring, 400)
+    seen = []
+    for first, b in ring.iter_chunks(chunk_rows=150):
+        seen.extend(zip(range(first, first + b.num_rows), b.column('label').to_pylist()))
+    assert len(seen) == 400 and all(l == f'r{s}' for s, l in seen)
+
+
 def test_writer_unblocks_when_pin_released_concurrently():
     ring = Ring(SCHEMA, capacity=8)
     fill(ring, 8)

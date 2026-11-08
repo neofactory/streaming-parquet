@@ -329,6 +329,28 @@ void ar_recordset_release(ArRecordSet *rs);
  * forget publish paths. Call exactly one of release/detach. */
 void ar_recordset_detach(ArRecordSet *rs);
 
+/* ---- read side: chunk cursor (a pin per chunk, nothing between) --------- */
+
+/* A chunkwise read of [lo, hi), for a consumer that pulls batches one at
+ * a time (a DuckDB scan). Nothing is pinned at open. The range is fixed
+ * at the FIRST next, not at open: hi is lowered to the committed row
+ * then, lo raised to the oldest row then, so a consumer that reaches
+ * memory late reads memory as it is then. Each next pins up to
+ * chunk_rows rows, builds one zero-copy batch (the first physical run
+ * in that span: the ring wrap and var-width segment boundaries cut as
+ * ar_recordset_stream cuts), and hands the pin to the batch: the pin
+ * drops when the consumer releases the batch. So a scan holds only the
+ * chunk in hand, however long the query around it runs. A row the
+ * writer recycled before the read reached it ends the read with
+ * AR_ERR_STALE naming the rows: the read was lapped. At the end `out`
+ * has release == NULL. *first_seq is the batch's first row. */
+typedef struct ArChunkCursor ArChunkCursor;
+ArStatus ar_chunks_open(ArRing *ring, int64_t lo, int64_t hi,
+                        int64_t chunk_rows, ArChunkCursor **out);
+ArStatus ar_chunks_next(ArChunkCursor *cursor, struct ArrowArray *out,
+                        int64_t *first_seq);
+void     ar_chunks_free(ArChunkCursor *cursor);
+
 /* ---- egress convenience: Arrow IPC out ---------------------------------- */
 
 /* Write the record set as an Arrow IPC stream (encapsulated batches)

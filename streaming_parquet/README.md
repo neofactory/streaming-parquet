@@ -185,8 +185,9 @@ it again. Every checkpoint version, a live file's and a finished
 file's, stays 10 minutes after it is superseded (by the next version, or
 by the ticket dropping the file); the step that uploads a later one
 deletes it, nothing on a timer. So a polling reader's view never names a
-deleted one. Memory rows are copied out per query and the ring released
-at once, so a query never holds the writer. Without a live writer (no
+deleted one. Memory is read a chunk at a time, zero copy, pinning only
+the chunk in hand, so a query holds nothing of the ring between chunks
+however long it runs, and the writer never waits. Without a live writer (no
 ticket, or a stale one) the views read the store's current catalog.
 
 The archive is `<store>/streams/<name>` under the store the reader

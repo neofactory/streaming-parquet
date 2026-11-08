@@ -11,6 +11,7 @@ Everything stateful — slots, cursors, pins, leases, pools — lives in C.
 
 import datetime
 import decimal
+import operator
 import os
 import re
 import struct
@@ -23,6 +24,8 @@ import pyarrow as pa
 
 from ._row import make_row_classes
 from ._schema import flatten_schema
+
+INT64_MAX = 2 ** 63 - 1
 
 _CORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'core')
 _LIB_PATH = os.path.join(_CORE_DIR, 'libarrow_ring.dylib')
@@ -87,6 +90,24 @@ int64_t ar_recordset_hi(const ArRecordSet *rs);
 ArStatus ar_recordset_stream(ArRecordSet *rs, void *out_stream);
 void ar_recordset_release(ArRecordSet *rs);
 void ar_recordset_detach(ArRecordSet *rs);
+struct ArrowArray {
+    int64_t length;
+    int64_t null_count;
+    int64_t offset;
+    int64_t n_buffers;
+    int64_t n_children;
+    const void **buffers;
+    struct ArrowArray **children;
+    struct ArrowArray *dictionary;
+    void (*release)(struct ArrowArray *);
+    void *private_data;
+};
+typedef struct ArChunkCursor ArChunkCursor;
+ArStatus ar_chunks_open(ArRing *ring, int64_t lo, int64_t hi,
+                        int64_t chunk_rows, ArChunkCursor **out);
+ArStatus ar_chunks_next(ArChunkCursor *cursor, struct ArrowArray *out,
+                        int64_t *first_seq);
+void ar_chunks_free(ArChunkCursor *cursor);
 ArStatus ar_append_batch(ArRing *ring, void *batch);
 ArStatus ar_append_batch_at(ArRing *ring, void *batch, int64_t first_seq);
 typedef struct ArWireMap ArWireMap;
@@ -346,13 +367,53 @@ class Ring:
                          f" taken at {where}")
         return ("\n live pins:\n" + "\n".join(lines)) if lines else "\n (no live pins recorded)"
 
-    def get_dynamic_relation(self, ttl_s=0.1, lease_s=5.0):
+    CHUNK_ROWS = 16384
+
+    def iter_chunks(self, lo=0, hi=None, chunk_rows=CHUNK_ROWS):
+        """Read [lo, hi) a chunk at a time, pinning only the chunk in
+        hand: yields (first_seq, pyarrow.RecordBatch). Nothing is pinned
+        before the first chunk is asked for, and the range is fixed
+        then, not now: hi (None: no bound) is lowered to the committed
+        row, lo raised to the oldest row. Each batch's pin drops when
+        the batch is freed. A row the writer recycles before the read
+        reaches it raises StaleReadError naming the rows: the read was
+        lapped. This is what the DuckDB views read through, so a scan
+        holds only its current chunk however long the query runs."""
+        out = ffi.new("ArChunkCursor **")
+        _check(lib.ar_chunks_open(self._c, int(lo),
+                                  INT64_MAX if hi is None else int(hi),
+                                  int(chunk_rows), out))
+        cur = out[0]
+        try:
+            seq = ffi.new("int64_t *")
+            while True:
+                arr = ffi.new("struct ArrowArray *")
+                _check(lib.ar_chunks_next(cur, arr, seq))
+                if arr.release == ffi.NULL:
+                    return
+                # Built inside the yield: this frame keeps no reference
+                # to the batch across the suspension, so the consumer's
+                # drop is the last one and the chunk's pin goes with it.
+                yield seq[0], pa.RecordBatch._import_from_c(
+                    int(ffi.cast("uintptr_t", arr)), self.schema)
+        finally:
+            lib.ar_chunks_free(cur)
+
+    def chunked_reader(self, lo=0, hi=None, chunk_rows=CHUNK_ROWS):
+        """iter_chunks as a pyarrow.RecordBatchReader, an Arrow stream a
+        DuckDB view registers (it has __arrow_c_stream__). `map` rather
+        than a generator: a generator's loop variable would hold each
+        batch, and its pin, until the next pull."""
+        return pa.RecordBatchReader.from_batches(
+            self.schema,
+            map(operator.itemgetter(1), self.iter_chunks(lo, hi, chunk_rows)))
+
+    def get_dynamic_relation(self, chunk_rows=CHUNK_ROWS):
         """A standing view: register it once (DuckDB scans objects with
-        __arrow_c_stream__); every query resolves a fresh snapshot at
-        scan-open. The TTL aligns multiple scans within one query; pins
-        manage themselves (detached to the consumed stream). Never
-        release it — it has nothing to release."""
-        return DynamicRelation(self, ttl_s, lease_s)
+        __arrow_c_stream__); every scan reads memory as it is when the
+        scan begins, a chunk at a time, pinning only the chunk in hand.
+        Never release it — it has nothing to release."""
+        return DynamicRelation(self, chunk_rows)
 
     # ---- diagnostics ----------------------------------------------------------
 
@@ -736,30 +797,23 @@ class WireMap:
 
 class DynamicRelation:
     """Standing always-current view over a Ring (or anything with
-    get_static_relation). Snapshots are cached for ttl_s so multiple
-    scans inside one query see the same window; each snapshot's pin is
-    detached to its table and self-releases when consumers finish."""
+    chunked_reader). Register it once with DuckDB; every scan reads
+    memory as it is when the scan begins, a chunk at a time, pinning
+    only the chunk in hand (Ring.iter_chunks). Nothing is pinned
+    between scans, or between chunks, or while the query around the
+    scan does other work. Two scans in one query each read memory as
+    of their own start."""
 
-    def __init__(self, source, ttl_s=0.1, lease_s=5.0):
+    def __init__(self, source, chunk_rows=Ring.CHUNK_ROWS):
         self._source = source
-        self._ttl_s = float(ttl_s)
-        self._lease_s = float(lease_s)
-        self._cached = None
-        self._cached_mono = -1.0
-
-    def _snapshot(self):
-        import time as _time
-        now_mono = _time.monotonic()
-        if self._cached is None or now_mono - self._cached_mono > self._ttl_s:
-            rel = self._source.get_static_relation(self._lease_s)
-            self._cached = rel.detach()
-            self._cached_mono = now_mono
-        return self._cached
+        self._chunk_rows = int(chunk_rows)
 
     def __arrow_c_stream__(self, requested_schema=None):
-        return self._snapshot().__arrow_c_stream__(requested_schema)
+        return self._source.chunked_reader(
+            chunk_rows=self._chunk_rows).__arrow_c_stream__(requested_schema)
 
     @property
     def table(self):
-        """The current snapshot as a pyarrow Table (refreshes per TTL)."""
-        return self._snapshot()
+        """Memory now, as a pyarrow Table. Zero copy: the table pins
+        the rows it holds until it is dropped."""
+        return self._source.chunked_reader(chunk_rows=self._chunk_rows).read_all()

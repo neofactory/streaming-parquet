@@ -177,26 +177,41 @@ def test_duckdb_query_over_hot_relation():
 
 
 def test_dynamic_relation_standing_view():
-    # Register ONCE; every query sees current data; TTL aligns scans.
+    # Register ONCE; every query sees current data, as of its own scan.
     ring = Ring(SCHEMA, capacity=256, lease_margin_s=0.0)
     fill(ring, 50)
     con = duckdb.connect()
-    con.register('live', ring.get_dynamic_relation(ttl_s=0.02))
+    con.register('live', ring.get_dynamic_relation())
     assert con.sql("SELECT max(seq) FROM live").fetchall()[0][0] == 49
     fill(ring, 50, start=50)
-    time.sleep(0.03)                       # let the TTL expire
     assert con.sql("SELECT max(seq) FROM live").fetchall()[0][0] == 99
-    # within-TTL: two immediate queries share one snapshot
-    a = con.sql("SELECT count(*) FROM live").fetchall()[0][0]
-    b = con.sql("SELECT count(*) FROM live").fetchall()[0][0]
-    assert a == b
+    assert con.sql("SELECT count(*) FROM live").fetchall()[0][0] == 100
+    # a scan in flight pins nothing between chunks: the writer wraps the
+    # ring while a query that reads memory LAST waits on a slow source
+    fill(ring, 156, start=100)            # full: 256 rows, seq 0..255
+    slow_rows = pa.table({'k': pa.array(range(5), type=pa.int64())})
+
+    class Slow:
+        def __arrow_c_stream__(self, requested_schema=None):
+            def gen():
+                for i in range(5):
+                    time.sleep(0.2)       # 1 s in all, while the writer wraps
+                    fill(ring, 60, start=256 + i * 60)
+                    yield slow_rows.slice(i, 1).to_batches()[0]
+            return pa.RecordBatchReader.from_batches(
+                slow_rows.schema, gen()).__arrow_c_stream__(requested_schema)
+    con.register('slow', Slow())
+    n_slow, n_live = con.sql(
+        "SELECT (SELECT count(*) FROM slow), (SELECT count(*) FROM live)"
+    ).fetchall()[0]
+    assert n_slow == 5 and n_live == 256  # memory read as of its own scan
+    assert ring.newest_seq == 555         # the writer never waited
     # writer keeps running; view keeps answering (pins self-release)
-    for i in range(100, 400):
+    for i in range(556, 856):
         row = ring.get_mutable_row(block_s=1.0)
         row.seq = i; row.tv = i * 0.5; row.label = f'v{i}'
         ring.commit()
         if i % 50 == 0:
-            time.sleep(0.03)
             assert con.sql("SELECT max(seq) FROM live").fetchall()[0][0] == i
 
 
