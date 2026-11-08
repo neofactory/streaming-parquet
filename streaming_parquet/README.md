@@ -444,7 +444,7 @@ a = sp.connect(name, store=...)      # local: the publisher's ring, zero
 a.newest_row().tv                    # one row, attribute per column
 for row in a.cursor(): ...           # the rows this reader has not seen
 t = a.arrow_table(rows=1000)         # the newest 1000 rows, zero copy;
-                                     # the table pins memory until dropped
+                                     # the table pins its rows until dropped
 t = a.arrow_table(since=('tv', t0))  # from a time onward
 view = a.duckdb_all(con)             # register once with DuckDB;
 con.sql(f"select ... from {view.name}")   # every query sees current data

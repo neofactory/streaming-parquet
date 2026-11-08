@@ -51,11 +51,6 @@ from . import _tickets
 # How often the feeder re-reads the ticket while unconnected.
 TICKET_POLL_INTERVAL = 1.0
 
-#: lease a reader's pinned table declares by default: the table is
-#: expected to be consumed within this many seconds. An overstayed hold
-#: on an origin ring stalls the writer, loudly, naming the holder.
-TABLE_LEASE_S = 1.0
-
 
 def _safe(name):
     return re.sub(r'\W+', '_', name)
@@ -123,23 +118,23 @@ class Cursor:
 
     def arrow_table(self, columns=None):
         """The unread rows as one table, and the cursor moves past them.
-        Zero copy: the table pins the ring until it is dropped."""
+        Zero copy: the table pins its own rows, and no others, until it
+        is dropped."""
         d = self._current()
         cols = list(columns) if columns else self._columns
         if d is None:
             return _empty_table(None)
-        rs = d.get_static_relation(TABLE_LEASE_S)
-        lo = max(rs.lo, self._next)
-        hi = rs.hi
-        if lo < rs.lo:
-            self.lost += rs.lo - lo
-        if hi <= lo:
+        hi = d.newest_visible_seq() + 1
+        if hi <= self._next:
+            return _empty_table(d.schema, cols)
+        rs = d.pin(self._next, hi)
+        if rs.lo > self._next:                  # recycled before this pass
+            self.lost += rs.lo - self._next
+        if rs.hi <= rs.lo:
             rs.release()
             return _empty_table(d.schema, cols)
-        if rs.lo > self._next:
-            self.lost += rs.lo - self._next
-        t = rs.detach().slice(lo - rs.lo, hi - lo)
-        self._next = hi
+        t = rs.detach()
+        self._next = rs.hi
         return t.select(cols) if cols else t
 
 
@@ -223,8 +218,9 @@ class Attached:
         return Cursor(self, since=since, columns=columns)
 
     def arrow_table(self, columns=None, rows=None, since=None):
-        """Memory as one Arrow table, zero copy (the table pins the
-        ring until it is dropped; drop it or copy it).
+        """Memory as one Arrow table, zero copy: the table pins the
+        rows it holds, and no others, until it is dropped (drop it or
+        copy it; a numpy view of a column keeps it).
 
         No selector: the rows not yet on disk. On a reader with no
         archive of its own, everything it holds.
@@ -235,8 +231,10 @@ class Attached:
         cols = list(columns) if columns else None
         if d is None:
             return _empty_table(None)
-        rs = d.get_static_relation(TABLE_LEASE_S)
-        lo, hi = rs.lo, rs.hi
+        # The selector names the seq range first; the pin covers that
+        # range and nothing else.
+        hi = d.newest_visible_seq() + 1
+        lo = d.oldest_seq
         if since is not None:
             column, value = since
             seq = d.seq_at_or_after(column, value)
@@ -246,9 +244,12 @@ class Attached:
         elif self._unarchived_fn is not None:
             lo = max(lo, hi - int(self._unarchived_fn()))
         if hi <= lo:
+            return _empty_table(d.schema, cols)
+        rs = d.pin(lo, hi)
+        if rs.hi <= rs.lo:
             rs.release()
             return _empty_table(d.schema, cols)
-        t = rs.detach().slice(lo - rs.lo, hi - lo)
+        t = rs.detach()
         return t.select(cols) if cols else t
 
     def memory_state(self):
