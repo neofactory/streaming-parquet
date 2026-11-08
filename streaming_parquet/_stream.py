@@ -30,7 +30,7 @@ import pyarrow as pa
 from ._diag import _diag, console_print
 from ._options import Memory, Archive, ArchiveState, MirrorState, MemoryState
 from ._stream_data import _StreamData
-from ._worker_pool import get_pool, Task
+from ._worker_pool import get_pool
 from . import _tickets
 
 import socket
@@ -116,10 +116,8 @@ class Stream:
         self._ship_failing = False      # for transition logging
         self._ship_error = None         # the last failure's text
 
-        # Cursors (seq space). Flight and parquet advance independently.
-        self._flight_cursor = 0
-        self._push_pending = False      # one push task outstanding at most
-        self._push = Task("flight", name, self._push_task, (), None)
+        # The archive cursor (seq space). Flight readers keep their own:
+        # they pull (see _flight_server).
         self._pq_cursor = 0
         self._pq_durable = 0            # rows covered by the last flush
                                         # or tail checkpoint
@@ -181,8 +179,6 @@ class Stream:
         self._ticket_next_mono = 0.0
         self._ticket_failing = False
         self._ticket_deleted = False
-        self._empty_batch = pa.record_batch(
-            [pa.array([], type=f.type) for f in schema], schema=schema)
         if self._parquet is not None:
             self._parquet.on_ticket = self._write_ticket
         self._face._source = self._view_source()
@@ -272,9 +268,8 @@ class Stream:
             console_print(f"[streaming-parquet] First ticket published: "
                           f"{self._ticket_root}/tickets/{self.name} -> "
                           f"{ticket}")
-        if self._flight_server.has_subscribers(self.name):
-            self._flight_server.push_batch(self.name, self._empty_batch, -1,
-                                           ticket["revision"])
+        # A waiting reader answers at once with the new revision.
+        self._flight_server.notify(self.name)
         return True
 
     def _ticket_state(self):
@@ -357,25 +352,13 @@ class Stream:
     def _publish(self):
         """Compare counts; submit at most one task per kind. Pointer work
         and queue puts, microseconds. Called by commit, append, cut, and
-        the heartbeat thread for the time-due part."""
+        the heartbeat thread for the time-due part. Flight readers pull
+        (see _flight_server): a commit only wakes the ones waiting."""
         from ._clock import now as _now
         committed = self._ring.newest_seq + 1
-        # A push costs a pin and an Arrow export of the ring window per
-        # call, about a millisecond; a stream nobody is attached to does
-        # not pay it (four streams at 100 Hz each: 60 % of a
-        # core, found 2026-10-25). The cursor still advances, so a reader
-        # attaching later gets rows from then on, as it does today.
-        subscribed = (self._flight_server is not None
-                      and self._flight_server.has_subscribers(self.name))
+        if self._flight_server is not None:
+            self._flight_server.notify(self.name)
         with self._lock:
-            push = False
-            if committed > self._flight_cursor:
-                if subscribed:
-                    push = not self._push_pending
-                    if push:
-                        self._push_pending = True
-                elif not self._push_pending:
-                    self._flight_cursor = committed
             archive = (self._recording and committed > self._pq_cursor
                        and (self._pq_due(committed)
                             or self._tail_due(committed)))
@@ -392,51 +375,10 @@ class Stream:
             if ship:
                 self._ship_queued = True
                 self._ship_mono = time.monotonic()
-        if push:
-            self._pool.submit_task(self._push)
         if archive:
             self._submit_archive(committed)
         if ship:
             self._pool.submit("ship", self.name, self._do_ship)
-
-    def _push_task(self):
-        """On a pool thread: send everything from the Flight cursor to
-        now. Loops while rows keep arriving; clears the pending flag only
-        when caught up, under the lock commit sets it under, so a row
-        committed in the gap either is seen by the loop or starts a new
-        task."""
-        while True:
-            committed = self._ring.newest_seq + 1
-            with self._lock:
-                lo = self._flight_cursor
-                if committed <= lo:
-                    self._push_pending = False
-                    return
-                self._flight_cursor = committed
-            # Pin the rows being sent and no others. The pin rides the
-            # batches into the subscriber queues and the gRPC sends; a
-            # slow or stuck subscriber then holds a few rows, which the
-            # writer reaches only after a whole ring (2026-11-07: the
-            # whole-window pin stopped the writer 2.6 s into one slow
-            # send and the publisher exited).
-            rel = self._data.pin(lo, committed)
-            table = rel.detach()        # the pin rides the batches
-            if rel.lo > lo:
-                _diag.warning(
-                    f"[{self.name}] Flight fell behind: rows "
-                    f"[{lo}, {rel.lo}) recycled before push "
-                    f"(subscribers missed them)")
-                lo = rel.lo
-            if committed <= lo:
-                continue
-            new = table.slice(lo - rel.lo, committed - lo)
-            running = lo
-            for batch in new.to_batches():
-                if batch.num_rows == 0:
-                    continue
-                self._flight_server.push_batch(self.name, batch, running,
-                                               self._ticket_revision)
-                running += batch.num_rows
 
     def _submit_archive(self, committed):
         """Pin the pending region, slice it, submit the write or the

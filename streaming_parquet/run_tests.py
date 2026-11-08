@@ -780,51 +780,65 @@ def _():
         s.close()                        # before the directory goes
 
 
-@test("no Flight subscriber, no push: commits cost no export; a later subscriber gets rows from then on")
+@test("a reader that attaches later gets rows from then on: its first request starts at the newest row")
 def _():
     s = sp.create_stream("v2test/nosub", SCHEMA, memory=Memory(lookback=500))
-    pushes = []
-    real = s._flight_server.push_batch
-    def counting(name, batch, first_seq=-1, revision=0):
-        pushes.append(batch.num_rows)
-        return real(name, batch, first_seq, revision)
-    s._flight_server.push_batch = counting
-    fill(s, 50)                          # nobody attached: the cursor advances, nothing is pushed
-    time.sleep(0.2)
-    assert pushes == [], pushes
-    assert s._flight_cursor == 50, s._flight_cursor
+    fill(s, 50)                          # nobody attached; nothing is sent to anyone
     a = sp.connect(ticket=s._ticket, memory=Memory(lookback=500))
     wait_for(lambda: a.state == "streaming", what="feeder connect")
-    fill(s, 10, start=50)                # now someone is attached: pushed
+    fill(s, 10, start=50)
     wait_for(lambda: a._newest_seq == 59, what="rows after attach")
-    assert a._oldest_seq == 50 and sum(pushes) == 10, (a._oldest_seq, pushes)
+    assert a._oldest_seq == 50, a._oldest_seq
     a.close()
 
 
-@test("commit publishes: one push task outstanding, rows arriving meanwhile ride the next push as one batch")
+@test("the pull wire: one answer per request carries everything since the seq asked; a quiet stream answers empty with the revision")
 def _():
+    import struct as _s
+    import pyarrow.flight as flight
+    s = sp.create_stream("v2test/pull", SCHEMA, memory=Memory(lookback=500))
+    for i in range(100):                 # one hundred commits
+        fill(s, 1, start=i)
+    t = s._ticket
+    client = flight.FlightClient(f"grpc://{t['host']}:{t['port']}")
+    info = client.get_flight_info(flight.FlightDescriptor.for_path("v2test/pull"))
+    assert info.total_records == 100     # a new reader starts here
+    # one request from 0: one answer with all 100 rows, side data (seq, revision)
+    chunks = list(client.do_get(flight.Ticket(b"v2test/pull@0")))
+    assert len(chunks) == 1 and chunks[0].data.num_rows == 100
+    seq, rev = _s.unpack('<qq', chunks[0].app_metadata)
+    assert seq == 0 and rev == s._ticket_revision
+    # a column subset
+    chunks = list(client.do_get(flight.Ticket(b"v2test/pull@90:tv,label")))
+    assert chunks[0].data.column_names == ['tv', 'label'] and chunks[0].data.num_rows == 10
+    # nothing new: the answer waits up to a second, then comes back empty with the revision
+    t0 = time.monotonic()
+    chunks = list(client.do_get(flight.Ticket(b"v2test/pull@100")))
+    assert 0.8 < time.monotonic() - t0 < 2.0
+    assert len(chunks) == 1 and chunks[0].data.num_rows == 0
+    assert _s.unpack('<qq', chunks[0].app_metadata) == (-1, s._ticket_revision)
+    # a row committed while a request waits answers it at once
+    def later():
+        time.sleep(0.2)
+        fill(s, 1, start=100)
     import threading as _th
-    s = sp.create_stream("v2test/coalesce", SCHEMA, memory=Memory(lookback=500))
+    _th.Thread(target=later).start()
+    t0 = time.monotonic()
+    chunks = list(client.do_get(flight.Ticket(b"v2test/pull@100")))
+    assert time.monotonic() - t0 < 0.8 and chunks[0].data.num_rows == 1
+    # the old ticket form is refused
+    try:
+        list(client.do_get(flight.Ticket(b"v2test/pull")))
+        assert False, "a ticket without @seq must be refused"
+    except flight.FlightError:
+        pass
+    client.close()
+    # the feeder on the same wire: at rest, one row commits and arrives within a round trip
     a = sp.connect(ticket=s._ticket, memory=Memory(lookback=500))
     wait_for(lambda: a.state == "streaming", what="feeder connect")
-    pushes = []
-    real = s._flight_server.push_batch
-    def counting(name, batch, first_seq=-1, revision=0):
-        pushes.append(batch.num_rows)
-        return real(name, batch, first_seq, revision)
-    s._flight_server.push_batch = counting
-    # hold the stream's Flight lane with a task that waits on an event
-    gate = _th.Event()
-    s._pool.submit("flight", s.name, gate.wait)
-    for i in range(100):                # one hundred commits, no publish call anywhere
-        fill(s, 1, start=i)
-    gate.set()
-    wait_for(lambda: a._newest_seq == 99, what="all rows over Flight")
-    assert sum(pushes) == 100 and len(pushes) <= 2, pushes   # one push carried them all
-    # at rest, one row commits and arrives within a wake-up, no loop sleep in the path
     t0 = time.monotonic()
-    fill(s, 1, start=100)
-    wait_for(lambda: a._newest_seq == 100, what="the row after one commit")
+    fill(s, 1, start=101)
+    wait_for(lambda: a._newest_seq == 101, what="the row after one commit")
     assert time.monotonic() - t0 < 0.5
     a.close()
 
@@ -1007,32 +1021,30 @@ def _():
         assert rs.table.num_rows == 60
 
 
-@test("a stuck subscriber holds only the rows sent to it; the writer recycles past it (2026-11-07)")
+@test("a reader that stops asking holds nothing: the writer laps the ring twice; the reader's next request starts at the oldest row left (2026-11-07)")
 def _():
-    # A subscriber queue nobody drains is what a stuck gRPC send looks
-    # like to the publisher: the batches stop moving and the pins riding
-    # them stay. The ring is full and the writer recycles at a steady
-    # rate for longer than any lease, fewer rows than a ring. The pin
-    # on each pushed batch covers the rows sent and no others, so the
-    # writer never meets one. (With the whole-window pin it stalled
-    # within 2 s: the brother-connector exit of 2026-11-07.)
-    from streaming_parquet._flight_server import _SubscriberQueue
-    s = sp.create_stream("v2test/stuck", SCHEMA, memory=Memory(lookback=20_000))
-    for i in range(40):                     # a full ring at ~5,000 rows/s
-        fill(s, 500, start=i * 500)
-        time.sleep(0.1)
-    stuck = _SubscriberQueue()
-    sp._flight_server._streams["v2test/stuck"].add_subscriber(stuck)
-    try:
-        for i in range(30):                 # 15,000 more rows over ~3 s
-            fill(s, 500, start=20_000 + i * 500)
-            time.sleep(0.1)
-    finally:
-        held = stuck._queue.qsize()
-        stuck.close()
-    assert held == 30, held                 # every batch still sits in the queue
-    assert s.memory_state().rows == 20_000
-    assert s.newest_row().tv == 34_999.0
+    # Readers pull. A reader that stops, or whose network path died,
+    # leaves nothing at the publisher: no queue, no sender, no pin.
+    # (The push protocol this replaced held a pin per batch in transit;
+    # one stuck 2.6 s stopped the writer and ended brother-connector.)
+    import pyarrow.flight as flight
+    s = sp.create_stream("v2test/stuck", SCHEMA, memory=Memory(lookback=2_000))
+    fill(s, 100)
+    t = s._ticket
+    client = flight.FlightClient(f"grpc://{t['host']}:{t['port']}")
+    first = list(client.do_get(flight.Ticket(b"v2test/stuck@0")))[0].data
+    assert first.num_rows == 100
+    del first                               # the reader is now "stuck": it asks for nothing more
+    fill(s, 4_000, start=100)               # two whole rings; the writer never waits
+    assert s.memory_state().rows == 2_000 and s.newest_row().tv == 4_099.0
+    # when it asks again from where it was, it gets the oldest row left and sees the gap
+    chunks = list(client.do_get(flight.Ticket(b"v2test/stuck@100")))
+    import struct as _s
+    seq, _rev = _s.unpack('<qq', chunks[0].app_metadata)
+    assert seq == 4_100 - 2_000, seq        # the oldest row left: seq 2100
+    # one answer; two Arrow batches, because the ring wrap cuts the run
+    assert sum(c.data.num_rows for c in chunks) == 2_000
+    client.close()
 
 
 @test("wire seq alignment: mid-stream attach lands on publisher's axis")

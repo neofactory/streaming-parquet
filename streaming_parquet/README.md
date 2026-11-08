@@ -135,11 +135,21 @@ each time: O(n^2)); assemble once.
 - Each ring keeps a monotonic seq per row. It never wraps; the ring's
   rows only set how far back is readable. Rings of different sizes share
   the same seq axis.
+- Readers pull. A Flight DoGet with the ticket `<name>@<from_seq>` (or
+  `<name>@<from_seq>:col1,col2`) answers once: the committed rows from
+  that seq to the newest as one batch, or, after a second with no new
+  row, an empty batch. The reader appends and asks again from the seq
+  it reached; the next request is the acknowledgment. GetFlightInfo's
+  TotalRecords is the committed row count, where a new reader starts.
+  The publisher keeps no state per reader, so a reader that stops
+  asking leaves nothing behind, and no reader can hold the writer
+  (`_flight_server.py` says why a pull and not a pushed stream).
 - Each wire batch carries two numbers in its Flight app_metadata, 16
   bytes LE: the origin seq of its first row (-1 for an empty batch), then
-  the ticket revision. A ticket write with no new rows sends an empty
-  batch carrying the new revision, so a live reader knows at once to
-  re-read the ticket. Readers also accept the older 8-byte form (seq
+  the ticket revision. An answer carries the revision current when it
+  was made, and a waiting request answers at once when the ticket
+  changes, so a live reader knows within a round trip to re-read the
+  ticket. Readers also accept the older 8-byte form (seq
   only). connect()
   starts the subscriber's ring at that number and stays on the
   PUBLISHER's seq axis. On reconnect or drop, a batch number past the
