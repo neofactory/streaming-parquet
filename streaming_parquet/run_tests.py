@@ -562,8 +562,9 @@ def _():
         s.commit()
         time.sleep(0.3)                 # archived before any recycle
 
-        # a reader's table IS a pin: held past its lease, the writer
-        # stalls, loudly, and the stall names the holder
+        # a reader's table IS a pin on its rows: held while the writer
+        # laps the ring, the writer stalls, loudly, and the stall names
+        # the range and the holder
         t = a.arrow_table(rows=60)      # the whole window, held
         assert t.num_rows == 60, t.num_rows
         stalled = False
@@ -571,7 +572,7 @@ def _():
             try:
                 alloc(i)
             except PinStalledError as e:
-                assert "lease" in str(e)
+                assert "range pin [0, 60)" in str(e) and "arrow_table" in str(e), e
                 stalled = True
                 break
         assert stalled, "a held table must stall the writer"
@@ -694,6 +695,20 @@ def _():
         s2 = sp.create_stream("v2test/table2", SCHEMA, memory=Memory(lookback=50))
         fill(s2, 12)
         assert sp.connect("v2test/table2").arrow_table().num_rows == 12
+        # the table pins ITS rows and no others: held across a near-full
+        # ring of writes, the writer runs until it reaches the table's
+        # first row (seq 38 of a 500-row ring: at seq 538), not before
+        from arrow_ring import PinStalledError
+        t = a.arrow_table(rows=5)            # seq 38..42
+        fill(s, 495, start=43)               # seq 43..537 recycle 0..37: free
+        try:
+            s.get_mutable_row(block_s=0.05)  # seq 538 would recycle 38
+            assert False, "the held table's rows were recycled"
+        except PinStalledError:
+            pass
+        del t
+        fill(s, 1, start=538)
+        assert s.newest_row().tv == 538.0
 
 
 @test("duckdb views: live is memory, archive is the files, all is both, each registered on the connection")
