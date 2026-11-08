@@ -172,10 +172,10 @@ def create_stream(name, schema, store=None, spool=DEFAULT_SPOOL,
         with _lock:
             if name in _streams:
                 raise ValueError(f"Stream '{name}' already exists")
-            server.register_stream(name, schema, None)
             stream = Stream(name, schema, server, port, run, memory=memory,
                             archive=archive, store=store, writer=writer,
                             owner=owner)
+            server.register_stream(name, schema, stream)  # readers pull from it
             _streams[name] = stream
     except BaseException:
         owner.release()
@@ -466,10 +466,9 @@ def close():
 
         server = _flight_server
 
-    # Let subscribers drain pending batches, then shut down -- joined
+    # Readers pull, so there is nothing to drain: shut down -- joined
     # for the same reason as the feeders above.
     if server is not None:
-        server.drain_subscribers(timeout=2.0)
         t = threading.Thread(target=server.shutdown, daemon=True)
         t.start()
         t.join(timeout=3.0)

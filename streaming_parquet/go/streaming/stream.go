@@ -21,7 +21,7 @@ type Stream struct {
 	ring         *ring.Ring
 	arch         *archiver
 	run          string // the writer's start time; the ticket's run, every file's sp_run
-	flightCursor int64
+	published    int64  // committed rows as of the last Publish
 	stopHB       chan struct{}
 	hbDone       sync.WaitGroup
 	closed       bool
@@ -68,7 +68,7 @@ func (t *Telemetry) CreateStream(name string, schema *arrow.Schema,
 	}
 	t.streams[name] = s
 	t.mu.Unlock()
-	t.flight.register(name, schema)
+	t.flight.register(name, schema, s)
 	if t.tickets != nil {
 		s.hbDone.Add(1)
 		go s.heartbeat()
@@ -117,45 +117,19 @@ func (s *Stream) heartbeat() {
 	}
 }
 
-// Publish pushes committed rows outward: new rows go to every Flight
-// subscriber as zero-copy record batches; the archiver advances.
-// Returns rows newly pushed to Flight.
+// Publish makes committed rows visible outward: Flight readers waiting
+// on this stream are woken (they pull; flightserver.go says why), and
+// the archiver advances. Returns the rows committed since the last
+// Publish.
 func (s *Stream) Publish() (int64, error) {
 	committed := s.ring.NewestSeq() + 1
-	var pushed int64
-	if committed > s.flightCursor {
-		// The rows being sent and no others: the pin rides the batches
-		// to the subscribers, and a slow one then holds a few rows,
-		// which the writer reaches only after a whole ring.
-		rs, err := s.ring.Pin(s.flightCursor, committed)
-		if err != nil {
-			return 0, err
-		}
-		if rs.Lo > s.flightCursor {
-			s.flightCursor = rs.Lo // fell behind; subscribers missed rows
-		}
-		recs, err := rs.Records()
-		if err != nil {
-			rs.Release()
-			return 0, err
-		}
-		pos := rs.Lo
-		for _, rec := range recs {
-			n := rec.NumRows()
-			lo := max64(s.flightCursor-pos, 0)
-			if lo < n {
-				slice := rec.NewSlice(lo, n)
-				s.tel.flight.push(s.Name, slice, pos+lo)
-				slice.Release()
-			}
-			rec.Release()
-			pos += n
-		}
-		rs.Release()
-		pushed = committed - s.flightCursor
-		s.flightCursor = committed
+	var fresh int64
+	if committed > s.published {
+		fresh = committed - s.published
+		s.published = committed
+		s.tel.flight.notify(s.Name)
 	}
-	return pushed, s.arch.step()
+	return fresh, s.arch.step()
 }
 
 // StartParquet begins a recording segment covering rows committed

@@ -578,8 +578,9 @@ class _Feeder:
 
                 self._state = "streaming"
                 backoff = 0.5
-                self._receive(self._client,
-                              flight.Ticket(ticket_str.encode("utf-8")))
+                # TotalRecords is the committed row count: the first
+                # request starts at the newest row
+                self._receive(self._client, ticket_str, info.total_records)
             except Exception as e:
                 if self._closed:
                     break
@@ -595,52 +596,59 @@ class _Feeder:
 
         self._state = "closed"
 
-    def _receive(self, client, flight_ticket):
+    def _receive(self, client, ticket_str, from_seq):
+        """The pull loop (the publisher's _flight_server says why a pull):
+        ask for the rows from from_seq on, append the answer, ask again
+        from the seq reached. One answer in flight; the next request is
+        the acknowledgment. A quiet stream answers empty after a second,
+        carrying the ticket revision. Returns on close or on the first
+        error; the lifecycle loop reconnects."""
         t_connect = time.monotonic()
-        _diag.info(f"[{self.name}] RECV START: connecting to Flight do_get")
-        batches = 0
+        _diag.info(f"[{self.name}] RECV START: pulling from seq {from_seq}")
+        name, _, cols = ticket_str.partition(":")
+        answers = 0
         rows = 0
         reader = None
         try:
-            reader = client.do_get(flight_ticket)
-            with self._lock:
-                if self._closed:
-                    try:
-                        reader.cancel()
-                    except Exception:
-                        pass
-                    return
-                self._reader = reader
-            _diag.info(f"[{self.name}] RECV CONNECTED: do_get returned after "
-                       f"{time.monotonic() - t_connect:.3f}s")
-            for chunk in reader:
-                if self._closed:
-                    break
-                batch = chunk.data
-                at_seq, revision = _side_data(chunk.app_metadata)
-                if revision is not None and revision != self.ticket_revision:
-                    with self._revision_cond:
-                        self.ticket_revision = revision
-                        self._revision_cond.notify_all()
-                if batch.num_rows == 0:
-                    continue        # an empty batch carries a revision only
-                batches += 1
-                rows += batch.num_rows
-                if batches == 1:
-                    _diag.info(f"[{self.name}] RECV FIRST BATCH: "
-                               f"{batch.num_rows} rows, "
-                               f"{time.monotonic() - t_connect:.3f}s "
-                               f"after connect")
-                # publisher's origin seq: keep the local ring on the
-                # publisher's seq axis (gap = loud jump)
-                self.data.ring.append_batch(batch, at_seq=at_seq)
+            while not self._closed:
+                ticket = f"{name}@{from_seq}" + (f":{cols}" if cols else "")
+                reader = client.do_get(flight.Ticket(ticket.encode("utf-8")))
+                with self._lock:
+                    if self._closed:
+                        try:
+                            reader.cancel()
+                        except Exception:
+                            pass
+                        return
+                    self._reader = reader
+                for chunk in reader:
+                    at_seq, revision = _side_data(chunk.app_metadata)
+                    if revision is not None and revision != self.ticket_revision:
+                        with self._revision_cond:
+                            self.ticket_revision = revision
+                            self._revision_cond.notify_all()
+                    batch = chunk.data
+                    if batch.num_rows == 0:
+                        continue    # a quiet stream: the revision only
+                    answers += 1
+                    rows += batch.num_rows
+                    if answers == 1:
+                        _diag.info(f"[{self.name}] RECV FIRST BATCH: "
+                                   f"{batch.num_rows} rows from seq {at_seq}, "
+                                   f"{time.monotonic() - t_connect:.3f}s "
+                                   f"after connect")
+                    # publisher's origin seq: keep the local ring on the
+                    # publisher's seq axis (a jump past from_seq is a
+                    # gap: rows recycled before this reader asked)
+                    self.data.ring.append_batch(batch, at_seq=at_seq)
+                    from_seq = (at_seq if at_seq is not None else from_seq) + batch.num_rows
         except Exception as e:
             if not self._closed:
                 _diag.error(f"[{self.name}] RECV ERROR: {e} "
-                            f"(after {batches} batches, {rows} rows)")
+                            f"(after {answers} answers, {rows} rows)")
         finally:
             with self._lock:
                 if reader is not None and self._reader is reader:
                     self._reader = None
-            _diag.info(f"[{self.name}] RECV DONE: {batches} batches, "
+            _diag.info(f"[{self.name}] RECV DONE: {answers} answers, "
                        f"{rows} rows, {time.monotonic() - t_connect:.1f}s")

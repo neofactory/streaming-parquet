@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -307,51 +308,72 @@ func (a *Attached) receive(tk *Ticket) error {
 	}
 	a.mu.Unlock()
 
-	stream, err := client.DoGet(ctx, &flight.Ticket{Ticket: []byte(ticketStr)})
-	if err != nil {
-		return err
-	}
-	rdr, err := flight.NewRecordReader(stream)
-	if err != nil {
-		return err
-	}
-	defer rdr.Release()
+	// The pull loop (flightserver.go says why a pull): ask for the rows
+	// from `from` on, append the answer, ask again from the seq reached.
+	// TotalRecords is the committed row count: start at the newest row.
+	name, colsCSV, hasCols := strings.Cut(ticketStr, ":")
+	from := info.TotalRecords
 	a.state.Store("streaming")
-	for rdr.Next() {
-		rec := rdr.RecordBatch()
-		if rec.NumRows() == 0 {
-			continue
+	for ctx.Err() == nil {
+		tk := fmt.Sprintf("%s@%d", name, from)
+		if hasCols {
+			tk += ":" + colsCSV
 		}
-		firstSeq := int64(-1)
-		if meta := rdr.LatestAppMetadata(); len(meta) == 8 || len(meta) == 16 {
-			// publisher's origin seq: keep the local ring on the
-			// publisher's seq axis (gap = loud jump in the core). A
-			// 16-byte side data carries the ticket revision after it,
-			// which this reader does not use.
-			firstSeq = int64(binary.LittleEndian.Uint64(meta[:8]))
-		} else if len(meta) > 0 {
-			// malformed alignment metadata: appending without the
-			// axis would silently misalign — drop the connection
-			return fmt.Errorf("stream %s: batch app_metadata is "+
-				"%d bytes (want 16: the LE origin seq and ticket "+
-				"revision; or 8: the seq) — malformed "+
-				"publisher", a.Name, len(meta))
-		}
-		a.mu.Lock()
-		err := a.ring.AppendRecordAt(rec, firstSeq)
-		var archErr error
-		if err == nil && a.arch != nil {
-			archErr = a.arch.step()
-		}
-		a.mu.Unlock()
+		stream, err := client.DoGet(ctx, &flight.Ticket{Ticket: []byte(tk)})
 		if err != nil {
 			return err
 		}
-		if archErr != nil {
-			fmt.Fprintf(os.Stderr, "[%s] archiver: %v\n", a.Name, archErr)
+		rdr, err := flight.NewRecordReader(stream)
+		if err != nil {
+			return err
+		}
+		for rdr.Next() {
+			rec := rdr.RecordBatch()
+			if rec.NumRows() == 0 {
+				continue // a quiet stream: nothing new yet
+			}
+			firstSeq := int64(-1)
+			if meta := rdr.LatestAppMetadata(); len(meta) == 8 || len(meta) == 16 {
+				// publisher's origin seq: keep the local ring on the
+				// publisher's seq axis (a jump past `from` is a gap:
+				// rows recycled before this reader asked). A 16-byte
+				// side data carries the ticket revision after it,
+				// which this reader does not use.
+				firstSeq = int64(binary.LittleEndian.Uint64(meta[:8]))
+			} else if len(meta) > 0 {
+				rdr.Release()
+				return fmt.Errorf("stream %s: batch app_metadata is "+
+					"%d bytes (want 16: the LE origin seq and ticket "+
+					"revision; or 8: the seq) — malformed "+
+					"publisher", a.Name, len(meta))
+			}
+			a.mu.Lock()
+			err := a.ring.AppendRecordAt(rec, firstSeq)
+			var archErr error
+			if err == nil && a.arch != nil {
+				archErr = a.arch.step()
+			}
+			a.mu.Unlock()
+			if err != nil {
+				rdr.Release()
+				return err
+			}
+			if archErr != nil {
+				fmt.Fprintf(os.Stderr, "[%s] archiver: %v\n", a.Name, archErr)
+			}
+			if firstSeq >= 0 {
+				from = firstSeq + rec.NumRows()
+			} else {
+				from += rec.NumRows()
+			}
+		}
+		err = rdr.Err()
+		rdr.Release()
+		if err != nil {
+			return err
 		}
 	}
-	return rdr.Err()
+	return nil
 }
 
 // Close stops the feeder, finalizes any recording, frees the ring.
