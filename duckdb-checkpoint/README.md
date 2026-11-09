@@ -21,6 +21,32 @@ version. A version never changes once written, so DuckDB's caches and
 its S3 reads, which remember an object by its name, can never mix two
 versions.
 
+## What a query asks the store for
+
+Nothing is read twice. A chunk is read through DuckDB's own cache of
+remote files, under the chunk's own path. A chunk never changes once
+written, so a cached chunk is used with no check: it costs no request,
+not even to open it. A checkpoint version is kept by the extension, the
+last 8 it read: a version is used by a few queries and then never again,
+and DuckDB's cache would keep every one.
+
+- The first query on a checkpoint version fetches that version and the
+  byte ranges it needs of each chunk. A chunk under 2 MiB is fetched
+  whole.
+- A later query on the same version asks the store for nothing it has
+  already read.
+- A new version costs its own checkpoint object and the chunks it adds.
+  A chunk that an older version named is not read again.
+
+The chunk cache is DuckDB's (`enable_external_file_cache`, on by
+default). It is in memory and belongs to one database: a new process
+starts with none of it. A local chunk is not cached, as for any local
+file in DuckDB.
+
+DuckDB reads one file from all of its scan threads at once. The chunks
+are opened on first touch, each under its own lock, and read through the
+cache with no lock of ours.
+
 ## Loading
 
 DuckDB has not signed the extension, so it loads only on a connection

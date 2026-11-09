@@ -20,15 +20,49 @@
 // ranges), so the manifest chunk CRCs are NOT verified here — parquet
 // page checksums are the guard on this path, same contract as the
 // Python CheckpointFile ranged mode.
+//
+// Nothing is read twice. Two faults were found on 2026-11-09, and how
+// the objects are read answers both:
+//
+//   The cache. DuckDB keeps what a query read from a remote file and
+//   serves the next query from memory, but only for paths it knows as
+//   remote (s3://, http://, ...). The path of the virtual file begins
+//   with pqc://, so DuckDB caches nothing of it: every query downloaded
+//   the checkpoint object again, once for each time DuckDB opened the
+//   file, three times in a query.
+//
+//   The threads. DuckDB 2.0 reads one file handle from every scan
+//   thread at once. A handle of ours that opened chunks on first touch
+//   and kept them in a table with no lock died or hung.
+//
+// A chunk is read through DuckDB's own caching file system
+// (CachingFileSystem). The chunk has a remote path, so it is cached
+// under that path and fetched once, however many checkpoint versions
+// name it. It never changes once written, so it is opened with no
+// validity check: a cached chunk costs no request at all, not even to
+// open it. The caching file system is made for many threads; what is
+// left to us is one lock for each chunk, held only while it is opened.
+//
+// A checkpoint version is kept by us, the last few read
+// (KEPT_CHECKPOINTS). A version is opened several times by one query
+// and by the queries that follow it, and then never again. DuckDB's
+// cache would keep every version it ever read until memory ran short:
+// 4 MB each 15 seconds on the stream measured that day.
 
 #include "parquet_checkpoint_extension.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/mutex.hpp"
+#include "duckdb/common/open_file_info.hpp"
+#include "duckdb/common/query_context.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/common/virtual_file_system.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/storage/external_file_cache/caching_file_system.hpp"
 
 extern "C" {
 #include "pqc.h"
@@ -46,6 +80,14 @@ struct CkptSegment {
 	idx_t blob_off;   // when path is empty: offset within the ckpt blob
 };
 
+// One checkpoint object as it was read: its bytes and its time in the
+// store. Never changed after it is read; handles share it.
+struct CheckpointObject {
+	vector<uint8_t> bytes;
+	timestamp_t last_modified;
+	string version_tag;
+};
+
 class ParquetCheckpointFileSystem;
 
 class ParquetCheckpointFileHandle : public FileHandle {
@@ -57,17 +99,25 @@ public:
 		ParquetCheckpointFileHandle::Close();
 	}
 
-	vector<uint8_t> blob;                  // the checkpoint object's bytes
+	// One chunk of the manifest, opened on first touch. Scan threads
+	// share this handle: the lock is held while the chunk is opened,
+	// and the reads that follow take no lock of ours.
+	struct Chunk {
+		mutex lock;
+		unique_ptr<CachingFileHandle> file;
+	};
+
+	shared_ptr<CheckpointObject> checkpoint; // the checkpoint object
 	vector<CkptSegment> segments;
 	idx_t file_size = 0;
 	idx_t position = 0;
-	FileSystem *raw_fs = nullptr;          // opens chunk objects
+	FileSystem *raw_fs = nullptr;          // opens the chunks
 	optional_ptr<FileOpener> opener;
-	// lazily-opened chunk handles, one per segment index
-	unordered_map<idx_t, unique_ptr<FileHandle>> chunk_handles;
+	FileOpenFlags chunk_flags;             // how a chunk is opened
+	vector<unique_ptr<Chunk>> chunks;      // one for each segment
 
 	void Close() override {
-		chunk_handles.clear();
+		chunks.clear();
 	}
 };
 
@@ -107,18 +157,23 @@ public:
 		auto handle = make_uniq<ParquetCheckpointFileHandle>(*this, path, flags);
 		handle->raw_fs = RawFsFor(raw);
 		handle->opener = opener;
+		// A chunk is read the way DuckDB reads a parquet file of its
+		// own: the reader's request sizes, and for a remote chunk no
+		// second buffer under the cache.
+		handle->chunk_flags = FileFlags::FILE_FLAGS_READ;
+		handle->chunk_flags.SetRequestSizing(flags.GetRequestSizing());
+		if (FileSystem::IsRemoteFile(raw)) {
+			handle->chunk_flags |= FileFlags::FILE_FLAGS_DIRECT_IO;
+		}
 
-		// read the checkpoint object whole (it is small: manifest +
-		// provisional tail + footer)
-		auto ckpt_handle = handle->raw_fs->OpenFile(
-		    raw, FileFlags::FILE_FLAGS_READ, opener);
-		auto ckpt_size = handle->raw_fs->GetFileSize(*ckpt_handle);
-		handle->blob.resize(NumericCast<size_t>(ckpt_size));
-		handle->raw_fs->Read(*ckpt_handle, handle->blob.data(), ckpt_size, 0);
+		// The checkpoint object, whole: the manifest, the rows not yet
+		// in a chunk, the footer.
+		handle->checkpoint = ReadCheckpoint(*handle->raw_fs, raw, opener);
+		auto &blob = handle->checkpoint->bytes;
 
 		char err[256] = {0};
-		PqcReader *r = pqc_reader_open(handle->blob.data(),
-		                               handle->blob.size(), err, sizeof(err));
+		PqcReader *r = pqc_reader_open(blob.data(), blob.size(), err,
+		                               sizeof(err));
 		if (!r) {
 			throw IOException("checkpoint %s: refused: %s", raw, err);
 		}
@@ -156,6 +211,10 @@ public:
 		    NumericCast<idx_t>(doff)});
 		handle->file_size = off + NumericCast<idx_t>(dlen);
 		pqc_reader_free(r);
+		for (idx_t i = 0; i < handle->segments.size(); i++) {
+			handle->chunks.push_back(
+			    make_uniq<ParquetCheckpointFileHandle::Chunk>());
+		}
 		return std::move(handle);
 	}
 
@@ -180,13 +239,14 @@ public:
 			idx_t hi = MinValue(want_end, seg_end);
 			auto *dst = out + (lo - location);
 			if (seg.path.empty()) {
-				memcpy(dst, h.blob.data() + seg.blob_off + (lo - seg.start),
+				memcpy(dst,
+				       h.checkpoint->bytes.data() + seg.blob_off +
+				           (lo - seg.start),
 				       hi - lo);
 			} else {
-				auto &ch = ChunkHandle(h, i);
-				h.raw_fs->Read(ch, dst,
-				               NumericCast<int64_t>(hi - lo),
-				               lo - seg.start);
+				ChunkFile(h, i)
+				    .Read(hi - lo, lo - seg.start)
+				    .CopyTo(dst, hi - lo);
 			}
 		}
 	}
@@ -230,14 +290,16 @@ public:
 	}
 
 	timestamp_t GetLastModifiedTime(FileHandle &handle) override {
-		// the ckpt object's own mtime: it advances on every
-		// checkpoint, which is exactly the cache-invalidation signal
-		// a parquet-metadata cache wants from this file
-		auto &h = handle.Cast<ParquetCheckpointFileHandle>();
-		string raw = Unwrap(handle.GetPath());
-		auto ch = h.raw_fs->OpenFile(raw, FileFlags::FILE_FLAGS_READ,
-		                             h.opener);
-		return h.raw_fs->GetLastModifiedTime(*ch);
+		// the checkpoint object's own time, as it was opened: it
+		// differs for every checkpoint, which is the signal a
+		// parquet-metadata cache wants from this file
+		return handle.Cast<ParquetCheckpointFileHandle>()
+		    .checkpoint->last_modified;
+	}
+
+	string GetVersionTag(FileHandle &handle) override {
+		return handle.Cast<ParquetCheckpointFileHandle>()
+		    .checkpoint->version_tag;
 	}
 
 	bool FileExists(const string &filename,
@@ -280,6 +342,78 @@ private:
 		return true;
 	}
 
+	// Whether `raw` names a checkpoint VERSION, <name>.parquet.<6+
+	// digits>.ckpt: an object written once and never changed. A
+	// checkpoint named without a version (written before versions) was
+	// replaced in place, so its cache entry is checked at each open.
+	static bool IsVersionedCheckpoint(const string &raw) {
+		if (!StringUtil::EndsWith(raw, CKPT_SUFFIX)) {
+			return false;
+		}
+		string stem = raw.substr(0, raw.size() - strlen(CKPT_SUFFIX));
+		auto dot = stem.find_last_of('.');
+		if (dot == string::npos || stem.size() - dot - 1 < 6) {
+			return false;
+		}
+		for (idx_t i = dot + 1; i < stem.size(); i++) {
+			if (stem[i] < '0' || stem[i] > '9') {
+				return false;
+			}
+		}
+		return StringUtil::EndsWith(stem.substr(0, dot), ".parquet");
+	}
+
+	// The checkpoint object at `raw`, whole. A version comes from the
+	// few kept, or is read and kept; a checkpoint with no version in
+	// its name is read at every open, because it was replaced in place.
+	shared_ptr<CheckpointObject> ReadCheckpoint(FileSystem &raw_fs,
+	                                            const string &raw,
+	                                            optional_ptr<FileOpener> opener) {
+		bool versioned = IsVersionedCheckpoint(raw);
+		if (versioned) {
+			lock_guard<mutex> guard(kept_lock);
+			for (idx_t i = 0; i < kept.size(); i++) {
+				if (kept[i].first == raw) {
+					auto found = kept[i];       // the one read last is last
+					kept.erase(kept.begin() + NumericCast<int64_t>(i));
+					kept.push_back(found);
+					return found.second;
+				}
+			}
+		}
+		auto file = raw_fs.OpenFile(raw, FileFlags::FILE_FLAGS_READ, opener);
+		auto object = make_shared_ptr<CheckpointObject>();
+		auto size = raw_fs.GetFileSize(*file);
+		object->bytes.resize(NumericCast<size_t>(size));
+		raw_fs.Read(*file, object->bytes.data(), size, 0);
+		object->last_modified = raw_fs.GetLastModifiedTime(*file);
+		object->version_tag = raw_fs.GetVersionTag(*file);
+		if (versioned) {
+			lock_guard<mutex> guard(kept_lock);
+			kept.emplace_back(raw, object);
+			if (kept.size() > KEPT_CHECKPOINTS) {
+				kept.erase(kept.begin());
+			}
+		}
+		return object;
+	}
+
+	// Open the chunk at `path` through DuckDB's caching file system. A
+	// chunk is written once, so a cached copy is used with no validity
+	// check and no request.
+	unique_ptr<CachingFileHandle> OpenChunk(FileSystem &raw_fs, const string &path,
+	                                        FileOpenFlags flags,
+	                                        optional_ptr<FileOpener> opener) {
+		OpenFileInfo info(path);
+		info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+		info.extended_info->options["validate_external_file_cache"] =
+		    Value::BOOLEAN(false);
+		CachingFileSystem caching(raw_fs, db);
+		return caching.OpenFile(
+		    QueryContext(FileOpener::TryGetClientContext(opener)), info, flags,
+		    opener);
+	}
+
 	static string Unwrap(const string &path) {
 		if (StringUtil::StartsWith(path, PQC_SCHEME)) {
 			return path.substr(strlen(PQC_SCHEME));
@@ -303,16 +437,22 @@ private:
 		return DBConfig::GetConfig(db).file_system.get();
 	}
 
-	FileHandle &ChunkHandle(ParquetCheckpointFileHandle &h, idx_t seg_idx) {
-		auto it = h.chunk_handles.find(seg_idx);
-		if (it == h.chunk_handles.end()) {
-			auto ch = h.raw_fs->OpenFile(h.segments[seg_idx].path,
-			                             FileFlags::FILE_FLAGS_READ,
-			                             h.opener);
-			it = h.chunk_handles.emplace(seg_idx, std::move(ch)).first;
+	// The caching handle of segment seg_idx's chunk, opened on first
+	// touch. Any number of scan threads may ask at once.
+	CachingFileHandle &ChunkFile(ParquetCheckpointFileHandle &h, idx_t seg_idx) {
+		auto &chunk = *h.chunks[seg_idx];
+		lock_guard<mutex> guard(chunk.lock);
+		if (!chunk.file) {
+			chunk.file = OpenChunk(*h.raw_fs, h.segments[seg_idx].path,
+			                       h.chunk_flags, h.opener);
 		}
-		return *it->second;
+		return *chunk.file;
 	}
+
+	// The checkpoint versions read last, the newest last.
+	static constexpr idx_t KEPT_CHECKPOINTS = 8;
+	mutex kept_lock;
+	vector<std::pair<string, shared_ptr<CheckpointObject>>> kept;
 
 	DatabaseInstance &db;
 	unique_ptr<FileSystem> local_fs;
