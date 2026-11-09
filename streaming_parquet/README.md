@@ -11,18 +11,25 @@ defines the on-disk and S3 file format. The import name is
 `streaming-parquet`. The code was reworked from telemetry v1 under the
 working name telemetry_v2 and renamed on 2026-08-22.
 
-## The model: chunks and checkpoint versions, in two places
+## The model: objects and checkpoint versions, in two places
 
 Data lives in two kinds of artifact, in one format, wherever they are
 stored:
 
-- **Chunks**: immutable pieces of the final parquet file, cut at
-  row-group boundaries, >= 5 MB (the S3 multipart part minimum; the
-  packaging size, never a durability boundary). A chunk is a local
-  file and/or an S3 object with the same name and bytes.
+- **Objects**: immutable pieces of the parquet file, whole row groups,
+  each written once and never changed. A file while it is written is a
+  list of them in file order: chunks (>= 5 MB of final row groups: the
+  S3 multipart part minimum; the packaging size, never a durability
+  boundary), then the final row groups that do not yet fill a chunk,
+  one object each, then the rows of the row group still being filled,
+  one object for each checkpoint's new rows, merged in steps. An object
+  is a local file and/or an S3 object with the same name and bytes.
 - **Checkpoint versions**: `<file>.parquet.<version>.ckpt`, each one
-  object written once and never changed, holding everything a reader or
-  repair needs. Each checkpoint is a new version.
+  object written once and never changed: the list of the file's objects
+  and its footer. Each checkpoint is a new version.
+
+A checkpoint costs what its new rows cost, not what the file holds: it
+stores one object with those rows and the checkpoint version.
 
 ```
   checkpoint version layout
@@ -30,17 +37,15 @@ stored:
   | header:  magic PQC2, version, CRC-32 of everything after |
   |          the CRC field, final file name, watermark (rows |
   |          covered), data offset                           |
-  | manifest: ordered chunk list -- relative name, byte      |
-  |          length, CRC-32 per chunk                        |
-  | data:    the row groups not yet in a chunk (final), the  |
-  |          newest rows as one provisional row group, and   |
-  |          the footer covering chunks + data               |
+  | manifest: the list of objects -- relative name, byte     |
+  |          length, CRC-32 for each                         |
+  | data:    the footer covering every object                |
   +----------------------------------------------------------+
 ```
 
-The manifest defines a virtual file: chunk i covers logical bytes
+The manifest defines a virtual file: object i covers logical bytes
 [start_i, start_i + len_i), the data region follows, the footer
-describes the whole. It is ordinary parquet: chunks + data region,
+describes the whole. It is ordinary parquet: objects + data region,
 concatenated, is the file. Relative names make the set relocatable.
 
 **Two copies, one format.** The same bytes are written to local disk
@@ -57,11 +62,11 @@ tier or mode.
   memory  |  arrow_ring: mutable -> frozen -> recycled          |
           |  rows, cursors, tables, DuckDB views                 |
           +=====================================================+
-             |  frozen spans -> chunks + checkpoint versions
+             |  frozen spans -> objects + checkpoint versions
              v
   DURABLE +======================+    +==========================+
           | spool (local disk)   |    | the store (S3)           |
-          | chunk files          |    | chunk objects            |
+          | object files         |    | objects                  |
           | checkpoint versions  |    | checkpoint versions      |
           +======================+    | ticket, catalog          |
                                       +==========================+
@@ -75,16 +80,17 @@ tier or mode.
 - A PUT is atomic: a crash mid-upload leaves no object. S3 objects are
   immutable -- no append, no truncate -- so no ragged states exist on
   S3 and no truncation machinery is needed anywhere.
-- Ordering, every layer: data durable first, claim second. A chunk is
-  stored before any checkpoint version that references it; a version is
+- Ordering, every layer: data durable first, claim second. An object
+  is stored before any checkpoint version that names it; a version is
   stored whole before the ticket names it.
 - A checkpoint version never changes once written: a reader that opened
   one reads one consistent file. A version superseded for 10 minutes
   (by the next version, or by the ticket dropping a finished file) is
-  deleted in the step that uploads a later one; nothing runs on a timer.
-- Crash loss: zero committed rows past the last checkpoint (the newest
-  rows ride inside it). The checkpoint cadence is the loss window --
-  seconds -- independent of row-group and chunk sizes.
+  deleted in the step that uploads a later one, and an object with the
+  last kept version that names it; nothing runs on a timer.
+- Crash loss: zero committed rows past the last checkpoint. The
+  checkpoint cadence is the loss window -- seconds -- independent of
+  row-group and chunk sizes.
 - A view changes from the store to memory at a row the store has and
   the ring still holds (see "The views"). Three quarters of the ring
   must hold the unfinished row group and the rows written during the
@@ -95,13 +101,14 @@ tier or mode.
 ## Assembly (= repair; one mechanism)
 
 - `CreateMultipartUpload` on the final key
-- `UploadPartCopy` each chunk object, in manifest order (server-side;
-  each byte copied once)
-- final part: `UploadPartCopy` of the newest checkpoint version, byte
-  range [data offset, end) -- the data region and footer, already in
-  final form. No bytes travel to the host. The last part is exempt from
-  the 5 MB minimum.
-- `CompleteMultipartUpload`. The chunks and checkpoint versions stay
+- `UploadPartCopy` each object of at least 5 MB, in manifest order
+  (the chunks: server-side, each byte copied once, no bytes travel)
+- final part: the smaller objects after the last chunk and the newest
+  checkpoint version's data region (the footer), fetched and sent as
+  one `UploadPart`. S3 cannot join small objects, and refuses a part
+  under 5 MB unless it is the last; these are under 5 MB together, or
+  a chunk would hold them.
+- `CompleteMultipartUpload`. The objects and checkpoint versions stay
   while the ticket still lists the file and 10 minutes after it drops it
   (readers were told of them); then they are deleted.
 
@@ -405,7 +412,7 @@ stream. `S3Sink` fails fast (5 s connect, 15 s read, 2 attempts).
 | process crash | 0 rows past the last local checkpoint | assembly from local chunks + checkpoint |
 | disk loss | rows since the last S3 checkpoint PUT | assembly from S3, from any machine |
 | WAN outage | none (local copies continue; S3 catches up) | shipper drains the backlog |
-| crash during assembly | none; chunks and checkpoint are durable | re-run; a lifecycle rule deletes the dead multipart upload |
+| crash during assembly | none; objects and checkpoint are durable | re-run; a lifecycle rule deletes the dead multipart upload |
 | corrupted checkpoint version | none | header CRC refuses it; repair uses the newest version that holds |
 | corrupted chunk | detected | manifest CRC refuses it at read/assembly |
 | data page corruption | detected | page CRCs on by default; `verify()` reads every page |
