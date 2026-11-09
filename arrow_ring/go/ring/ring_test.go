@@ -74,7 +74,7 @@ func TestRowWriteReadBack(t *testing.T) {
 }
 
 func TestWrapAndStale(t *testing.T) {
-	r, err := NewRing(testSchema(), 64, &Options{LeaseMarginS: 0})
+	r, err := NewRing(testSchema(), 64, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,13 +125,13 @@ func TestAppendRecordBulk(t *testing.T) {
 }
 
 func TestStaticRelationZeroCopyOut(t *testing.T) {
-	r, err := NewRing(testSchema(), 512, &Options{LeaseMarginS: 0})
+	r, err := NewRing(testSchema(), 512, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer r.Close()
 	fill(t, r, 0, 400)
-	rs, err := r.StaticRelation(time.Second)
+	rs, err := r.StaticRelation()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,13 +166,13 @@ func TestStaticRelationZeroCopyOut(t *testing.T) {
 }
 
 func TestPinStallsWriterLoudly(t *testing.T) {
-	r, err := NewRing(testSchema(), 64, &Options{LeaseMarginS: 0})
+	r, err := NewRing(testSchema(), 64, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer r.Close()
 	fill(t, r, 0, 64) // full
-	rs, err := r.StaticRelation(10 * time.Millisecond)
+	rs, err := r.StaticRelation()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +193,7 @@ func TestPinStallsWriterLoudly(t *testing.T) {
 // Pin(lo, hi) holds the rows named and no others: the writer recycles
 // everything below lo and meets the pin only when it reaches lo.
 func TestPinRangeHoldsOnlyItsRows(t *testing.T) {
-	r, err := NewRing(testSchema(), 64, &Options{LeaseMarginS: 0})
+	r, err := NewRing(testSchema(), 64, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -49,7 +49,7 @@ func main() {
 		{Name: "n", Type: arrow.PrimitiveTypes.Int64},
 		{Name: "s", Type: arrow.BinaryTypes.String},
 	}, nil)
-	r, err := ring.NewRing(schema, 72000, &ring.Options{RateHint: 12000})
+	r, err := ring.NewRing(schema, 72000, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -83,7 +83,7 @@ func main() {
 		n += 1200
 
 		if stage == "relation" || stage == "encode" {
-			rs, err := r.StaticRelation(time.Second)
+			rs, err := r.StaticRelation()
 			if err == nil {
 				recs, err := rs.Records()
 				if err != nil {

@@ -2,7 +2,7 @@
 
 Options, given once at create_stream / attach:
 
-    Memory(lookback, maximum, rate_hint, segment_bytes)
+    Memory(lookback, maximum, segment_bytes)
     Archive(checkpoint_seconds, row_group_rows, row_group_seconds,
             ship_seconds, parquet)
 
@@ -31,13 +31,10 @@ class Memory:
     maximum:  bytes at which the writer stalls. Not enforced on this
               core (the ring is a fixed capacity); accepted so a host
               can say it now.
-    rate_hint: expected rows per second; seeds the ring's lease
-              exclusions.
     segment_bytes: the variable-width pool's segment size (tests).
     """
     lookback: Optional[int] = None
     maximum: Optional[int] = None
-    rate_hint: Optional[float] = None
     segment_bytes: Optional[int] = None
 
 

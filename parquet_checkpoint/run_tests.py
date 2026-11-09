@@ -505,7 +505,7 @@ def _():
 def _():
     import arrow_ring
     import pyarrow.compute as pc
-    ring = arrow_ring.Ring(SCHEMA, capacity=512, lease_margin_s=0.0)
+    ring = arrow_ring.Ring(SCHEMA, capacity=512)
     sink = FakeS3(part_min=4096)
     w = CheckpointWriter('u.parquet', SCHEMA, sink=sink,
                          chunk_bytes=32 * 1024, compression='none',
@@ -521,7 +521,7 @@ def _():
             row.s = f'row-{i}'
             i += 1
         ring.commit()
-        rel = ring.get_static_relation(duration_s=0.5)
+        rel = ring.get_static_relation()
         hot = rel.table
         fresh = hot.filter(pc.greater_equal(hot['n'], w.rows_checkpointed))
         if fresh.num_rows:

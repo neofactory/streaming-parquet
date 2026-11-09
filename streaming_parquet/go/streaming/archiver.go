@@ -66,12 +66,14 @@ type ArchiveOptions struct {
 // parallel.
 const defaultRowGroupRows = 122_880
 
-// ringSizes settles a stream's ring rows and row group rows. A row
-// group's rows stay in the ring until the group is written, and the
-// archiver's read leaves out the rows the writer may reuse meanwhile
-// (2.5 s at the ring's peak rate), so the ring holds two row groups:
-// given neither size, DuckDB's row group; given one, the other follows;
-// given both, a ring under two row groups is refused.
+// ringSizes settles a stream's ring rows and row group rows. The ring
+// holds two row groups. The newest half holds the unfinished row group:
+// its rows stay in the ring until the group is written. The older half
+// is for readers: a view reads from the ring the rows the store does
+// not have yet, and keeps out of the oldest quarter, which is the time
+// a running query has. Given neither size, DuckDB's row group; given
+// one, the other follows; given both, a ring under two row groups is
+// refused.
 func ringSizes(name string, ringRows, rowGroupRows int64) (int64, int64, error) {
 	switch {
 	case ringRows == 0 && rowGroupRows == 0:

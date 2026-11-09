@@ -8,12 +8,15 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/neofactory/streaming-parquet/parquet_checkpoint/go/pqc"
 )
 
 // Ticket is the discovery record, wire-compatible with the Python
 // module: one JSON object at <root>/tickets/<name>.json, rewritten
 // every heartbeat with a fresh Ts; deleted on clean close. A missing
 // ticket means "no publisher"; a stale Ts means "dead publisher".
+// StaleAfter is the writer's own word on when its ticket is stale.
 type Ticket struct {
 	Name string  `json:"name"`
 	Host string  `json:"host"`
@@ -24,12 +27,25 @@ type Ticket struct {
 	//                 subscribers resync instead of livelocking on the
 	//                 restarted seq axis; every file records it as sp_run
 	Archive string `json:"archive,omitempty"` // where the history lives
+	// seconds after Ts at which a reader calls the writer dead: three
+	// beats, at least 30 seconds (pqc.DeadAfter, the one rule)
+	StaleAfter float64 `json:"stale_after,omitempty"`
+}
+
+// staleAfter is the seconds after its write at which a ticket means a
+// dead writer: what the ticket says, else the rule for a writer that
+// names no beat.
+func (t *Ticket) staleAfter() float64 {
+	if t.StaleAfter > 0 {
+		return t.StaleAfter
+	}
+	return pqc.DeadAfter(0).Seconds()
 }
 
 const (
-	heartbeatInterval = 60 * time.Second // readers call it dead after 2.25 min (staleThresholdS)
-	// a ticket older than this is a dead publisher, not a live one
-	staleThresholdS = 135.0
+	// the beat: the ticket is rewritten this often; readers call the
+	// writer dead three beats after the last one (Ticket.StaleAfter)
+	heartbeatInterval = 60 * time.Second
 	// how often a feeder re-reads the ticket while unconnected
 	ticketPollInterval = time.Second
 )

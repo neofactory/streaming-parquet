@@ -167,7 +167,7 @@ def _():
     s = sp.create_stream("v2test/rel", SCHEMA, memory=Memory(lookback=500))
     fill(s, 100)
     a = sp.connect("v2test/rel")
-    with a._ring.get_static_relation(1.0) as rs:
+    with a._ring.get_static_relation() as rs:
         assert (rs.lo, rs.hi) == (0, 100)
         con = duckdb.connect()
         con.register('hot', rs.table)
@@ -221,12 +221,12 @@ def _():
     s = sp.create_stream("v2test/pin", SCHEMA, memory=Memory(lookback=32))
     fill(s, 32)
     a = sp.connect("v2test/pin")
-    rs = a._ring.get_static_relation(0.0)
+    rs = a._ring.get_static_relation()
     try:
         s.get_mutable_row(block_s=0.05)
         assert False, "pinned ring should stall the writer"
     except PinStalledError as e:
-        assert "lease" in str(e)
+        assert "a pin on [0, 32)" in str(e), e
     rs.release()
     row = s.get_mutable_row()
     row.tv = 99.0
@@ -384,7 +384,7 @@ def _():
 def _():
     from hostile import hostile_table, assert_hostile_equal, HOSTILE_SCHEMA
     with tempfile.TemporaryDirectory() as tmp:
-        s = sp.create_stream("v2test/hostile", HOSTILE_SCHEMA, memory=Memory(lookback=6000, rate_hint=2000), store=tmp, archive=Archive(checkpoint_seconds=0.15, row_group_rows=500, row_group_seconds=0.4))
+        s = sp.create_stream("v2test/hostile", HOSTILE_SCHEMA, memory=Memory(lookback=6000), store=tmp, archive=Archive(checkpoint_seconds=0.15, row_group_rows=500, row_group_seconds=0.4))
         a = sp.connect(ticket=s._ticket, memory=Memory(lookback=6000))
         wait_for(lambda: a.state == "streaming", what="feeder connect")
         N = 2000
@@ -394,7 +394,7 @@ def _():
         time.sleep(0.5)
         wait_for(lambda: a._newest_seq == N - 1, what="hostile rows over Flight")
         # the attached ring carried nulls/NaN/unicode/lists intact
-        with a._ring.get_static_relation(1.0) as rs:
+        with a._ring.get_static_relation() as rs:
             assert_hostile_equal(rs.table, 0, N)
         # and the whole timeline (catalog + unfinished file + memory) is exact
         con = view_con()
@@ -419,7 +419,7 @@ def _():
     with tempfile.TemporaryDirectory() as tmp:
         flat = pa.schema([F('n', pa.int64(), nullable=False),
                           F('x', pa.float64(), nullable=False)])
-        s = sp.create_stream("v2test/cr", flat, memory=Memory(lookback=5000, rate_hint=700), store=tmp, archive=Archive(checkpoint_seconds=0.2, row_group_rows=250, row_group_seconds=0.5))
+        s = sp.create_stream("v2test/cr", flat, memory=Memory(lookback=5000), store=tmp, archive=Archive(checkpoint_seconds=0.2, row_group_rows=250, row_group_seconds=0.5))
 
         def burst(a, k):
             s.append(pa.record_batch(
@@ -555,8 +555,7 @@ def _():
             row = s.get_mutable_row(block_s=block_s)
             row.n = i
 
-        # fill 60 rows in ONE commit (keeps the observed rate -- and so
-        # the lease exclusion -- near zero: the pin covers the window)
+        # fill 60 rows in one commit
         for i in range(60):
             alloc(i)
         s.commit()
@@ -572,7 +571,7 @@ def _():
             try:
                 alloc(i)
             except PinStalledError as e:
-                assert "range pin [0, 60)" in str(e) and "arrow_table" in str(e), e
+                assert "a pin on [0, 60)" in str(e) and "arrow_table" in str(e), e
                 stalled = True
                 break
         assert stalled, "a held table must stall the writer"
@@ -591,7 +590,7 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as tmp:
         flat = pa.schema([F('n', pa.int64(), nullable=False)])
-        s = sp.create_stream("v2test/crs", flat, memory=Memory(lookback=4000, rate_hint=500), store=tmp, archive=Archive(checkpoint_seconds=0.15, row_group_rows=200, row_group_seconds=0.4))
+        s = sp.create_stream("v2test/crs", flat, memory=Memory(lookback=4000), store=tmp, archive=Archive(checkpoint_seconds=0.15, row_group_rows=200, row_group_seconds=0.4))
         for w in range(3):
             s.append(pa.record_batch([pa.array(range(w * 150,
                                                            w * 150 + 150))],
@@ -715,7 +714,7 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as tmp:
         flat = pa.schema([F('n', pa.int64(), nullable=False)])
-        s = sp.create_stream("v2test/views", flat, memory=Memory(lookback=4000, rate_hint=500),
+        s = sp.create_stream("v2test/views", flat, memory=Memory(lookback=4000),
                                     store=tmp, archive=Archive(row_group_rows=200, row_group_seconds=0.4, checkpoint_seconds=0.15))
         for w in range(3):
             s.append(pa.record_batch([pa.array(range(w * 150, w * 150 + 150))], schema=flat))
@@ -1017,7 +1016,7 @@ def _():
     # second wave
     fill(s, 30, start=30)
     wait_for(lambda: a._newest_seq == 59, what="second wave")
-    with a._ring.get_static_relation(1.0) as rs:
+    with a._ring.get_static_relation() as rs:
         assert rs.table.num_rows == 60
 
 
@@ -1060,7 +1059,7 @@ def _():
     assert a._oldest_seq == 40, a._oldest_seq
     for seq in (40, 50, 59):
         assert a._read_row(seq).tv == float(seq)
-    with a._ring.get_static_relation(1.0) as rs:
+    with a._ring.get_static_relation() as rs:
         assert rs.lo == 40 and rs.hi == 60
 
 
@@ -1151,9 +1150,7 @@ def _():
         s.start_parquet("LOST")
         # 200 rows in ONE commit into a 64-row ring: the flush pins the
         # pending region at the commit, and by then rows 0..135 are
-        # recycled. (Before the range pin, commits of 20 rows showed a
-        # loss too, but a false one: the lease excluded rows that were
-        # still in the ring.)
+        # recycled.
         fill(s, 200)
         st = s.archive_state()
         assert st.lost_rows == 136, st
@@ -1503,7 +1500,8 @@ def _():
 
 
 @test("ticket: a reader calls a writer dead after the ticket's own "
-      "stale_after; a ticket without one (the Go writer's) after 135 s")
+      "stale_after; a ticket without one after the rule for a writer "
+      "with no beat, 30 s")
 def _():
     import json as _json
     import tempfile
@@ -1519,11 +1517,23 @@ def _():
         a.close()
         with open(path, "w") as f:
             _json.dump({"name": "v2test/st", "host": "127.0.0.1", "port": 1,
-                        "ts": time.time() - 60}, f)
+                        "ts": time.time() - 20}, f)
         a = sp.connect("v2test/st", memory=Memory(lookback=500), store=root)
         wait_for(lambda: a.state in ("connecting", "reconnecting"),
-                 what="a 60 s old ticket without stale_after is live")
+                 what="a 20 s old ticket without stale_after is live")
         a.close()
+        with open(path, "w") as f:
+            _json.dump({"name": "v2test/st", "host": "127.0.0.1", "port": 1,
+                        "ts": time.time() - 40}, f)
+        a = sp.connect("v2test/st", memory=Memory(lookback=500), store=root)
+        wait_for(lambda: a.state == "waiting",
+                 what="a 40 s old ticket without stale_after is stale")
+        assert "stale after 30 s" in a.standing()[0], a.standing()
+        a.close()
+        # the one rule: three beats, at least 30 seconds
+        assert sp._tickets.stale_after({}) == parquet_checkpoint.dead_after() == 30.0
+        assert parquet_checkpoint.dead_after(5) == 30.0
+        assert parquet_checkpoint.dead_after(60) == 180.0
 
 
 def _catalog_rows(folder, sql="SELECT count(*), min(n), max(n) FROM b.data"):

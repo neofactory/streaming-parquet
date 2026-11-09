@@ -6,7 +6,7 @@ errors); the engine is core/libarrow_ring.dylib. Python's jobs here:
 schema metadata (leaf routing, handle classes via _schema/_row), value
 conversion at the boundary (datetime -> ticks, Decimal -> bytes,
 sequences -> packed elements), and pyarrow import of exported streams.
-Everything stateful — slots, cursors, pins, leases, pools — lives in C.
+Everything stateful — slots, cursors, pins, pools — lives in C.
 """
 
 import datetime
@@ -41,8 +41,6 @@ typedef struct ArAllocator {
   void *ctx;
 } ArAllocator;
 typedef struct ArRingOptions {
-  double rate_hint;
-  double lease_margin_s;
   int64_t segment_bytes;
   ArAllocator allocator;
   void (*diag)(void *, const char *);
@@ -75,15 +73,13 @@ ArStatus ar_get_var(const ArRing *ring, int64_t seq, int32_t leaf,
                     const void **data, int64_t *n, _Bool *is_null);
 int64_t ar_oldest_seq(const ArRing *ring);
 int64_t ar_newest_seq(const ArRing *ring);
-double ar_lease_rate(const ArRing *ring);
 uint64_t ar_leaf_data_address(const ArRing *ring, int32_t leaf);
 uint64_t ar_leaf_valid_address(const ArRing *ring, int32_t leaf);
 uint64_t ar_var_data_address(const ArRing *ring, int32_t leaf,
                              int64_t elem_seq);
 int32_t ar_pool_segment_count(const ArRing *ring, int32_t leaf);
 int64_t ar_pool_oversized_count(const ArRing *ring, int32_t leaf);
-void ar_set_lease_margin(ArRing *ring, double margin_s);
-ArStatus ar_relation(ArRing *ring, double duration_s, ArRecordSet **out);
+ArStatus ar_relation(ArRing *ring, ArRecordSet **out);
 ArStatus ar_pin(ArRing *ring, int64_t lo, int64_t hi, ArRecordSet **out);
 int64_t ar_recordset_lo(const ArRecordSet *rs);
 int64_t ar_recordset_hi(const ArRecordSet *rs);
@@ -214,8 +210,7 @@ class Ring:
     See the package README (the contract) — this class is the Python
     face of the C core."""
 
-    def __init__(self, schema, capacity, rate_hint=None,
-                 segment_bytes=None, lease_margin_s=None):
+    def __init__(self, schema, capacity, segment_bytes=None):
         # Python-side flatten first: validates the type surface with the
         # documented error messages and yields the routing metadata.
         self._leaves, tree = flatten_schema(schema)
@@ -227,9 +222,6 @@ class Ring:
         cs = ffi.new("char[]", 128)
         schema._export_to_c(int(ffi.cast("uintptr_t", cs)))
         opts = ffi.new("ArRingOptions *")
-        opts.rate_hint = float(rate_hint) if rate_hint else 0.0
-        opts.lease_margin_s = (lease_margin_s if lease_margin_s is not None
-                               else 0.5)
         opts.segment_bytes = segment_bytes or 0
         out = ffi.new("ArRing **")
         st = lib.ar_ring_new(cs, capacity, opts, out)
@@ -237,7 +229,6 @@ class Ring:
             msg = ffi.string(lib.ar_last_error(ffi.NULL)).decode()
             raise TypeError(msg)
         self._c = out[0]
-        self._lease_margin = float(opts.lease_margin_s)
 
         self._li = [lib.ar_leaf_index(self._c, lf.path.encode())
                     for lf in self._leaves]
@@ -256,17 +247,6 @@ class Ring:
         if getattr(self, '_c', None) is not None:
             lib.ar_ring_free(self._c)
             self._c = None
-
-    # ---- lease margin: settable for exact test bounds -------------------
-
-    @property
-    def LEASE_MARGIN_S(self):
-        return self._lease_margin
-
-    @LEASE_MARGIN_S.setter
-    def LEASE_MARGIN_S(self, value):
-        self._lease_margin = float(value)
-        lib.ar_set_lease_margin(self._c, self._lease_margin)
 
     # ---- write side -------------------------------------------------------
 
@@ -313,21 +293,29 @@ class Ring:
                 f"seq {seq} recycled (oldest readable is {oldest})")
         return self._read_cls(self, seq)   # a Row's slot IS the seq
 
-    def get_static_relation(self, duration_s):
-        """Pin a frozen record set (see README). Yours to release —
-        context manager; an overstayed hold eventually stalls the
-        writer, loudly, naming the lease."""
+    def get_static_relation(self):
+        """Pin every row the ring holds now, as one frozen record set
+        (see README). Yours to release — release(), detach(), or use as
+        a context manager. On a full ring this pin holds the row the
+        writer needs next: the writer waits until the release, and
+        raises PinStalledError, naming the pin, after its block time.
+        A reader that must not make the writer wait names newer rows
+        with pin(lo, hi)."""
         out = ffi.new("ArRecordSet **")
-        _check(lib.ar_relation(self._c, float(duration_s), out))
-        rs = out[0]
+        _check(lib.ar_relation(self._c, out))
+        return self._record_pin(out[0])
+
+    def _record_pin(self, rs):
+        """The RecordSet for a new C record set, noted with where it
+        was taken so that a stall names its holder."""
         rec = RecordSet(self, rs, lib.ar_recordset_lo(rs),
-                        lib.ar_recordset_hi(rs), duration_s)
+                        lib.ar_recordset_hi(rs))
         now = time.monotonic()
         self._pins[id(rec)] = [rec.lo, rec.hi, now, False,
-                               traceback.extract_stack(limit=9)[:-1]]
+                               traceback.extract_stack(limit=10)[:-2]]
         # A detached pin's end is not observable here (it dies with its
-        # table's buffers); keep detached entries 30 s, long past any
-        # lease, so a stall still names the overdue one.
+        # table's buffers); keep detached entries 30 s, so that a stall
+        # still names a pin detached a moment ago.
         if len(self._pins) > 256:
             for k, p in list(self._pins.items()):
                 if p[3] and now - p[2] > 30.0:
@@ -337,20 +325,15 @@ class Ring:
     def pin(self, lo, hi):
         """Pin the rows [lo, hi) and no others: a record set for a
         caller that knows which rows it needs (the publish and archive
-        paths: the rows they send or write). No lease: the writer
-        meets this pin only after a whole ring of writes, and then
-        the holder is a leak. lo below the oldest readable row is
+        paths: the rows they send or write). The writer meets this
+        pin only after a whole ring of writes, and then the holder is
+        a leak. lo below the oldest readable row is
         raised to it (rec.lo > lo says rows were recycled); hi above
         committed is lowered to it. Yours to release — release(),
         detach(), or use as a context manager."""
         out = ffi.new("ArRecordSet **")
         _check(lib.ar_pin(self._c, int(lo), int(hi), out))
-        rs = out[0]
-        rec = RecordSet(self, rs, lib.ar_recordset_lo(rs),
-                        lib.ar_recordset_hi(rs), None)
-        self._pins[id(rec)] = [rec.lo, rec.hi, time.monotonic(), False,
-                               traceback.extract_stack(limit=9)[:-1]]
-        return rec
+        return self._record_pin(out[0])
 
     def _pins_report(self):
         """The live pins, oldest first, with where each was taken: the
@@ -416,9 +399,6 @@ class Ring:
         return DynamicRelation(self, chunk_rows)
 
     # ---- diagnostics ----------------------------------------------------------
-
-    def _lease_rate(self):
-        return lib.ar_lease_rate(self._c)
 
     def leaf_data_address(self, leaf):
         return lib.ar_leaf_data_address(self._c, leaf)
@@ -706,12 +686,11 @@ class RecordSet:
     Release promptly — release() or use as a context manager; do not
     read the table after release (memory-safe but recyclable)."""
 
-    def __init__(self, ring, c_rs, lo, hi, duration_s):
+    def __init__(self, ring, c_rs, lo, hi):
         self._ring = ring      # keeps the Ring (and so the C ring) alive
         self._c = c_rs
         self.lo = lo
         self.hi = hi
-        self.duration_s = duration_s
         self._table = None
         self._released = False
 

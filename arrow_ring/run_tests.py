@@ -3,7 +3,7 @@
 Run:  python3 packages/arrow_ring/run_tests.py
 
 Covers the allocation model (mutable -> frozen -> recycled), read-only
-handles, pins blocking the writer, lease exclusion math, zero-copy
+handles, pins blocking the writer, zero-copy
 verification, wrapped-region record sets, the Arrow type surface
 (fixed-width tier, structs, nulls), and the variable-width segment pool
 (utf8/binary/list, chunk cuts, oversized values, segment reuse).
@@ -13,7 +13,6 @@ import os
 import subprocess
 import sys
 import threading
-import time
 import traceback
 
 import pyarrow as pa
@@ -110,12 +109,12 @@ def test_allocation_destroys_before_commit():
         ring.read_row(0)
 
 
-# ---- record sets: zero-copy, pins, leases ---------------------------------
+# ---- record sets: zero-copy, pins -----------------------------------------
 
 def test_relation_content_and_range():
     ring = Ring(SCHEMA, capacity=64)
     fill(ring, 10)
-    with ring.get_static_relation(duration_s=0.0) as rs:
+    with ring.get_static_relation() as rs:
         assert (rs.lo, rs.hi) == (0, 10) and len(rs) == 10
         t = rs.table
         assert t.num_rows == 10
@@ -125,7 +124,7 @@ def test_relation_content_and_range():
 def test_relation_is_zero_copy():
     ring = Ring(SCHEMA, capacity=64)
     fill(ring, 10)
-    with ring.get_static_relation(duration_s=0.0) as rs:
+    with ring.get_static_relation() as rs:
         col = rs.table.column('tv').chunk(0)
         # Arrow data buffer must alias the ring's own column memory
         # (leaf 0 = tv in schema order).
@@ -134,11 +133,9 @@ def test_relation_is_zero_copy():
 
 def test_relation_wrapped_region_is_two_chunks():
     ring = Ring(SCHEMA, capacity=8)
-    ring.LEASE_MARGIN_S = 0.0       # two commits observe a real rate;
-                                    # zero the margin for exact bounds
     fill(ring, 8)
     fill(ring, 4, start=8)          # physical window now wraps: seqs 4..11
-    with ring.get_static_relation(duration_s=0.0) as rs:
+    with ring.get_static_relation() as rs:
         assert (rs.lo, rs.hi) == (4, 12)
         t = rs.table
         assert t.column('n').num_chunks == 2
@@ -147,31 +144,28 @@ def test_relation_wrapped_region_is_two_chunks():
 
 def test_empty_relation():
     ring = Ring(SCHEMA, capacity=16)
-    with ring.get_static_relation(duration_s=1.0) as rs:
+    with ring.get_static_relation() as rs:
         assert len(rs) == 0 and rs.table.num_rows == 0
 
 
-def test_lease_excludes_only_rows_facing_recycle():
-    # Exclusion is against the RECYCLE FRONTIER, not the oldest row: a
-    # ring that is not near full excludes nothing (an honest hold
-    # recycles nothing), and a full ring excludes rate x (hold+margin).
-    ring = Ring(SCHEMA, capacity=1000, rate_hint=100.0)
+def test_relation_holds_every_row_the_ring_has():
+    # The whole-window relation leaves no row out, on a ring that is
+    # half full and on a full one, whatever the rate of the writer.
+    ring = Ring(SCHEMA, capacity=1000)
     fill(ring, 500)
-    with ring.get_static_relation(duration_s=2.0) as rs:
-        assert rs.lo == 0 and rs.hi == 500          # half-full: no exclusion
-    # Fresh ring, single commit (a second commit would raise the observed
-    # peak above the hint), filled to capacity:
-    ring = Ring(SCHEMA, capacity=1000, rate_hint=100.0)
-    fill(ring, 1000)
-    # frontier after a 2.5s hold at 100 rows/s: 1000 + 250 - 1000 = 250
-    with ring.get_static_relation(duration_s=2.0) as rs:
-        assert rs.lo == 250 and rs.hi == 1000
+    with ring.get_static_relation() as rs:
+        assert rs.lo == 0 and rs.hi == 500
+    ring = Ring(SCHEMA, capacity=1000)
+    for start in range(0, 2500, 500):        # several commits, then full
+        fill(ring, 500, start=start)
+    with ring.get_static_relation() as rs:
+        assert rs.lo == 1500 and rs.hi == 2500
 
 
 def test_pin_blocks_writer_then_raises():
     ring = Ring(SCHEMA, capacity=8)
     fill(ring, 8)
-    rs = ring.get_static_relation(duration_s=0.0)   # pins [0, 8)
+    rs = ring.get_static_relation()   # pins [0, 8)
     with Raises(PinStalledError):
         ring.get_mutable_row(block_s=0.05)   # seq 8 must recycle seq 0
     rs.release()
@@ -182,7 +176,7 @@ def test_pin_blocks_writer_then_raises():
 
 
 def test_pin_range_holds_only_its_rows():
-    # pin(lo, hi) pins the rows named and no others, with no lease: the
+    # pin(lo, hi) pins the rows named and no others: the
     # writer recycles everything below lo freely and meets the pin only
     # when it reaches lo, a whole ring after the rows were written.
     ring = Ring(SCHEMA, capacity=8)
@@ -260,7 +254,7 @@ def test_chunked_read_pins_only_the_chunk_in_hand():
 def test_writer_unblocks_when_pin_released_concurrently():
     ring = Ring(SCHEMA, capacity=8)
     fill(ring, 8)
-    rs = ring.get_static_relation(duration_s=0.0)
+    rs = ring.get_static_relation()
     t = threading.Timer(0.05, rs.release)
     t.start()
     row = ring.get_mutable_row(block_s=2.0)  # blocks ~50ms, then proceeds
@@ -273,18 +267,10 @@ def test_writer_unblocks_when_pin_released_concurrently():
 def test_frozen_data_stable_under_continued_writes():
     ring = Ring(SCHEMA, capacity=64)
     fill(ring, 10)
-    with ring.get_static_relation(duration_s=0.0) as rs:
+    with ring.get_static_relation() as rs:
         before = rs.table.column('n').to_pylist()
         fill(ring, 20, start=10)             # writer advances, no recycle yet
         assert rs.table.column('n').to_pylist() == before
-
-
-def test_rate_estimate_observes_commits():
-    ring = Ring(SCHEMA, capacity=100_000)
-    fill(ring, 1)                    # seed the commit clock
-    time.sleep(0.01)
-    fill(ring, 1000)
-    assert ring._lease_rate() > 0
 
 
 # ---- type surface: fixed-width tier ----------------------------------------
@@ -308,7 +294,7 @@ def test_fixed_width_kinds_roundtrip():
     row.dur = 1500
     row.day = _dt.date(2026, 8, 19)
     ring.commit()
-    with ring.get_static_relation(duration_s=0.0) as rs:
+    with ring.get_static_relation() as rs:
         d = rs.table.to_pylist()[0]
         assert d['i8'] == -5 and d['u64'] == 2**63
         assert d['f16'] == 1.5 and d['flag'] is True
@@ -325,7 +311,7 @@ def test_bool_bitpacked_across_bytes():
         row = ring.get_mutable_row()
         row.b = (i % 3 == 0)
     ring.commit()
-    with ring.get_static_relation(duration_s=0.0) as rs:
+    with ring.get_static_relation() as rs:
         assert rs.table.column('b').to_pylist() == \
             [(i % 3 == 0) for i in range(20)]
 
@@ -339,7 +325,7 @@ def test_decimal_and_fixed_size_binary():
     row.price = _dec.Decimal('123.4567')
     row.tag = b'ABCD'
     ring.commit()
-    with ring.get_static_relation(duration_s=0.0) as rs:
+    with ring.get_static_relation() as rs:
         d = rs.table.to_pylist()[0]
         assert d['price'] == _dec.Decimal('123.4567')
         assert d['tag'] == b'ABCD'
@@ -356,7 +342,7 @@ def test_fixed_size_list():
         row.xyz = [i, i + 0.5, i + 0.25]
     ring.commit()
     assert ring.read_row(2).xyz == (2.0, 2.5, 2.25)
-    with ring.get_static_relation(duration_s=0.0) as rs:
+    with ring.get_static_relation() as rs:
         assert rs.table.column('xyz').to_pylist()[3] == [3.0, 3.5, 3.25]
     with Raises(ValueError):
         ring.get_mutable_row().xyz = [1.0, 2.0]
@@ -375,7 +361,7 @@ def test_nested_struct():
     ring.commit()
     r = ring.read_row(0)
     assert r.servo.pos == 100 and r.servo.vel == 200
-    with ring.get_static_relation(duration_s=0.0) as rs:
+    with ring.get_static_relation() as rs:
         d = rs.table.to_pylist()[0]
         assert d['servo'] == {'pos': 100, 'vel': 200}
 
@@ -384,8 +370,6 @@ def test_nulls_fixed_width():
     schema = pa.schema([F('x', pa.float64(), nullable=False),
                         F('mark', pa.int32(), nullable=True)])
     ring = Ring(schema, capacity=8)
-    ring.LEASE_MARGIN_S = 0.0        # two commits observe a rate; keep
-                                     # the relation bounds exact
     for i in range(4):
         row = ring.get_mutable_row()
         row.x = float(i)
@@ -401,7 +385,7 @@ def test_nulls_fixed_width():
     row.mark = None                  # explicit null overwrites
     ring.commit()
     assert ring.read_row(4).mark is None
-    with ring.get_static_relation(duration_s=0.0) as rs:
+    with ring.get_static_relation() as rs:
         assert rs.table.column('mark').to_pylist() == [0, None, 20, None, None]
     with Raises(TypeError):
         ring.get_mutable_row().x = None   # not nullable
@@ -421,7 +405,7 @@ def test_utf8_roundtrip():
     ring.commit()
     assert ring.read_row(3).label == 'µm-grid'
     assert ring.read_row(0).label == ''
-    with ring.get_static_relation(duration_s=0.0) as rs:
+    with ring.get_static_relation() as rs:
         assert rs.table.column('label').to_pylist() == words
 
 
@@ -437,7 +421,7 @@ def test_utf8_null_vs_empty():
     assert ring.read_row(0).label == ''
     assert ring.read_row(1).label is None
     assert ring.read_row(2).label is None
-    with ring.get_static_relation(duration_s=0.0) as rs:
+    with ring.get_static_relation() as rs:
         assert rs.table.column('label').to_pylist() == ['', None, None]
 
 
@@ -447,7 +431,7 @@ def test_utf8_string_data_is_zero_copy():
     row = ring.get_mutable_row()
     row.label = 'hello'
     ring.commit()
-    with ring.get_static_relation(duration_s=0.0) as rs:
+    with ring.get_static_relation() as rs:
         col = rs.table.column('label').chunk(0)
         assert col.buffers()[2].address == ring.var_data_address(0, 0)
 
@@ -461,7 +445,7 @@ def test_segment_boundary_causes_chunk_cut():
         row = ring.get_mutable_row()
         row.label = w
     ring.commit()
-    with ring.get_static_relation(duration_s=0.0) as rs:
+    with ring.get_static_relation() as rs:
         col = rs.table.column('label')
         assert col.num_chunks > 1                  # cuts happened
         assert col.to_pylist() == words            # content survives them
@@ -477,7 +461,7 @@ def test_oversized_string_gets_dedicated_segment():
     ring.commit()
     assert ring.pool_oversized_count(0) == 1
     assert ring.read_row(1).label == big
-    with ring.get_static_relation(duration_s=0.0) as rs:
+    with ring.get_static_relation() as rs:
         assert rs.table.column('label').to_pylist() == ['small', big, 'after']
 
 
@@ -527,7 +511,7 @@ def test_batch_crossing_ring_end_keeps_live_strings():
         live = list(range(max(0, n - 10), n))
         assert [ring.read_row(i).label for i in live] == \
             [f'w{i:04d}' for i in live], n
-        with ring.get_static_relation(duration_s=0.0) as rs:
+        with ring.get_static_relation() as rs:
             t = rs.table
             assert t.column('label').to_pylist() == \
                 [f'w{i:04d}' for i in t.column('n').to_pylist()], n
@@ -540,7 +524,7 @@ def test_binary_column():
     row.payload = b'\x00\x01\xffdata'
     ring.commit()
     assert ring.read_row(0).payload == b'\x00\x01\xffdata'
-    with ring.get_static_relation(duration_s=0.0) as rs:
+    with ring.get_static_relation() as rs:
         assert rs.table.column('payload').to_pylist() == [b'\x00\x01\xffdata']
 
 
@@ -554,7 +538,7 @@ def test_list_of_primitive():
     ring.commit()
     assert ring.read_row(0).samples == (1.0, 2.0, 3.0)
     assert len(ring.read_row(1).samples) == 0
-    with ring.get_static_relation(duration_s=0.0) as rs:
+    with ring.get_static_relation() as rs:
         assert rs.table.column('samples').to_pylist() == lists
 
 
@@ -562,13 +546,12 @@ def test_var_with_ring_wrap():
     schema = pa.schema([F('n', pa.int32(), nullable=False),
                         F('label', pa.utf8(), nullable=False)])
     ring = Ring(schema, capacity=8)
-    ring.LEASE_MARGIN_S = 0.0
     for i in range(12):                            # wraps: readable 4..11
         row = ring.get_mutable_row()
         row.n = i
         row.label = f'row-{i}'
         ring.commit()
-    with ring.get_static_relation(duration_s=0.0) as rs:
+    with ring.get_static_relation() as rs:
         t = rs.table
         assert t.column('n').to_pylist() == list(range(4, 12))
         assert t.column('label').to_pylist() == [f'row-{i}'
@@ -616,10 +599,10 @@ def test_ring_to_ring_roundtrip():
     a = Ring(MIXED, capacity=64)
     b = Ring(MIXED, capacity=64)
     fill_mixed(a, 20)
-    with a.get_static_relation(duration_s=0.0) as rs:
+    with a.get_static_relation() as rs:
         b.append_table(rs.table)
-    with b.get_static_relation(duration_s=0.0) as rs_b:
-        with a.get_static_relation(duration_s=0.0) as rs_a:
+    with b.get_static_relation() as rs_b:
+        with a.get_static_relation() as rs_a:
             assert rs_b.table.to_pylist() == rs_a.table.to_pylist()
     assert b.read_row(7).label == 'r7'
     assert b.read_row(7).mark is None
@@ -627,17 +610,15 @@ def test_ring_to_ring_roundtrip():
 
 def test_ring_to_ring_across_wrap():
     a = Ring(MIXED, capacity=16)
-    a.LEASE_MARGIN_S = 0.0
     b = Ring(MIXED, capacity=64)
-    b.LEASE_MARGIN_S = 0.0          # appends observe a rate; exact bounds
     fill_mixed(a, 24)                       # A wraps: readable 8..23
-    with a.get_static_relation(duration_s=0.0) as rs:
+    with a.get_static_relation() as rs:
         expect = rs.table.to_pylist()
         b.append_table(rs.table)
-    with b.get_static_relation(duration_s=0.0) as rs_b:
+    with b.get_static_relation() as rs_b:
         assert rs_b.table.to_pylist() == expect
     # B itself wraps while ingesting more
-    with a.get_static_relation(duration_s=0.0) as rs:
+    with a.get_static_relation() as rs:
         for _ in range(4):
             b.append_table(rs.table)        # 16 + 64 rows through cap 64
     assert b.newest_seq == 79
@@ -647,7 +628,6 @@ def test_append_pyarrow_built_batch():
     # Batches built by pyarrow directly (not from a ring), including a
     # slice with a nonzero offset -- exercises the offset arithmetic.
     ring = Ring(MIXED, capacity=32)
-    ring.LEASE_MARGIN_S = 0.0       # two appends observe a rate; exact bounds
     batch = pa.record_batch({
         'tv': [1.0, 2.0, 3.0, 4.0],
         'servo': [{'pos': 1, 'vel': 2}, {'pos': 3, 'vel': 4},
@@ -659,7 +639,7 @@ def test_append_pyarrow_built_batch():
     }, schema=MIXED)
     ring.append_batch(batch)
     ring.append_batch(batch.slice(1, 2))    # nonzero-offset ingest
-    with ring.get_static_relation(duration_s=0.0) as rs:
+    with ring.get_static_relation() as rs:
         got = rs.table.to_pylist()
     assert got == batch.to_pylist() + batch.slice(1, 2).to_pylist()
 
@@ -709,7 +689,7 @@ def test_wire_map_scatter_gather():
     # gather back: identical bytes
     back = ring.to_wire(wmap, 3, len(frame))
     assert back == _s.pack('<Hd i i 4s', 3, 4.5, 30, -3, b'ABCD')
-    with ring.get_static_relation(duration_s=0.0) as rs:
+    with ring.get_static_relation() as rs:
         assert rs.table.column('pos').to_pylist() == \
             [i * 1.5 for i in range(5)]
 
@@ -775,17 +755,17 @@ def test_hostile_data_ring_roundtrip():
     """Nulls, NaN/Inf, unicode, empty+huge values through append_batch
     -> static relation, exact; then across a wrap (hostile testkit)."""
     from hostile import hostile_batch, assert_hostile_equal, HOSTILE_SCHEMA
-    ring = Ring(HOSTILE_SCHEMA, capacity=4096, lease_margin_s=0.0)
+    ring = Ring(HOSTILE_SCHEMA, capacity=4096)
     for k in range(4):
         ring.append_batch(hostile_batch(k * 700, 700))
-    rel = ring.get_static_relation(duration_s=1.0)
+    rel = ring.get_static_relation()
     try:
         assert_hostile_equal(rel.table, 0, 2800)
     finally:
         rel.release()
     for k in range(4, 8):
         ring.append_batch(hostile_batch(k * 700, 700))
-    rel = ring.get_static_relation(duration_s=1.0)
+    rel = ring.get_static_relation()
     try:
         t = rel.table
         first = t.column('n').to_pylist()[0]

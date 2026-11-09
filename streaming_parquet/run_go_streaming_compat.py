@@ -173,7 +173,7 @@ def _():
                 break
             time.sleep(0.05)
         assert a._newest_seq >= 1499, (a.state, a._newest_seq)
-        with a._ring.get_static_relation(1.0) as rs:
+        with a._ring.get_static_relation() as rs:
             t = rs.table
             lo = t.column('n').to_pylist()[0]
             for i, n in enumerate(t.column('n').to_pylist()):
@@ -197,7 +197,7 @@ def _():
 @test("type matrix Python -> Go: the same values verified by Go getters")
 def _():
     s = sp.create_stream('x/rich-py', RICH, store=ROOT,
-                                memory=sp.Memory(lookback=20000, rate_hint=2000))
+                                memory=sp.Memory(lookback=20000))
     child = subprocess.Popen(
         [BIN, 'attach-rich', ROOT, 'x/rich-py', '1200'],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

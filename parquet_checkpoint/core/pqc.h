@@ -175,6 +175,20 @@ int pqc_reader_chunk(const PqcReader *r, uint32_t idx, const char **name,
 void pqc_reader_data(const PqcReader *r, uint64_t *offset,
                      uint64_t *length);
 
+/* ---- a dead writer ------------------------------------------------------ */
+
+/* A writer is dead when nothing has come from it for
+ * PQC_DEAD_WRITER_BEATS of its beats, and never sooner than
+ * PQC_DEAD_WRITER_MIN_S seconds: one write to S3 has taken 5 seconds.
+ * This is the one rule for every place that asks: a reader of a
+ * stream's ticket, a writer that takes a stream over, and the start-up
+ * sweep that finishes a dead writer's files. beat_seconds is how often
+ * the writer shows that it lives, 0 when it does not say. Returns
+ * seconds. */
+#define PQC_DEAD_WRITER_BEATS 3
+#define PQC_DEAD_WRITER_MIN_S 30.0
+double pqc_dead_after(double beat_seconds);
+
 /* ---- utilities ---------------------------------------------------------- */
 
 /* CRC-32 (IEEE, zlib-compatible) for host-side chunk verification. */

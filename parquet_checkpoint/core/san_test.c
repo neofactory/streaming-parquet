@@ -129,6 +129,13 @@ int main(void) {
     uint8_t *store[2048];       /* pretend sink for object bodies */
     int n_store = 0;
 
+    /* a dead writer: three beats, at least 30 seconds */
+    assert(pqc_dead_after(0.0) == 30.0);
+    assert(pqc_dead_after(5.0) == 30.0);
+    assert(pqc_dead_after(15.0) == 45.0);
+    assert(pqc_dead_after(60.0) == 180.0);
+    assert(pqc_dead_after(-1.0) == 30.0);
+
     /* shift round: idempotence-ish (shift by d then -d = original) */
     {
         size_t n = mini_file(mini, 2000, 3, 4, 126);

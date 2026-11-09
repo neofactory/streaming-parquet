@@ -52,6 +52,7 @@ uint64_t pqc_rows_final(const PqcWriter *w);
 uint64_t pqc_rows_unfinished(const PqcWriter *w);
 uint32_t pqc_chunks_cut(const PqcWriter *w);
 uint64_t pqc_logical_end(const PqcWriter *w);
+double pqc_dead_after(double beat_seconds);
 void pqc_free(void *p);
 """
 ffi.cdef(_CDEF)
@@ -79,6 +80,12 @@ for _name in sorted(set(re.findall(r"\b(pqc_\w+)\s*\(", _CDEF))):
 for _type in (f'char[{_ERRLEN}]', f'char[{NAME_MAX}]', 'const uint8_t **',
               'uint64_t *', 'uint32_t *'):
     ffi.new(_type)
+
+
+def dead_after(beat_seconds=0.0):
+    """Seconds of silence after which a writer with this beat is dead
+    (pqc_dead_after: three beats, at least 30 seconds)."""
+    return float(lib.pqc_dead_after(float(beat_seconds)))
 
 
 class CoreError(Exception):

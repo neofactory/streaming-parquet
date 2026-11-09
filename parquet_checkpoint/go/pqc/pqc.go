@@ -547,6 +547,16 @@ func Finalize(name string, sink Sink) (string, error) {
 	return "recovered", nil
 }
 
+// DeadAfter is how long a writer with this beat must be silent before
+// it is dead: three beats, and never sooner than 30 seconds. It is the
+// core's rule (pqc_dead_after), the same one the Python host uses for
+// a ticket and for the start-up sweep. A zero beat: the writer does
+// not say how often it shows that it lives.
+func DeadAfter(beat time.Duration) time.Duration {
+	s := float64(C.pqc_dead_after(C.double(beat.Seconds())))
+	return time.Duration(s * float64(time.Second))
+}
+
 // CRC32 is the core's CRC (IEEE, zlib-compatible) for host-side use.
 func CRC32(b []byte) uint32 {
 	return uint32(C.pqc_crc32(bytesPtr(b), C.size_t(len(b))))

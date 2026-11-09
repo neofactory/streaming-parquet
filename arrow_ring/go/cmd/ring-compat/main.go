@@ -71,7 +71,7 @@ func main() {
 		if _, err := r.Commit(); err != nil {
 			die(err)
 		}
-		rs, err := r.StaticRelation(time.Second)
+		rs, err := r.StaticRelation()
 		if err != nil {
 			die(err)
 		}
