@@ -79,7 +79,6 @@ int main(void) {
 
   ArRingOptions opts;
   memset(&opts, 0, sizeof(opts));
-  opts.lease_margin_s = -1.0;   /* clamps to 0: exact bounds */
   opts.segment_bytes = 4096;    /* small segments: exercise reclaim */
 
   ArRing *a = NULL;
@@ -135,7 +134,7 @@ int main(void) {
     if (i % 1000 == 999) {
       OK(ar_commit(a, NULL), a, "commit@rel");
       ArRecordSet *rs = NULL;
-      OK(ar_relation(a, 0.0, &rs), a, "relation");
+      OK(ar_relation(a, &rs), a, "relation");
       CHECK(ar_recordset_hi(rs) - ar_recordset_lo(rs) > 0, "relation size");
       struct ArrowArrayStream stream;
       OK(ar_recordset_stream(rs, &stream), a, "stream");
@@ -167,7 +166,7 @@ int main(void) {
   /* ---- pin stall + staleness ------------------------------------------- */
   {
     ArRecordSet *rs = NULL;
-    OK(ar_relation(a, 0.0, &rs), a, "pin relation");
+    OK(ar_relation(a, &rs), a, "pin relation");
     ArStatus st = ar_row_begin(a, 5, NULL);
     CHECK(st == AR_ERR_PIN_STALLED, "pin stalls writer");
     ar_recordset_release(rs);
@@ -215,7 +214,7 @@ int main(void) {
     }
     OK(ar_commit(r2, NULL), r2, "ipc commit");
     ArRecordSet *rs2 = NULL;
-    OK(ar_relation(r2, 0.0, &rs2), r2, "ipc rel");
+    OK(ar_relation(r2, &rs2), r2, "ipc rel");
     g_ipc_bytes = 0;
     /* the core v1 contract: write_ipc is a LOUD not-implemented stub
      * (hosts feed ar_recordset_stream to their own IPC writer) */

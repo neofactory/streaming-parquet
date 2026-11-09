@@ -33,6 +33,8 @@ import json
 import os
 import threading
 
+import parquet_checkpoint
+
 DEFAULT_PUBLIC_STORE = "s3://streaming-parquet"
 
 _lock = threading.Lock()
@@ -137,15 +139,16 @@ def _make_backend(store):
 
 # ---- store operations (module face) -----------------------------------
 
-#: tickets without "stale_after" -- the Go writer's, rewritten once a
-#: minute -- are stale after 2.25 of its beats
-GO_TICKET_STALE_S = 135.0
-
-
 def stale_after(ticket):
-    """Seconds after its write a ticket means a dead writer: the writer's
-    own promise (three beats, at least 30 s), else the Go writer's."""
-    return float(ticket.get("stale_after", GO_TICKET_STALE_S))
+    """Seconds after its write a ticket means a dead writer. The writer
+    says so in the ticket ("stale_after"), by the one rule for a dead
+    writer: three of its beats, at least 30 seconds
+    (parquet_checkpoint.dead_after). A ticket that does not say gets
+    the rule for a writer with no beat."""
+    promised = ticket.get("stale_after")
+    if promised is None:
+        return parquet_checkpoint.dead_after()
+    return float(promised)
 
 
 def put_ticket(store, name, ticket):

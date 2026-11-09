@@ -14,7 +14,7 @@ shared C cores):
 | package | role | docs |
 |---|---|---|
 | [`arrow_ring`](arrow_ring/README.md) | the hot tier: a recycling builder over ring storage, zero-copy Arrow out | its README is the contract |
-| [`parquet_checkpoint`](parquet_checkpoint/README.md) | the durable format: crash-durable, queryable-while-open parquet (chunks + one checkpoint), local and S3 | includes the errata list |
+| [`parquet_checkpoint`](parquet_checkpoint/README.md) | the durable format: crash-durable, queryable-while-open parquet (immutable objects + a checkpoint; a checkpoint costs what its new rows cost), local and S3 | includes the errata list |
 | [`streaming_parquet`](streaming_parquet/README.md) | the composition: create/attach streams, Flight fan-out, archival, the timeline relations | the system README |
 
 Each package stands alone: use the ring without parquet, or the
@@ -36,6 +36,9 @@ project depends on a checkout like this:
 `arrow_ring` builds its C core with `make` and the system C compiler
 on first import, next to its sources (`arrow_ring/core/`), so that
 directory must be writable; in an editable install it is the checkout.
+`parquet_checkpoint` does the same for its core
+(`parquet_checkpoint/core/`) the first time a file is written; reading
+needs no build.
 
 ## Layout
 

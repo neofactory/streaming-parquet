@@ -5,9 +5,13 @@ Run after building:  GEN=ninja make release
                      python3 run_extension_tests.py
 """
 
+import http.server
 import os
+import re
+import subprocess
 import sys
 import tempfile
+import threading
 
 import duckdb
 import pyarrow as pa
@@ -30,6 +34,42 @@ def make_rows(start, count):
                      'x': [i * 0.5 for i in range(start, start + count)],
                      's': [f'row-{i}' for i in range(start, start + count)]},
                     schema=SCHEMA)
+
+
+def many_threads_worker(queries):
+    """One process: a checkpoint of 400 row groups in about 200 objects,
+    read again and again on every DuckDB thread. Run apart from the
+    suite because the fault it guards against (2026-11-09: the table of
+    open objects had no lock, and DuckDB 2.0 reads one file handle from
+    every scan thread) showed as a process that hung or died, not as an
+    exception."""
+    d = tempfile.mkdtemp(prefix='ckpt-ext-threads-')
+    writer = CheckpointWriter('live.parquet', SCHEMA, sink=DirSink(d),
+                              chunk_bytes=64 * 1024, compression='none')
+    groups = 400
+    for k in range(groups):
+        writer.write_table(make_rows(k * 1000, 1000))
+    writer.checkpoint()
+    objects = len(os.listdir(os.path.join(d, 'live.parquet.chunks')))
+    c = duckdb.connect(config={'allow_unsigned_extensions': 'true'})
+    c.execute(f"LOAD '{EXT}'")
+    threads = c.execute("SELECT current_setting('threads')").fetchall()[0][0]
+    want = (groups * 1000, sum(range(groups * 1000)))
+    ckpt = os.path.join(d, writer.ckpt_name)
+    for i in range(queries):
+        got = c.execute(f"SELECT count(*), sum(n), sum(x), count(s) "
+                        f"FROM read_parquet('{ckpt}')").fetchall()[0]
+        if got[:2] != want:
+            print(f"query {i}: {got[:2]}, expected {want}")
+            sys.exit(2)
+    print(f"{queries} queries, {threads} threads, {objects} objects")
+
+
+if len(sys.argv) == 3 and sys.argv[1] == '--many-threads':
+    if not os.path.exists(EXT):
+        sys.exit(f"extension not built at {EXT}")
+    many_threads_worker(int(sys.argv[2]))
+    sys.exit(0)
 
 
 passed = failed = 0
@@ -147,6 +187,164 @@ def missing_refuses_loudly():
         pass
 
 
+def many_threads_many_objects():
+    try:
+        r = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), '--many-threads', '200'],
+            capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        assert False, ("200 queries over 200 objects on every thread did "
+                       "not finish in 300 s: the process hangs")
+    assert r.returncode == 0, (
+        f"the process ended with {r.returncode}: "
+        f"{(r.stdout + r.stderr).strip()[-400:]}")
+
+
+class RangeServer(http.server.ThreadingHTTPServer):
+    """A directory over HTTP with byte ranges, and a record of every
+    request: what DuckDB asks a store for, counted."""
+
+    def __init__(self, directory):
+        self.directory = directory
+        self.requests = []              # (method, path, range or None)
+        self.lock = threading.Lock()
+        super().__init__(('127.0.0.1', 0), RangeHandler)
+        threading.Thread(target=self.serve_forever, daemon=True).start()
+
+    def url(self, name):
+        return f"http://127.0.0.1:{self.server_address[1]}/{name}"
+
+    def take(self):
+        """The requests since the last take."""
+        with self.lock:
+            got, self.requests = self.requests, []
+        return got
+
+
+class RangeHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, *args):
+        pass
+
+    def _serve(self, body):
+        rng = self.headers.get('Range')
+        with self.server.lock:
+            self.server.requests.append((self.command, self.path, rng))
+        path = os.path.join(self.server.directory, self.path.lstrip('/'))
+        if not os.path.isfile(path):
+            self.send_response(404)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+        size = os.path.getsize(path)
+        lo, hi = 0, size - 1
+        m = re.match(r'bytes=(\d+)-(\d*)$', rng or '')
+        if m:
+            lo = int(m.group(1))
+            hi = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+            self.send_response(206)
+            self.send_header('Content-Range', f'bytes {lo}-{hi}/{size}')
+        else:
+            self.send_response(200)
+        self.send_header('Accept-Ranges', 'bytes')
+        self.send_header('Content-Length', str(hi - lo + 1))
+        self.send_header('Last-Modified',
+                         self.date_time_string(os.path.getmtime(path)))
+        self.end_headers()
+        if body:
+            with open(path, 'rb') as f:
+                f.seek(lo)
+                self.wfile.write(f.read(hi - lo + 1))
+
+    def do_HEAD(self):
+        self._serve(False)
+
+    def do_GET(self):
+        self._serve(True)
+
+
+def remote_objects_are_read_once():
+    # Over HTTP, as over S3: an object that never changes is fetched
+    # once. A second query on the same checkpoint version asks the store
+    # for nothing; a new version costs its own checkpoint object and the
+    # objects it adds, never an object already read. (2026-11-09: every
+    # query downloaded the checkpoint object three times and opened each
+    # chunk again on each thread, because DuckDB caches nothing of a
+    # pqc:// path.)
+    try:
+        con.execute("LOAD httpfs")
+    except duckdb.Error as e:
+        print(f"  SKIP  the httpfs extension does not load here ({e})")
+        return
+    d = tempfile.mkdtemp(prefix='ckpt-ext-http-')
+    server = RangeServer(d)
+    try:
+        hw = CheckpointWriter('live.parquet', SCHEMA, sink=DirSink(d),
+                              chunk_bytes=64 * 1024, compression='none')
+        for k in range(20):
+            hw.write_table(make_rows(k * 1000, 1000))
+        hw.checkpoint(make_rows(20000, 300))
+        v1 = hw.ckpt_name
+        q = ("SELECT count(*), max(n), sum(x), count(s) "
+             "FROM read_parquet('pqc://{}')")
+        got = con.execute(q.format(server.url(v1))).fetchall()[0]
+        assert got[:2] == (20300, 20299), got
+        first = server.take()
+        assert first, "the first query made no request: is the server used?"
+        fetched = {path for _m, path, _r in first}
+
+        got = con.execute(q.format(server.url(v1))).fetchall()[0]
+        assert got[:2] == (20300, 20299), got
+        again = server.take()
+        assert not again, (
+            f"the same query on the same checkpoint version made "
+            f"{len(again)} request(s): {again[:6]}")
+
+        got = con.execute(f"SELECT s FROM read_parquet('pqc://{server.url(v1)}') "
+                          f"WHERE n = 12345").fetchall()
+        assert got == [('row-12345',)], got
+        other = server.take()
+        assert not other, (
+            f"another query on the same version made {len(other)} "
+            f"request(s): {other[:6]}")
+
+        for k in range(20, 26):
+            hw.write_table(make_rows(k * 1000, 1000))
+        hw.checkpoint(make_rows(26000, 40))
+        v2 = hw.ckpt_name
+        assert v2 != v1
+        got = con.execute(q.format(server.url(v2))).fetchall()[0]
+        assert got[:2] == (26040, 26039), got
+        second = server.take()
+        asked = {path for _m, path, _r in second}
+        assert '/' + v2 in asked, f"the new version was not fetched: {asked}"
+        repeated = asked & fetched
+        assert not repeated, (
+            f"the new version read again {len(repeated)} object(s) that "
+            f"the cache holds: {sorted(repeated)[:6]}")
+
+        # The extension keeps the last 8 checkpoint versions it read and
+        # forgets the rest: a reader that follows a stream for days must
+        # not hold every version it ever saw.
+        count = "SELECT count(*) FROM read_parquet('pqc://{}')"
+        versions = [v2]
+        for k in range(9):               # the tail grows: a new version each
+            hw.checkpoint(make_rows(26000, 40 + 10 * (k + 1)))
+            versions.append(hw.ckpt_name)
+            con.execute(count.format(server.url(hw.ckpt_name))).fetchall()
+        server.take()
+        con.execute(count.format(server.url(versions[-1]))).fetchall()
+        assert not server.take(), "the version read last was fetched again"
+        con.execute(count.format(server.url(versions[0]))).fetchall()
+        asked = {path for _m, path, _r in server.take()}
+        assert '/' + versions[0] in asked, (
+            "a version read 9 versions ago was still kept")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 check("live checkpoint via stock read_parquet()", live_read)
 check("content exact vs CheckpointReader", exact_vs_reader)
 check("projection + filter through the virtual file", projection_and_filter)
@@ -156,6 +354,9 @@ check("pqc:// wrapped path", pqc_scheme_wrapped)
 check("one query over closed file + live checkpoint", mixed_list_closed_and_live)
 check("finalized file reads as plain parquet", finalized_still_reads)
 check("missing checkpoint refuses loudly", missing_refuses_loudly)
+check("200 queries on every thread over 200 objects", many_threads_many_objects)
+check("a remote object is read once, across queries and versions",
+      remote_objects_are_read_once)
 
 
 # S3: the pqc://s3:// route goes through DuckDB's own filesystems

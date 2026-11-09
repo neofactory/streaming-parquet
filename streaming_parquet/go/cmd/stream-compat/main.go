@@ -320,7 +320,6 @@ func main() {
 			pqdir, label = os.Args[5], os.Args[6]
 		}
 		a, err := tel.Attach(name, streaming.AttachOptions{
-			RingRows: 5000, // the lease at this test's rate needs more than two 500-row groups
 			Archive: streaming.ArchiveOptions{BaseDir: pqdir,
 				RowGroupRows: 500, CheckpointSeconds: 0.1}})
 		if err != nil {

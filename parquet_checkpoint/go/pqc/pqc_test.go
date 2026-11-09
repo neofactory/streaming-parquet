@@ -3,6 +3,7 @@ package pqc
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -243,4 +244,93 @@ func containsChunks(name string) bool {
 		}
 	}
 	return false
+}
+
+// A checkpoint stores only its new rows: one object for each, merged in
+// steps, and the checkpoint object holds the list and the footer. The
+// file reads back exactly after every checkpoint.
+func TestCheckpointStoresOnlyNewRows(t *testing.T) {
+	dir := t.TempDir()
+	sink, _ := NewDirSink(dir)
+	w, err := NewWriter("n.parquet", sink, 64<<10, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := map[string]bool{}
+	for k := 1; k <= 120; k++ {
+		wm, err := CheckpointRows(w, makeRows(0, k*50))
+		if err != nil {
+			t.Fatalf("checkpoint %d: %v", k, err)
+		}
+		if wm != uint64(k*50) {
+			t.Fatalf("checkpoint %d: watermark %d", k, wm)
+		}
+		r, err := OpenReader(w.CkptName(), sink)
+		if err != nil {
+			t.Fatal(err)
+		}
+		file, err := r.Compose()
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := ReadRows[Row](file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkExact(t, rows, k*50)
+		// one new object for this checkpoint: its new rows, or a merge
+		objects, _ := sink.List("n.parquet.chunks/")
+		fresh := 0
+		for _, o := range objects {
+			if !before[o] {
+				fresh++
+				before[o] = true
+			}
+		}
+		if fresh != 1 {
+			t.Fatalf("checkpoint %d stored %d objects", k, fresh)
+		}
+		// the unfinished rows stay in few objects
+		if len(r.Manifest) > 40 {
+			t.Fatalf("checkpoint %d: %d objects in the list", k, len(r.Manifest))
+		}
+		// the data region is the footer alone: nothing but the list
+		// and the footer in the checkpoint object
+		if r.dataLen > 16<<10 {
+			t.Fatalf("checkpoint %d: a data region of %d bytes", k, r.dataLen)
+		}
+	}
+	// a tail never gets shorter
+	if _, err := CheckpointRows(w, makeRows(0, 10)); err == nil || !strings.Contains(err.Error(), "never gets shorter") {
+		t.Fatalf("a shorter tail: %v", err)
+	}
+	// the final rows replace the objects of the tail
+	if _, err := WriteRows(w, makeRows(0, 6000)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	r, err := OpenReader(w.CkptName(), sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Manifest) != 1 {
+		t.Fatalf("after the final rows: %d objects in the list", len(r.Manifest))
+	}
+	if err := CloseTyped[Row](w); err != nil {
+		t.Fatal(err)
+	}
+	final, _ := os.ReadFile(filepath.Join(dir, "n.parquet"))
+	rows, err := ReadRows[Row](final)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkExact(t, rows, 6000)
+	if left, _ := sink.List(""); len(left) != 1 {
+		t.Fatalf("left in the store: %v", left)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "n.parquet.chunks")); !os.IsNotExist(err) {
+		t.Fatal("the objects' folder is left behind, empty")
+	}
 }

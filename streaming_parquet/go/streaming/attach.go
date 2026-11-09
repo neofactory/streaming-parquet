@@ -177,7 +177,7 @@ func (a *Attached) lifecycle(t *Telemetry, direct *Ticket) {
 			continue
 		}
 		if direct == nil && cur.Ts > 0 &&
-			float64(time.Now().UnixNano())/1e9-cur.Ts > staleThresholdS {
+			float64(time.Now().UnixNano())/1e9-cur.Ts > cur.staleAfter() {
 			a.state.Store("waiting")
 			if !wait(ticketPollInterval) {
 				return

@@ -8,6 +8,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/neofactory/streaming-parquet/arrow_ring/go/ring"
+	"github.com/neofactory/streaming-parquet/parquet_checkpoint/go/pqc"
 )
 
 // Stream is a local publishing stream: a ring, the process's Flight
@@ -28,9 +29,8 @@ type Stream struct {
 }
 
 type StreamOptions struct {
-	RingRows int64   // ring rows; see ringSizes for the default
-	RateHint float64 // rows/s seed for lease exclusions
-	Parquet  bool    // recording gate at creation (StartParquet later works too)
+	RingRows int64 // ring rows; see ringSizes for the default
+	Parquet  bool  // recording gate at creation (StartParquet later works too)
 	Archive  ArchiveOptions
 }
 
@@ -41,8 +41,7 @@ func (t *Telemetry) CreateStream(name string, schema *arrow.Schema,
 		return nil, err
 	}
 	o.Archive.RowGroupRows = groupRows
-	r, err := ring.NewRing(schema, ringRows,
-		&ring.Options{RateHint: o.RateHint})
+	r, err := ring.NewRing(schema, ringRows, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -98,9 +97,10 @@ func (s *Stream) heartbeat() {
 	pub := func() {
 		err := s.tel.tickets.put(s.Name, Ticket{
 			Name: s.Name, Host: localIP(), Port: s.tel.flight.port,
-			Ts:      float64(time.Now().UnixNano()) / 1e9,
-			Run:     s.run,
-			Archive: s.arch.location})
+			Ts:         float64(time.Now().UnixNano()) / 1e9,
+			Run:        s.run,
+			Archive:    s.arch.location,
+			StaleAfter: pqc.DeadAfter(heartbeatInterval).Seconds()})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[%s] ticket publish error: %v\n",
 				s.Name, err)

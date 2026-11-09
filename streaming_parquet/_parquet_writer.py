@@ -19,7 +19,7 @@ pending finalize. The boot sweep goes through the same path.
 
 import os
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from ._clock import now as _wall_time
 
@@ -70,12 +70,11 @@ class ParquetWriter:
     process via the `.ckpt` object (parquet_checkpoint.live_table).
     """
 
-    DEFAULT_ROTATION_INTERVAL = timedelta(hours=6)
     #: A mirror pass at or over this many seconds is logged with its
     #: per-file, per-phase breakdown at normal verbosity.
     SHIP_SLOW_S = 1.0
 
-    def __init__(self, stream_name, schema, run, base_dir=None, rotation_interval=None,
+    def __init__(self, stream_name, schema, run, base_dir=None,
                  compression="zstd", compression_level=None,
                  sink=None, remote=None,
                  use_dictionary=None, column_encoding=None):
@@ -109,7 +108,6 @@ class ParquetWriter:
         self._compression_level = compression_level
         self._use_dictionary = use_dictionary
         self._column_encoding = column_encoding
-        self._rotation_interval = rotation_interval or self.DEFAULT_ROTATION_INTERVAL
         # The layout, the same under a directory and under a bucket:
         # <root>/streams/<name>/<files>, the ticket at <root>/tickets/<name>.json.
         stream_dir = os.path.join("streams", stream_name)
@@ -130,6 +128,9 @@ class ParquetWriter:
         self._store_lock = threading.Lock()
         self._bases = {}                # file name -> first row number (this run's files)
         self._in_store = {}             # file -> its newest checkpoint version in the store, unfinished there
+        # checkpoint version -> (rows in finished row groups, rows): what
+        # each version this run wrote covers, for the ticket
+        self._ckpt_rows = {}
         self._stored_row = -1           # newest row of this run in the store
         self._stored_at = None          # when it got there (library clock)
         self.catalog = None             # _catalog.Catalog, set by create_stream
@@ -304,6 +305,7 @@ class ParquetWriter:
         if self._writer is None:
             self._open(first_seq)
         self._writer.write_table(table)
+        self._note_checkpoint()
         self._stored_locally()
 
     def write_batch(self, batch):
@@ -312,6 +314,7 @@ class ParquetWriter:
             self._open()
         table = pa.Table.from_batches([batch], schema=self._schema)
         self._writer.write_table(table)
+        self._note_checkpoint()
 
     def checkpoint(self, tail=None, first_seq=None):
         """Durability point between row-group flushes: `tail` (a Table
@@ -320,7 +323,17 @@ class ParquetWriter:
         if self._writer is None:
             self._open(first_seq)
         self._writer.checkpoint(tail)
+        self._note_checkpoint()
         self._stored_locally()
+
+    def _note_checkpoint(self):
+        """Record what the writer's newest checkpoint version covers:
+        the rows of its finished row groups, and its rows."""
+        w = self._writer
+        if w.ckpt_name is not None:
+            with self._store_lock:
+                self._ckpt_rows[w.ckpt_name] = (w.rows_written,
+                                                w.rows_checkpointed)
 
     def _stored_locally(self):
         """Without a mirror the first copy is the store: a checkpoint is
@@ -336,6 +349,13 @@ class ParquetWriter:
         the checkpoint version `ckpt` (its object name)."""
         with self._store_lock:
             self._in_store[name] = ckpt
+            # the versions before it are named by no later ticket
+            at = parquet_checkpoint.parse_ckpt_object(ckpt)
+            for old in [c for c in self._ckpt_rows if c != ckpt]:
+                got = parquet_checkpoint.parse_ckpt_object(old)
+                if got is not None and at is not None and got[0] == at[0] \
+                        and got[1] < at[1]:
+                    del self._ckpt_rows[old]
             base = self._bases.get(name)
             if base is not None and rows > 0 and base + rows - 1 > self._stored_row:
                 self._stored_row = base + rows - 1
@@ -409,6 +429,26 @@ class ParquetWriter:
             return (self._stored_row, self._stored_at,
                     sorted(c for c in self._in_store.values() if c))
 
+    def store_files(self):
+        """(stored_row, stored_at, files): store_state() with, for each
+        file unfinished in the store, a dict of its newest checkpoint
+        version there (`checkpoint`, the object name), the stream row
+        number of the file's first row (`first_row`), the rows of its
+        finished row groups (`final_rows`) and its rows (`rows`), as
+        that version holds them. A number this run does not know (a
+        file its start-up sweep found) is None. One reading: the row
+        and the files belong together."""
+        with self._store_lock:
+            files = []
+            for name, ckpt in sorted(self._in_store.items()):
+                if not ckpt:
+                    continue
+                final, rows = self._ckpt_rows.get(ckpt, (None, None))
+                files.append({"checkpoint": ckpt,
+                              "first_row": self._bases.get(name),
+                              "final_rows": final, "rows": rows})
+            return self._stored_row, self._stored_at, files
+
     def store_location(self):
         """The stream's folder in the store, ending in '/': the bucket's
         when mirrored, else the first copy's (a directory, or a bucket
@@ -429,6 +469,7 @@ class ParquetWriter:
             name = self._writer.name
             keep = self._keeps_checkpoints()
             self._writer.close(keep_checkpoints=keep)
+            self._note_checkpoint()
             if keep:
                 self._await_catalog(name, self._sink, self._writer.ckpt_name,
                                     self._writer.rows_checkpointed)
@@ -436,10 +477,16 @@ class ParquetWriter:
                 self._finished(name)
         else:
             self._writer.checkpoint()
+            self._note_checkpoint()
         self._writer = None
         self._file_path = None
         self._file_opened_at = None
         self._file_opened_tw = None
+
+    def file_bytes(self):
+        """The bytes of the open file's final row groups; 0 with no
+        file open."""
+        return self._writer.bytes_written if self._writer is not None else 0
 
     def rotate(self):
         """Force rotation: finalize the current file and open a new one

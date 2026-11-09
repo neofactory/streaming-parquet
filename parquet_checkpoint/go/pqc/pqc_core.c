@@ -44,6 +44,11 @@ uint32_t pqc_crc32(const uint8_t *data, size_t len) {
     return c ^ 0xFFFFFFFFu;
 }
 
+double pqc_dead_after(double beat_seconds) {
+    double beats = PQC_DEAD_WRITER_BEATS * beat_seconds;
+    return beats > PQC_DEAD_WRITER_MIN_S ? beats : PQC_DEAD_WRITER_MIN_S;
+}
+
 /* ---- growable buffer -------------------------------------------------- */
 
 typedef struct { uint8_t *p; size_t len, cap; } Buf;
@@ -475,13 +480,23 @@ static int split_mini(const uint8_t *mini, size_t len,
 
 /* ---- writer ----------------------------------------------------------- */
 
-typedef struct {
-    uint8_t *pages;             /* NULL once its chunk is acknowledged */
-    size_t pages_len;
-    Buf rg;                     /* shifted RowGroup element bytes      */
-    uint32_t rg_count;
-    int64_t rows;
-} Group;
+/* The file, as the store holds it while it is written, is a list of
+ * objects in file order and a footer:
+ *
+ *   chunks            >= chunk_bytes of final row groups each
+ *   loose groups      final row groups not yet in a chunk, one object each
+ *   unfinished        the rows of the row group still being filled:
+ *                     one object for each checkpoint's new rows, merged
+ *                     in steps
+ *
+ * An object is written once and never changed. The cost of a checkpoint
+ * follows the new rows: it stores one unfinished object and the
+ * checkpoint object (this list and the footer), never a row a stored
+ * object already holds. A merge replaces the unfinished objects from
+ * some row on by one object of the same rows, so it only ever replaces
+ * the END of the list, and no object that stays ever moves. */
+
+#define PQC_LEVELS 24           /* size steps of the unfinished objects */
 
 typedef struct {
     char name[PQC_NAME_MAX];
@@ -489,27 +504,70 @@ typedef struct {
     uint32_t crc;
 } ManEntry;
 
+typedef struct {                /* a final row group */
+    uint8_t *pages;             /* NULL once a chunk holds it          */
+    size_t pages_len;
+    Buf rg;                     /* shifted RowGroup element bytes      */
+    uint32_t rg_count;
+    int64_t rows;
+    int stored;                 /* in the store as an object of its own */
+    ManEntry obj;               /* that object, while no chunk holds it */
+} Group;
+
+typedef struct {                /* an unfinished object */
+    ManEntry obj;
+    Buf rg;                     /* shifted RowGroup element bytes      */
+    uint32_t rg_count;
+    int64_t rows;
+    uint64_t first_row;         /* file row of its first row           */
+    uint64_t pages_len;
+    uint32_t level;             /* its size step: 0 = one checkpoint   */
+} Unf;
+
+enum { PEND_NONE = 0, PEND_CHUNK, PEND_GROUP, PEND_UNF };
+
 struct PqcWriter {
     char name[PQC_NAME_MAX];
     uint64_t chunk_bytes;
-    uint64_t logical_end;       /* starts after the leading magic */
+    uint64_t logical_end;       /* end of the final groups; starts
+                                   after the leading magic */
     uint64_t rows_final;
+    uint32_t objects_made;      /* numbers the object names */
 
     Group *groups;
     size_t n_groups, cap_groups;
-    size_t first_buffered;      /* first group not in an acked chunk */
-    uint64_t buffered_bytes;
+    size_t first_loose;         /* first group not in a stored chunk */
+    uint64_t loose_bytes;
 
-    uint8_t *tpl;               /* first group's full shifted footer */
+    Unf *unf;                   /* in file order; levels never rise */
+    size_t n_unf, cap_unf;
+    uint64_t unf_rows;
+    /* footer bytes the objects of each size step have cost: every
+     * checkpoint writes the footer, which has an entry for each */
+    uint64_t paid[PQC_LEVELS];
+
+    int span_set;               /* pqc_next_span's answer, for the */
+    size_t span_from;           /* pqc_add_unfinished that follows  */
+    uint64_t span_first_row, span_rows;
+    uint32_t span_level;
+
+    int has_new;                /* an unfinished object not yet stored */
+    Unf new_unf;
+    uint8_t *new_pages;
+    size_t new_from;            /* it replaces unf[new_from ..] */
+
+    uint8_t *tpl;               /* the first object's full shifted footer */
     size_t tpl_len;
 
-    ManEntry *man;
+    ManEntry *man;              /* the chunks */
     size_t n_man, cap_man;
 
-    Buf pending;                /* cut chunk awaiting host store ack */
+    Buf pending;                /* the object awaiting the host's store */
     uint32_t pending_crc;
-    size_t pending_take;        /* groups it consumes */
-    int has_pending;
+    int pending_kind;
+    size_t pending_take;        /* PEND_CHUNK: the groups it holds */
+    size_t pending_group;       /* PEND_GROUP: which group */
+    char pending_name[PQC_NAME_MAX];
 };
 
 PqcWriter *pqc_writer_new(const char *final_name, uint64_t chunk_bytes,
@@ -531,13 +589,33 @@ PqcWriter *pqc_writer_new(const char *final_name, uint64_t chunk_bytes,
     return w;
 }
 
+static void drop_unfinished(PqcWriter *w) {
+    for (size_t i = 0; i < w->n_unf; i++) buf_free(&w->unf[i].rg);
+    w->n_unf = 0;
+    w->unf_rows = 0;
+    memset(w->paid, 0, sizeof(w->paid));
+    w->span_set = 0;
+    if (w->has_new) {
+        buf_free(&w->new_unf.rg);
+        free(w->new_pages);
+        w->new_pages = NULL;
+        w->has_new = 0;
+    }
+    if (w->pending_kind == PEND_UNF) {
+        w->pending_kind = PEND_NONE;
+        w->pending.len = 0;
+    }
+}
+
 void pqc_writer_free(PqcWriter *w) {
     if (!w) return;
+    drop_unfinished(w);
     for (size_t i = 0; i < w->n_groups; i++) {
         free(w->groups[i].pages);
         buf_free(&w->groups[i].rg);
     }
     free(w->groups);
+    free(w->unf);
     free(w->tpl);
     free(w->man);
     buf_free(&w->pending);
@@ -545,8 +623,11 @@ void pqc_writer_free(PqcWriter *w) {
 }
 
 uint64_t pqc_rows_final(const PqcWriter *w) { return w->rows_final; }
+uint64_t pqc_rows_unfinished(const PqcWriter *w) { return w->unf_rows; }
 uint32_t pqc_chunks_cut(const PqcWriter *w) { return (uint32_t)w->n_man; }
 uint64_t pqc_logical_end(const PqcWriter *w) { return w->logical_end; }
+
+void pqc_drop_unfinished(PqcWriter *w) { drop_unfinished(w); }
 
 int64_t pqc_add_group(PqcWriter *w, const uint8_t *mini, size_t len,
                       char *err, size_t errlen) {
@@ -583,7 +664,7 @@ int64_t pqc_add_group(PqcWriter *w, const uint8_t *mini, size_t len,
     g->rg = slices;             /* ownership moves */
     g->rg_count = rg_count;
     g->rows = rows;
-    if (!w->tpl) {              /* first group: keep its full footer */
+    if (!w->tpl) {              /* the first object: keep its full footer */
         w->tpl = footer.p;
         w->tpl_len = footer.len;
     } else {
@@ -591,68 +672,233 @@ int64_t pqc_add_group(PqcWriter *w, const uint8_t *mini, size_t len,
     }
     w->logical_end += pages_len;
     w->rows_final += (uint64_t)rows;
-    w->buffered_bytes += pages_len;
+    w->loose_bytes += pages_len;
+    /* the final groups hold the rows of the unfinished objects now */
+    drop_unfinished(w);
     return rows;
 }
 
-static int cut_pending(PqcWriter *w) {
-    if (w->has_pending || w->buffered_bytes < w->chunk_bytes) return 0;
-    size_t take = 0;
-    uint64_t size = 0;
-    while (size < w->chunk_bytes
-           && w->first_buffered + take < w->n_groups) {
-        size += w->groups[w->first_buffered + take].pages_len;
-        take++;
+void pqc_next_span(PqcWriter *w, uint64_t new_rows,
+                   uint64_t *first_row, uint64_t *rows) {
+    uint64_t n[PQC_LEVELS] = {0}, bytes[PQC_LEVELS] = {0};
+    for (size_t i = 0; i < w->n_unf; i++) {
+        n[w->unf[i].level]++;
+        bytes[w->unf[i].level] += w->unf[i].obj.length;
     }
-    w->pending.len = 0;
-    if (w->n_man == 0)
-        if (buf_put(&w->pending, MAGIC, 4)) return -1;
-    for (size_t k = 0; k < take; k++) {
-        Group *g = &w->groups[w->first_buffered + k];
-        if (buf_put(&w->pending, g->pages, g->pages_len)) return -1;
+    n[0]++;                     /* the object the new rows would be */
+    int merge = -1;             /* the highest step whose run merges */
+    for (int k = PQC_LEVELS - 1; k >= 0; k--) {
+        if (n[k] >= 2 && (w->paid[k] >= bytes[k] || n[k] >= PQC_RUN_LIMIT)) {
+            merge = k;
+            break;
+        }
     }
-    w->pending_crc = pqc_crc32(w->pending.p, w->pending.len);
-    w->pending_take = take;
-    w->has_pending = 1;
+    uint64_t end = w->rows_final + w->unf_rows + new_rows;
+    w->span_from = w->n_unf;
+    w->span_first_row = w->rows_final + w->unf_rows;
+    w->span_level = 0;
+    if (merge >= 0) {
+        /* levels never rise along the list: the run of step `merge`
+         * begins at the first object of that step or below */
+        for (size_t i = 0; i < w->n_unf; i++) {
+            if ((int)w->unf[i].level <= merge) {
+                w->span_from = i;
+                w->span_first_row = w->unf[i].first_row;
+                break;
+            }
+        }
+        w->span_level = merge + 1 < PQC_LEVELS ? (uint32_t)merge + 1
+                                               : PQC_LEVELS - 1;
+    }
+    w->span_rows = end - w->span_first_row;
+    w->span_set = 1;
+    *first_row = w->span_first_row;
+    *rows = w->span_rows;
+}
+
+int64_t pqc_add_unfinished(PqcWriter *w, const uint8_t *mini, size_t len,
+                           char *err, size_t errlen) {
+    if (!w->span_set) {
+        set_err(err, errlen, "pqc_add_unfinished without pqc_next_span: "
+                "the core says which rows the object holds");
+        return -1;
+    }
+    if (w->has_new) {
+        set_err(err, errlen, "an unfinished object is not stored yet");
+        return -1;
+    }
+    const uint8_t *pages, *thrift;
+    size_t pages_len, thrift_len;
+    if (split_mini(mini, len, &pages, &pages_len, &thrift, &thrift_len,
+                   err, errlen))
+        return -1;
+    uint64_t pos = w->logical_end;
+    for (size_t i = 0; i < w->span_from; i++) pos += w->unf[i].pages_len;
+    Buf footer = {0}, slices = {0};
+    uint32_t rg_count = 0;
+    int64_t rows = 0;
+    if (shift_fmd(thrift, thrift_len, (int64_t)pos - 4, &footer, &slices,
+                  &rg_count, &rows, err, errlen)) {
+        buf_free(&footer);
+        buf_free(&slices);
+        return -1;
+    }
+    if ((uint64_t)rows != w->span_rows) {
+        set_err(err, errlen, "the unfinished object does not hold the "
+                "rows pqc_next_span asked for");
+        buf_free(&footer);
+        buf_free(&slices);
+        return -1;
+    }
+    w->new_pages = malloc(pages_len ? pages_len : 1);
+    if (!w->new_pages) {
+        set_err(err, errlen, "out of memory");
+        buf_free(&footer);
+        buf_free(&slices);
+        return -1;
+    }
+    memcpy(w->new_pages, pages, pages_len);
+    memset(&w->new_unf, 0, sizeof(w->new_unf));
+    w->new_unf.rg = slices;     /* ownership moves */
+    w->new_unf.rg_count = rg_count;
+    w->new_unf.rows = rows;
+    w->new_unf.first_row = w->span_first_row;
+    w->new_unf.pages_len = pages_len;
+    w->new_unf.level = w->span_level;
+    w->new_from = w->span_from;
+    w->has_new = 1;
+    w->span_set = 0;
+    if (!w->tpl) {
+        w->tpl = footer.p;
+        w->tpl_len = footer.len;
+    } else {
+        buf_free(&footer);
+    }
+    return rows;
+}
+
+/* Whether a stored object is still owed: the host must drain
+ * pqc_next_object before a checkpoint may claim anything. */
+static int owes_object(const PqcWriter *w) {
+    if (w->pending_kind != PEND_NONE || w->has_new) return 1;
+    if (w->loose_bytes >= w->chunk_bytes && w->first_loose < w->n_groups)
+        return 1;
+    for (size_t i = w->first_loose; i < w->n_groups; i++)
+        if (!w->groups[i].stored) return 1;
     return 0;
 }
 
-int pqc_next_chunk(PqcWriter *w, char name[PQC_NAME_MAX],
-                   const uint8_t **data, uint64_t *len, uint32_t *crc) {
-    if (!w->has_pending && cut_pending(w)) return -1;
-    if (!w->has_pending) return 0;
-    snprintf(name, PQC_NAME_MAX, "%s.chunks/%06u", w->name,
-             (unsigned)(w->n_man + 1));
+/* Choose the next object to store and put its bytes in w->pending. */
+static int cut_pending(PqcWriter *w) {
+    w->pending.len = 0;
+    if (w->loose_bytes >= w->chunk_bytes && w->first_loose < w->n_groups) {
+        /* a chunk: final groups up to chunk_bytes. A group not yet
+         * stored as an object of its own is written only here. */
+        size_t take = 0;
+        uint64_t size = 0;
+        while (size < w->chunk_bytes
+               && w->first_loose + take < w->n_groups) {
+            size += w->groups[w->first_loose + take].pages_len;
+            take++;
+        }
+        if (w->n_man == 0)
+            if (buf_put(&w->pending, MAGIC, 4)) return -1;
+        for (size_t k = 0; k < take; k++) {
+            Group *g = &w->groups[w->first_loose + k];
+            if (buf_put(&w->pending, g->pages, g->pages_len)) return -1;
+        }
+        w->pending_take = take;
+        w->pending_kind = PEND_CHUNK;
+    } else {
+        size_t i = w->first_loose;
+        while (i < w->n_groups && w->groups[i].stored) i++;
+        if (i < w->n_groups) {  /* a final group, as its own object */
+            if (w->n_man == 0 && i == 0)
+                if (buf_put(&w->pending, MAGIC, 4)) return -1;
+            if (buf_put(&w->pending, w->groups[i].pages,
+                        w->groups[i].pages_len)) return -1;
+            w->pending_group = i;
+            w->pending_kind = PEND_GROUP;
+        } else if (w->has_new) {
+            if (w->n_man == 0 && w->n_groups == 0 && w->new_from == 0)
+                if (buf_put(&w->pending, MAGIC, 4)) return -1;
+            if (buf_put(&w->pending, w->new_pages, w->new_unf.pages_len))
+                return -1;
+            w->pending_kind = PEND_UNF;
+        } else {
+            return 0;
+        }
+    }
+    w->pending_crc = pqc_crc32(w->pending.p, w->pending.len);
+    snprintf(w->pending_name, PQC_NAME_MAX, "%s.chunks/%06u", w->name,
+             (unsigned)(w->objects_made + 1));
+    return 0;
+}
+
+int pqc_next_object(PqcWriter *w, char name[PQC_NAME_MAX],
+                    const uint8_t **data, uint64_t *len, uint32_t *crc) {
+    if (w->pending_kind == PEND_NONE && cut_pending(w)) {
+        w->pending_kind = PEND_NONE;
+        return -1;
+    }
+    if (w->pending_kind == PEND_NONE) return 0;
+    memcpy(name, w->pending_name, PQC_NAME_MAX);
     *data = w->pending.p;
     *len = w->pending.len;
     *crc = w->pending_crc;
     return 1;
 }
 
-void pqc_chunk_stored(PqcWriter *w) {
-    if (!w->has_pending) return;
-    if (w->n_man == w->cap_man) {
-        size_t cap = w->cap_man ? w->cap_man * 2 : 8;
-        ManEntry *m = realloc(w->man, cap * sizeof(ManEntry));
-        if (!m) return;         /* next next_chunk re-cuts; nothing lost */
-        w->man = m;
-        w->cap_man = cap;
+void pqc_object_stored(PqcWriter *w) {
+    if (w->pending_kind == PEND_NONE) return;
+    ManEntry e;
+    memcpy(e.name, w->pending_name, PQC_NAME_MAX);
+    e.length = w->pending.len;
+    e.crc = w->pending_crc;
+    if (w->pending_kind == PEND_CHUNK) {
+        if (w->n_man == w->cap_man) {
+            size_t cap = w->cap_man ? w->cap_man * 2 : 8;
+            ManEntry *m = realloc(w->man, cap * sizeof(ManEntry));
+            if (!m) return;     /* the same object is given again */
+            w->man = m;
+            w->cap_man = cap;
+        }
+        w->man[w->n_man++] = e;
+        for (size_t k = 0; k < w->pending_take; k++) {
+            Group *g = &w->groups[w->first_loose + k];
+            w->loose_bytes -= g->pages_len;
+            free(g->pages);
+            g->pages = NULL;
+            g->pages_len = 0;   /* rg slices + rows stay: footers need them */
+        }
+        w->first_loose += w->pending_take;
+    } else if (w->pending_kind == PEND_GROUP) {
+        w->groups[w->pending_group].stored = 1;
+        w->groups[w->pending_group].obj = e;
+    } else {                    /* PEND_UNF: it replaces unf[new_from ..] */
+        if (w->new_from == w->cap_unf) {
+            size_t cap = w->cap_unf ? w->cap_unf * 2 : 16;
+            Unf *u = realloc(w->unf, cap * sizeof(Unf));
+            if (!u) return;     /* the same object is given again */
+            w->unf = u;
+            w->cap_unf = cap;
+        }
+        for (size_t i = w->new_from; i < w->n_unf; i++)
+            buf_free(&w->unf[i].rg);
+        w->new_unf.obj = e;
+        w->unf[w->new_from] = w->new_unf;       /* rg ownership moves */
+        w->n_unf = w->new_from + 1;
+        w->unf_rows = 0;
+        for (size_t i = 0; i < w->n_unf; i++)
+            w->unf_rows += (uint64_t)w->unf[i].rows;
+        /* the runs below its step are gone; they owe nothing more */
+        for (uint32_t k = 0; k < w->new_unf.level; k++) w->paid[k] = 0;
+        free(w->new_pages);
+        w->new_pages = NULL;
+        w->has_new = 0;
     }
-    ManEntry *e = &w->man[w->n_man];
-    snprintf(e->name, PQC_NAME_MAX, "%s.chunks/%06u", w->name,
-             (unsigned)(w->n_man + 1));
-    e->length = w->pending.len;
-    e->crc = w->pending_crc;
-    w->n_man++;
-    for (size_t k = 0; k < w->pending_take; k++) {
-        Group *g = &w->groups[w->first_buffered + k];
-        w->buffered_bytes -= g->pages_len;
-        free(g->pages);
-        g->pages = NULL;
-        g->pages_len = 0;       /* rg slices + rows stay: footers need them */
-    }
-    w->first_buffered += w->pending_take;
-    w->has_pending = 0;
+    w->objects_made++;
+    w->pending_kind = PEND_NONE;
     w->pending.len = 0;
 }
 
@@ -699,96 +945,85 @@ static uint8_t *encode_ckpt(const char *name, uint64_t watermark,
     return out.p;
 }
 
-uint8_t *pqc_build_checkpoint(PqcWriter *w, const uint8_t *tail_mini,
-                              size_t tail_len, uint64_t *out_len,
+uint8_t *pqc_build_checkpoint(PqcWriter *w, const uint8_t *empty_mini,
+                              size_t empty_len, uint64_t *out_len,
                               uint64_t *out_watermark,
                               char *err, size_t errlen) {
-    if (w->has_pending) {
-        set_err(err, errlen, "pending chunk not stored -- a checkpoint "
+    if (owes_object(w)) {
+        set_err(err, errlen, "an object is not stored -- a checkpoint "
                 "must never claim bytes that are not durable");
         return NULL;
     }
-    /* No final groups, no chunks: the tail mini IS the data region. */
-    if (w->n_groups == 0 && w->n_man == 0) {
-        if (!tail_mini) {
+    /* No object at all: the mini file IS the data region. */
+    if (w->n_groups == 0 && w->n_man == 0 && w->n_unf == 0) {
+        if (!empty_mini) {
             set_err(err, errlen, "empty writer: pass an (empty) parquet "
-                    "file as tail_mini for a zero-row checkpoint");
+                    "file for a zero-row checkpoint");
             return NULL;
         }
         const uint8_t *tp, *tt;
         size_t tpl_, ttl;
-        if (split_mini(tail_mini, tail_len, &tp, &tpl_, &tt, &ttl,
+        if (split_mini(empty_mini, empty_len, &tp, &tpl_, &tt, &ttl,
                        err, errlen))
             return NULL;
-        Buf f = {0};
         int64_t trows = 0;
         if (shift_fmd(tt, ttl, 0, NULL, NULL, NULL, &trows, err, errlen))
             return NULL;
-        buf_free(&f);
         uint8_t *ck = encode_ckpt(w->name, (uint64_t)trows, w->man, 0,
-                                  tail_mini, tail_len, out_len,
+                                  empty_mini, empty_len, out_len,
                                   err, errlen);
         if (ck && out_watermark) *out_watermark = (uint64_t)trows;
         return ck;
     }
-    /* Combined footer: chunked + buffered groups, then the tail. */
-    Buf splice = {0}, tail_footer = {0}, tail_slices = {0};
-    uint32_t total_rg = 0, tail_rg = 0;
-    int64_t total_rows = 0, tail_rows = 0;
-    const uint8_t *tail_pages = NULL;
-    size_t tail_pages_len = 0;
+    /* The list: chunks, loose groups, unfinished objects, in file
+     * order. The footer: every row group of them. */
+    size_t n_list = w->n_man + (w->n_groups - w->first_loose) + w->n_unf;
+    ManEntry *list = malloc((n_list ? n_list : 1) * sizeof(ManEntry));
+    Buf splice = {0}, footer = {0}, data = {0};
+    uint8_t *ck = NULL;
+    if (!list) { set_err(err, errlen, "out of memory"); return NULL; }
+    size_t at = 0;
+    for (size_t i = 0; i < w->n_man; i++) list[at++] = w->man[i];
+    for (size_t i = w->first_loose; i < w->n_groups; i++)
+        list[at++] = w->groups[i].obj;
+    for (size_t i = 0; i < w->n_unf; i++) list[at++] = w->unf[i].obj;
+    uint32_t total_rg = 0;
+    int64_t total_rows = 0;
     for (size_t i = 0; i < w->n_groups; i++) {
-        buf_put(&splice, w->groups[i].rg.p, w->groups[i].rg.len);
+        if (buf_put(&splice, w->groups[i].rg.p, w->groups[i].rg.len))
+            goto oom;
         total_rg += w->groups[i].rg_count;
         total_rows += w->groups[i].rows;
     }
-    if (tail_mini) {
-        const uint8_t *tt;
-        size_t ttl;
-        if (split_mini(tail_mini, tail_len, &tail_pages, &tail_pages_len,
-                       &tt, &ttl, err, errlen))
-            goto fail;
-        if (shift_fmd(tt, ttl, (int64_t)w->logical_end - 4, &tail_footer,
-                      &tail_slices, &tail_rg, &tail_rows, err, errlen))
-            goto fail;
-        buf_put(&splice, tail_slices.p, tail_slices.len);
-        total_rg += tail_rg;
-        total_rows += tail_rows;
+    for (size_t i = 0; i < w->n_unf; i++) {
+        if (buf_put(&splice, w->unf[i].rg.p, w->unf[i].rg.len)) goto oom;
+        total_rg += w->unf[i].rg_count;
+        total_rows += w->unf[i].rows;
     }
-    Buf footer = {0};
     if (build_combined(w->tpl, w->tpl_len, total_rows, splice.p,
-                       splice.len, total_rg, &footer, err, errlen)) {
-        buf_free(&footer);
-        goto fail;
+                       splice.len, total_rg, &footer, err, errlen))
+        goto done;
+    if (buf_put(&data, footer.p, footer.len)
+        || buf_u32le(&data, (uint32_t)footer.len)
+        || buf_put(&data, MAGIC, 4))
+        goto oom;
+    ck = encode_ckpt(w->name, (uint64_t)total_rows, list, n_list, data.p,
+                     data.len, out_len, err, errlen);
+    if (ck) {
+        if (out_watermark) *out_watermark = (uint64_t)total_rows;
+        /* each unfinished object has cost its footer entry once more */
+        for (size_t i = 0; i < w->n_unf; i++)
+            w->paid[w->unf[i].level] += w->unf[i].rg.len;
     }
-    Buf data = {0};
-    if (w->n_man == 0) buf_put(&data, MAGIC, 4);
-    for (size_t i = w->first_buffered; i < w->n_groups; i++)
-        buf_put(&data, w->groups[i].pages, w->groups[i].pages_len);
-    if (tail_pages) buf_put(&data, tail_pages, tail_pages_len);
-    buf_put(&data, footer.p, footer.len);
-    buf_u32le(&data, (uint32_t)footer.len);
-    if (buf_put(&data, MAGIC, 4)) {
-        set_err(err, errlen, "out of memory");
-        buf_free(&footer);
-        buf_free(&data);
-        goto fail;
-    }
+    goto done;
+oom:
+    set_err(err, errlen, "out of memory");
+done:
+    free(list);
+    buf_free(&splice);
     buf_free(&footer);
-    buf_free(&splice);
-    buf_free(&tail_footer);
-    buf_free(&tail_slices);
-    uint8_t *ck = encode_ckpt(w->name, (uint64_t)total_rows, w->man,
-                              w->n_man, data.p, data.len, out_len,
-                              err, errlen);
     buf_free(&data);
-    if (ck && out_watermark) *out_watermark = (uint64_t)total_rows;
     return ck;
-fail:
-    buf_free(&splice);
-    buf_free(&tail_footer);
-    buf_free(&tail_slices);
-    return NULL;
 }
 
 /* ---- reader ----------------------------------------------------------- */

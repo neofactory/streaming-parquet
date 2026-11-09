@@ -129,14 +129,65 @@ func (s *S3Sink) List(prefix string) ([]string, error) {
 	return out, nil
 }
 
-// Assemble builds dest from the sources as one multipart upload of
-// server-side part copies: a whole object or a byte range each. Every
-// part but the last must reach MinPart; the upload is aborted on any
-// failure so no part lingers. The final object appears atomically at
+// part is one part of an assembly: a server-side copy of one source,
+// or sources fetched and uploaded together.
+type part struct {
+	copy    bool
+	sources []Source
+}
+
+// planParts groups the sources of an assembly into parts under S3's
+// rule: every part but the last is at least partMin. S3 copies a part
+// server-side from one object, and it cannot join small objects. A
+// source of at least partMin is copied as a part of its own. Smaller
+// sources that follow one another are fetched and uploaded together as
+// one part; such a run takes in sources until it reaches partMin or
+// the file ends. A file is its chunks, each at least partMin, then its
+// smaller objects and its footer: so the chunks are copied and what
+// follows them travels once, as the last part. (The Python plan_parts.)
+func planParts(sources []Source, sizes []int64, partMin int64) []part {
+	var parts []part
+	var run []Source
+	var runBytes int64
+	for i, src := range sources {
+		if len(run) == 0 && sizes[i] >= partMin {
+			parts = append(parts, part{copy: true, sources: []Source{src}})
+			continue
+		}
+		run = append(run, src)
+		runBytes += sizes[i]
+		if runBytes >= partMin {
+			parts = append(parts, part{sources: run})
+			run, runBytes = nil, 0
+		}
+	}
+	if len(run) > 0 {
+		parts = append(parts, part{sources: run})
+	}
+	return parts
+}
+
+// Assemble builds dest from the sources as one multipart upload. The
+// parts are planParts': a server-side copy for each source of at least
+// MinPart (a chunk: no bytes travel), and one uploaded part for a run
+// of smaller sources (the objects after the last chunk and the
+// footer: fetched and sent once). The upload is aborted on any failure
+// so no part lingers. The final object appears atomically at
 // completion.
 func (s *S3Sink) Assemble(dest string, sources []Source) (err error) {
-	if len(sources) > MaxParts {
-		return fmt.Errorf("assemble %s: %d parts exceeds %d", dest, len(sources), MaxParts)
+	sizes := make([]int64, len(sources))
+	for i, src := range sources {
+		if src.Offset < 0 {
+			if sizes[i], err = s.Size(src.Name); err != nil {
+				return fmt.Errorf("assemble %s: source %s: %w", dest, src.Name, err)
+			}
+		} else {
+			sizes[i] = src.Length
+		}
+	}
+	plan := planParts(sources, sizes, MinPart)
+	if len(plan) > MaxParts {
+		return fmt.Errorf("assemble %s: %d parts exceeds %d", dest, len(plan), MaxParts)
 	}
 	key := s.key(dest)
 	mpu, err := s.client.CreateMultipartUpload(s.ctx, &s3.CreateMultipartUploadInput{Bucket: aws.String(s.Bucket), Key: aws.String(key)})
@@ -150,29 +201,43 @@ func (s *S3Sink) Assemble(dest string, sources []Source) (err error) {
 		}
 	}()
 	var parts []types.CompletedPart
-	for i, src := range sources {
+	for i, p := range plan {
 		n := int32(i + 1)
-		in := &s3.UploadPartCopyInput{
-			Bucket: aws.String(s.Bucket), Key: aws.String(key), UploadId: mpu.UploadId, PartNumber: aws.Int32(n),
-			CopySource: aws.String(url.PathEscape(s.Bucket + "/" + s.key(src.Name))),
-		}
-		var srcLen int64
-		if src.Offset < 0 {
-			if srcLen, err = s.Size(src.Name); err != nil {
-				return fmt.Errorf("assemble %s: part %d: %w", dest, n, err)
+		if p.copy {
+			src := p.sources[0]
+			in := &s3.UploadPartCopyInput{
+				Bucket: aws.String(s.Bucket), Key: aws.String(key), UploadId: mpu.UploadId, PartNumber: aws.Int32(n),
+				CopySource: aws.String(url.PathEscape(s.Bucket + "/" + s.key(src.Name))),
 			}
-		} else {
-			srcLen = src.Length
-			in.CopySourceRange = aws.String(fmt.Sprintf("bytes=%d-%d", src.Offset, src.Offset+src.Length-1))
+			if src.Offset >= 0 {
+				in.CopySourceRange = aws.String(fmt.Sprintf("bytes=%d-%d", src.Offset, src.Offset+src.Length-1))
+			}
+			out, err := s.client.UploadPartCopy(s.ctx, in)
+			if err != nil {
+				return fmt.Errorf("assemble %s: part %d copy: %w", dest, n, err)
+			}
+			parts = append(parts, types.CompletedPart{PartNumber: aws.Int32(n), ETag: out.CopyPartResult.ETag})
+			continue
 		}
-		if i < len(sources)-1 && srcLen < MinPart {
-			return fmt.Errorf("assemble %s: part %d is %d bytes; parts before the last must be >= %d", dest, n, srcLen, MinPart)
+		var body []byte
+		for _, src := range p.sources {
+			off := src.Offset
+			if off < 0 {
+				off = 0
+			}
+			b, err := s.Get(src.Name, off, src.Length)
+			if err != nil {
+				return fmt.Errorf("assemble %s: part %d: fetch %s: %w", dest, n, src.Name, err)
+			}
+			body = append(body, b...)
 		}
-		out, err := s.client.UploadPartCopy(s.ctx, in)
+		out, err := s.client.UploadPart(s.ctx, &s3.UploadPartInput{
+			Bucket: aws.String(s.Bucket), Key: aws.String(key), UploadId: mpu.UploadId, PartNumber: aws.Int32(n),
+			Body: bytes.NewReader(body)})
 		if err != nil {
-			return fmt.Errorf("assemble %s: part %d copy: %w", dest, n, err)
+			return fmt.Errorf("assemble %s: part %d upload: %w", dest, n, err)
 		}
-		parts = append(parts, types.CompletedPart{PartNumber: aws.Int32(n), ETag: out.CopyPartResult.ETag})
+		parts = append(parts, types.CompletedPart{PartNumber: aws.Int32(n), ETag: out.ETag})
 	}
 	_, err = s.client.CompleteMultipartUpload(s.ctx, &s3.CompleteMultipartUploadInput{
 		Bucket: aws.String(s.Bucket), Key: aws.String(key), UploadId: mpu.UploadId,

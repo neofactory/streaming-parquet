@@ -10,7 +10,7 @@ torture rig gained idle + bursty rate profiles. UPDATE 2026-08-23 (Paul's design
 calls made; all fixed + tested): #1 publisher restart -> random epoch
 ID in the ticket, feeder resyncs on a FRESH ring on epoch change
 (loud; old ring closed; relations must be re-created); #2 boot sweep
-refuses checkpoints modified < LIVE_SWEEP_THRESHOLD_S=30s ago (file
+refuses checkpoints modified < 30s ago (now `dead_after()`, the one rule for a dead writer; file
 mtime = writer liveness, sinks grew mtime()); #3 Stream.close now
 unregisters (name reusable) AND unregister_stream closes subscriber
 do_get streams (a closed publisher looks closed to feeders); #4 exit

@@ -343,12 +343,16 @@ def _():
                          checkpoint_every_write=False)
     generations = []                     # (objects snapshot, expected rows)
     i = 0
-    for _ in range(25):
-        if rng.random() < 0.7:
+    tail_n = 0
+    for _ in range(40):
+        if rng.random() < 0.5:
             n = rng.randrange(1, 400)
             w.write_table(make_rows(i, n))
             i += n
-        tail_n = rng.randrange(0, 60)
+            tail_n = 0
+        # a tail holds every row since the last write_table: it grows,
+        # or is given up (None: the claim covers the final rows only)
+        tail_n = 0 if rng.random() < 0.15 else tail_n + rng.randrange(0, 60)
         tail = make_rows(i, tail_n) if tail_n else None
         w.checkpoint(tail)
         rows = w.rows_checkpointed
@@ -501,7 +505,7 @@ def _():
 def _():
     import arrow_ring
     import pyarrow.compute as pc
-    ring = arrow_ring.Ring(SCHEMA, capacity=512, lease_margin_s=0.0)
+    ring = arrow_ring.Ring(SCHEMA, capacity=512)
     sink = FakeS3(part_min=4096)
     w = CheckpointWriter('u.parquet', SCHEMA, sink=sink,
                          chunk_bytes=32 * 1024, compression='none',
@@ -517,7 +521,7 @@ def _():
             row.s = f'row-{i}'
             i += 1
         ring.commit()
-        rel = ring.get_static_relation(duration_s=0.5)
+        rel = ring.get_static_relation()
         hot = rel.table
         fresh = hot.filter(pc.greater_equal(hot['n'], w.rows_checkpointed))
         if fresh.num_rows:
@@ -748,6 +752,245 @@ def _():
         assert remote.get('sv.parquet') == local.get('sv.parquet')
 
 
+@test("the shipper sends each object once; after an outage it sends only "
+      "what the newest version names; the remote keeps no object that no "
+      "kept version names")
+def _():
+    from parquet_checkpoint import Shipper
+    with tempfile.TemporaryDirectory() as d:
+        local, remote = DirSink(d), FakeS3(part_min=1024)
+        w = CheckpointWriter('so.parquet', SCHEMA, sink=local,
+                             chunk_bytes=64 * 1024, compression='none',
+                             checkpoint_every_write=False)
+        ship = Shipper('so.parquet', local, remote, superseded_keep_s=0)
+
+        def remote_puts():
+            got = [o[len('put:'):] for o in remote.op_log
+                   if o.startswith('put:')]
+            del remote.op_log[:]
+            return got
+
+        def remote_reads(k):
+            r = CheckpointReader(w.ckpt_name, remote)
+            check_exact(r.table(), k * 40)
+            return {m[0] for m in r.manifest}
+        # a poll at each checkpoint: one new object and the version
+        for k in range(1, 31):
+            w.checkpoint(make_rows(0, k * 40))
+            assert ship.poll()['state'] == 'shipped'
+            puts = remote_puts()
+            assert len(puts) == 2 and puts[-1] == w.ckpt_name, (k, puts)
+            named = remote_reads(k)
+            # with no keep time: what the newest version names, and at
+            # most what the one before it named
+            assert named <= set(remote.list('so.parquet.chunks/')), k
+        # an outage: 25 checkpoints with no poll, small objects merged
+        # and gone meanwhile; one poll ships what the newest names and
+        # the remote lacks, nothing the outage swallowed
+        for k in range(31, 56):
+            w.checkpoint(make_rows(0, k * 40))
+        assert ship.poll()['state'] == 'shipped'
+        puts = remote_puts()
+        named = remote_reads(55)
+        assert puts[-1] == w.ckpt_name and set(puts[:-1]) <= named, puts
+        assert len(puts) < 20, puts
+        # the next poll deletes the version before and its objects
+        w.checkpoint(make_rows(0, 56 * 40))
+        assert ship.poll()['state'] == 'shipped'
+        before = remote_reads(56)
+        w.checkpoint(make_rows(0, 57 * 40))
+        assert ship.poll()['state'] == 'shipped'
+        named = remote_reads(57)
+        assert set(remote.list('so.parquet.chunks/')) <= named | before, (
+            sorted(set(remote.list('so.parquet.chunks/')) - named - before))
+        # the final rows, then both copies finish the same file
+        w.write_table(make_rows(0, 57 * 40))
+        w.checkpoint()
+        assert ship.poll()['state'] == 'shipped'
+        w.close()
+        assert ship.close() == ('recovered', 'so.parquet')
+        assert remote.get('so.parquet') == local.get('so.parquet')
+        assert remote.list('') == ['so.parquet'], remote.list('')
+        assert sorted(os.listdir(d)) == ['so.parquet'], os.listdir(d)
+
+
+@test("a checkpoint stores only its new rows: one object for each, the "
+      "checkpoint object holds the list and the footer and no row, and "
+      "every row is read back after every checkpoint")
+def _():
+    import struct as _struct
+    sink = FakeS3(part_min=4096)
+    w = CheckpointWriter('n.parquet', SCHEMA, sink=sink,
+                         chunk_bytes=64 * 1024, compression='none',
+                         checkpoint_every_write=False)
+    step = 100
+    row_bytes = None
+    objects_before = set()
+    written = 0                          # bytes of every object ever stored
+    for k in range(1, 201):
+        w.checkpoint(make_rows(0, k * step))
+        r = CheckpointReader(w.ckpt_name, sink)
+        # every row, once, in order
+        check_exact(r.table(), k * step)
+        # the data region is the footer and nothing else
+        footer = _struct.unpack('<I', r._data[-8:-4])[0]
+        assert footer + 8 == len(r._data), (k, footer, len(r._data))
+        # one new object for this checkpoint: its new rows, or a merge
+        objects = set(sink.list('n.parquet.chunks/'))
+        fresh = objects - objects_before
+        assert len(fresh) == 1, (k, sorted(fresh))
+        written += sum(len(sink.get(n)) for n in fresh)
+        objects_before = objects
+        if k == 1:
+            row_bytes = len(sink.get(next(iter(fresh)))) / step
+        # the list holds the unfinished row group in few objects: never
+        # more than PQC_RUN_LIMIT of one checkpoint's size
+        rows_each = [g.num_rows for g in
+                     (pq.ParquetFile(r.open()).metadata.row_group(i)
+                      for i in range(len(r.manifest)))]
+        assert rows_each.count(step) <= 16, (k, rows_each)
+        assert len(r.manifest) <= 40, (k, len(r.manifest))
+    # each row is written once for each size step, not once for each
+    # checkpoint: the writer before stored 200 tails of 100 to 20,000
+    # rows, 100 times these rows
+    assert written <= 5 * 200 * step * row_bytes, (written, row_bytes)
+    # the final row group replaces them all, as one object
+    w.write_table(make_rows(0, 200 * step))
+    w.checkpoint()
+    r = CheckpointReader(w.ckpt_name, sink)
+    assert len(r.manifest) == 1, r.manifest
+    check_exact(r.table(), 200 * step)
+    w.close()
+    check_exact(pq.read_table(pa.BufferReader(sink.get('n.parquet'))),
+                200 * step)
+    assert sink.list('') == ['n.parquet'], sink.list('')
+
+
+@test("an object is deleted with the last checkpoint version that names "
+      "it; with no keep time the store holds what the newest version names")
+def _():
+    sink = FakeS3(part_min=4096)
+    w = CheckpointWriter('o.parquet', SCHEMA, sink=sink,
+                         chunk_bytes=64 * 1024, compression='none',
+                         checkpoint_every_write=False, superseded_keep_s=0.0)
+    for k in range(1, 61):
+        w.checkpoint(make_rows(0, k * 50))
+        r = CheckpointReader(w.ckpt_name, sink)
+        named = {m[0] for m in r.manifest}
+        # a version superseded by this one is deleted at the NEXT
+        # checkpoint: the store holds this version's objects and, at
+        # most, those of the one before
+        held = set(sink.list('o.parquet.chunks/'))
+        assert named <= held, (k, sorted(named - held))
+        check_exact(r.table(), k * 50)
+    w.checkpoint(make_rows(0, 60 * 50 + 1))
+    r = CheckpointReader(w.ckpt_name, sink)
+    versions = ckpt_versions(sink, 'o.parquet')
+    assert len(versions) <= 2, versions
+    before = CheckpointReader(versions[0][1], sink) if len(versions) == 2 else r
+    allowed = {m[0] for m in r.manifest} | {m[0] for m in before.manifest}
+    assert set(sink.list('o.parquet.chunks/')) <= allowed, (
+        sorted(set(sink.list('o.parquet.chunks/')) - allowed))
+
+
+@test("a final row group is an object of its own until a chunk holds it; "
+      "the row group that completes a chunk is written once, in the chunk")
+def _():
+    sink = FakeS3(part_min=4096)
+    w = CheckpointWriter('q.parquet', SCHEMA, sink=sink,
+                         chunk_bytes=64 * 1024, compression='none')
+    i, puts = 0, []
+    group = 600                          # about 20 KB: four fill a chunk
+    for k in range(12):
+        before = set(sink.list('q.parquet.chunks/'))
+        w.write_table(make_rows(i, group))
+        i += group
+        fresh = sorted(set(sink.list('q.parquet.chunks/')) - before)
+        assert len(fresh) == 1, (k, fresh)      # one object for each write
+        puts.append(len(sink.get(fresh[0])))
+        r = CheckpointReader(w.ckpt_name, sink)
+        check_exact(r.table(), i)
+        sizes = [m[1] for m in r.manifest]
+        # chunks first, each at least chunk_bytes; then the loose row
+        # groups, together under chunk_bytes
+        chunks = [x for x in sizes if x >= 64 * 1024]
+        assert sizes[:len(chunks)] == chunks, sizes
+        assert sum(sizes[len(chunks):]) < 64 * 1024, sizes
+    assert max(puts) >= 64 * 1024 and min(puts) < 32 * 1024, puts
+    w.close()
+    check_exact(pq.read_table(pa.BufferReader(sink.get('q.parquet'))), i)
+
+
+@test("assembly: an object of the part minimum or more is copied, and "
+      "the smaller objects after it travel once, with the footer")
+def _():
+    from parquet_checkpoint._sinks import plan_parts
+    big, small = 5000, 100
+    src = lambda n: (n, -1, -1)
+    assert plan_parts([src('a'), src('b'), src('c'), src('d')],
+                      [big, big, small, small], 4096) == [
+        ('copy', [src('a')]), ('copy', [src('b')]),
+        ('upload', [src('c'), src('d')])]
+    assert plan_parts([src('a')], [big], 4096) == [('copy', [src('a')])]
+    assert plan_parts([src('a'), src('b')], [small, small], 4096) == [
+        ('upload', [src('a'), src('b')])]
+    # a small object before a large one: the run takes the large one
+    # in, so that no part before the last is under the minimum
+    assert plan_parts([src('a'), src('b'), src('c')],
+                      [small, big, small], 4096) == [
+        ('upload', [src('a'), src('b')]), ('upload', [src('c')])]
+    # the real thing: chunks, loose row groups, unfinished objects
+    sink = FakeS3(part_min=4096)
+    w = CheckpointWriter('u.parquet', SCHEMA, sink=sink,
+                         chunk_bytes=64 * 1024, compression='none',
+                         checkpoint_every_write=False)
+    i = 0
+    for k in range(10):
+        w.write_table(make_rows(i, 600))
+        i += 600
+    for k in range(1, 8):
+        w.checkpoint(make_rows(i, k * 40))
+    rows = w.rows_checkpointed
+    r = CheckpointReader(w.ckpt_name, sink)
+    sizes = [m[1] for m in r.manifest]
+    assert len([x for x in sizes if x >= 64 * 1024]) >= 2, sizes   # chunks
+    assert len([x for x in sizes if x < 4096]) >= 3, sizes  # under the minimum
+    large = 0                            # the objects before the first small one
+    while sizes[large] >= 4096:
+        large += 1
+    del sink.op_log[:]
+    del w                                # a crash: finalize from the store
+    assert finalize('u.parquet', sink)[0] == 'recovered'
+    copies = [o for o in sink.op_log if o.startswith('upload_part_copy:')]
+    uploads = [o for o in sink.op_log if o.startswith('upload_part:')]
+    assert len(copies) == large, (large, sink.op_log)
+    # the rest travels once, with the footer: in as few parts as hold
+    # the part minimum each (the last may be smaller)
+    rest = sum(sizes[large:])
+    assert 1 <= len(uploads) <= rest // 4096 + 1, (rest, sink.op_log)
+    check_exact(pq.read_table(pa.BufferReader(sink.get('u.parquet'))), rows)
+    assert sink.list('') == ['u.parquet'], sink.list('')
+
+
+@test("a tail never gets shorter: checkpoint(tail) with fewer rows than "
+      "the one before is refused, and says why")
+def _():
+    sink = FakeS3(part_min=4096)
+    w = CheckpointWriter('v.parquet', SCHEMA, sink=sink,
+                         chunk_bytes=64 * 1024, checkpoint_every_write=False)
+    w.checkpoint(make_rows(0, 50))
+    try:
+        w.checkpoint(make_rows(0, 20))
+        raise AssertionError("a shorter tail was accepted")
+    except CheckpointError as e:
+        assert "never" in str(e) and "shorter" in str(e), e
+    # no tail: the claim covers the final rows only, and a new tail
+    # begins again
+    assert w.checkpoint() == 0
+    assert w.checkpoint(make_rows(0, 20)) == 20
+    check_exact(CheckpointReader(w.ckpt_name, sink).table(), 20)
+
+
 @test("mangler: 400 corrupted checkpoints refuse loudly, never crash/succeed")
 def _():
     import random as _r
@@ -760,6 +1003,8 @@ def _():
     for i in range(400):
         bad = bytearray(good)
         for _ in range(rng.randrange(1, 8)):
+            if not bad:
+                break                    # cut to nothing: nothing to mangle
             op = rng.random()
             if op < 0.5 and len(bad) > 1:
                 bad[rng.randrange(len(bad))] ^= rng.randrange(1, 256)

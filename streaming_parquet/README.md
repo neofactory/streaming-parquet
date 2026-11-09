@@ -11,18 +11,25 @@ defines the on-disk and S3 file format. The import name is
 `streaming-parquet`. The code was reworked from telemetry v1 under the
 working name telemetry_v2 and renamed on 2026-08-22.
 
-## The model: chunks and checkpoint versions, in two places
+## The model: objects and checkpoint versions, in two places
 
 Data lives in two kinds of artifact, in one format, wherever they are
 stored:
 
-- **Chunks**: immutable pieces of the final parquet file, cut at
-  row-group boundaries, >= 5 MB (the S3 multipart part minimum; the
-  packaging size, never a durability boundary). A chunk is a local
-  file and/or an S3 object with the same name and bytes.
+- **Objects**: immutable pieces of the parquet file, whole row groups,
+  each written once and never changed. A file while it is written is a
+  list of them in file order: chunks (>= 5 MB of final row groups: the
+  S3 multipart part minimum; the packaging size, never a durability
+  boundary), then the final row groups that do not yet fill a chunk,
+  one object each, then the rows of the row group still being filled,
+  one object for each checkpoint's new rows, merged in steps. An object
+  is a local file and/or an S3 object with the same name and bytes.
 - **Checkpoint versions**: `<file>.parquet.<version>.ckpt`, each one
-  object written once and never changed, holding everything a reader or
-  repair needs. Each checkpoint is a new version.
+  object written once and never changed: the list of the file's objects
+  and its footer. Each checkpoint is a new version.
+
+A checkpoint costs what its new rows cost, not what the file holds: it
+stores one object with those rows and the checkpoint version.
 
 ```
   checkpoint version layout
@@ -30,17 +37,15 @@ stored:
   | header:  magic PQC2, version, CRC-32 of everything after |
   |          the CRC field, final file name, watermark (rows |
   |          covered), data offset                           |
-  | manifest: ordered chunk list -- relative name, byte      |
-  |          length, CRC-32 per chunk                        |
-  | data:    the row groups not yet in a chunk (final), the  |
-  |          newest rows as one provisional row group, and   |
-  |          the footer covering chunks + data               |
+  | manifest: the list of objects -- relative name, byte     |
+  |          length, CRC-32 for each                         |
+  | data:    the footer covering every object                |
   +----------------------------------------------------------+
 ```
 
-The manifest defines a virtual file: chunk i covers logical bytes
+The manifest defines a virtual file: object i covers logical bytes
 [start_i, start_i + len_i), the data region follows, the footer
-describes the whole. It is ordinary parquet: chunks + data region,
+describes the whole. It is ordinary parquet: objects + data region,
 concatenated, is the file. Relative names make the set relocatable.
 
 **Two copies, one format.** The same bytes are written to local disk
@@ -57,11 +62,11 @@ tier or mode.
   memory  |  arrow_ring: mutable -> frozen -> recycled          |
           |  rows, cursors, tables, DuckDB views                 |
           +=====================================================+
-             |  frozen spans -> chunks + checkpoint versions
+             |  frozen spans -> objects + checkpoint versions
              v
   DURABLE +======================+    +==========================+
           | spool (local disk)   |    | the store (S3)           |
-          | chunk files          |    | chunk objects            |
+          | object files         |    | objects                  |
           | checkpoint versions  |    | checkpoint versions      |
           +======================+    | ticket, catalog          |
                                       +==========================+
@@ -75,29 +80,55 @@ tier or mode.
 - A PUT is atomic: a crash mid-upload leaves no object. S3 objects are
   immutable -- no append, no truncate -- so no ragged states exist on
   S3 and no truncation machinery is needed anywhere.
-- Ordering, every layer: data durable first, claim second. A chunk is
-  stored before any checkpoint version that references it; a version is
+- Ordering, every layer: data durable first, claim second. An object
+  is stored before any checkpoint version that names it; a version is
   stored whole before the ticket names it.
 - A checkpoint version never changes once written: a reader that opened
   one reads one consistent file. A version superseded for 10 minutes
   (by the next version, or by the ticket dropping a finished file) is
-  deleted in the step that uploads a later one; nothing runs on a timer.
-- Crash loss: zero committed rows past the last checkpoint (the newest
-  rows ride inside it). The checkpoint cadence is the loss window --
-  seconds -- independent of row-group and chunk sizes.
-- A live reader's memory must reach back past the ticket's stored_row
-  (the store lags by at most a ship interval).
+  deleted in the step that uploads a later one, and an object with the
+  last kept version that names it; nothing runs on a timer.
+- Crash loss: zero committed rows past the last checkpoint. The
+  checkpoint cadence is the loss window -- seconds -- independent of
+  row-group and chunk sizes.
+- A view changes from the store to memory at a row the store has and
+  the ring still holds (see "The views"). Three quarters of the ring
+  must hold the unfinished row group and the rows written during the
+  store's lag. The default ring, two row groups, does that below about
+  3,000 rows per second; a view whose ring is too short says so
+  (`ring_note`) and names the `Memory(lookback=...)` to set.
+
+## The margins
+
+One margin for each hazard:
+
+| What it guards | Margin | Where |
+|---|---|---|
+| A reader and the ring | A quarter of the ring | `_views.RING_MARGIN_SHARE` |
+| A reader and the store | 10 minutes: the store keeps an object that long after the list stops naming it, and a view looks again every 5 | `parquet_checkpoint.SUPERSEDED_KEEP_S`, `_views.REPOINT_SHARE` |
+| A dead writer | Three beats, at least 30 seconds | `pqc_dead_after` in the C core (`parquet_checkpoint.dead_after`, Go `pqc.DeadAfter`) |
+
+A beat is the longest time between two writes of the writer's ticket
+(`beat_seconds`; 60 seconds for the Go host). The writer puts the
+result in its ticket as `stale_after`. A reader of the ticket, a writer
+that takes the stream over and the start-up sweep all use that one
+rule. The sweep by hand (`python3 -m parquet_checkpoint mend`) does
+not know a beat, so it waits the 30 seconds.
+
+The ring has no margin of its own. A pin holds exactly its rows, and
+the writer waits only for a pin on the row it must reuse.
 
 ## Assembly (= repair; one mechanism)
 
 - `CreateMultipartUpload` on the final key
-- `UploadPartCopy` each chunk object, in manifest order (server-side;
-  each byte copied once)
-- final part: `UploadPartCopy` of the newest checkpoint version, byte
-  range [data offset, end) -- the data region and footer, already in
-  final form. No bytes travel to the host. The last part is exempt from
-  the 5 MB minimum.
-- `CompleteMultipartUpload`. The chunks and checkpoint versions stay
+- `UploadPartCopy` each object of at least 5 MB, in manifest order
+  (the chunks: server-side, each byte copied once, no bytes travel)
+- final part: the smaller objects after the last chunk and the newest
+  checkpoint version's data region (the footer), fetched and sent as
+  one `UploadPart`. S3 cannot join small objects, and refuses a part
+  under 5 MB unless it is the last; these are under 5 MB together, or
+  a chunk would hold them.
+- `CompleteMultipartUpload`. The objects and checkpoint versions stay
   while the ticket still lists the file and 10 minutes after it drops it
   (readers were told of them); then they are deleted.
 
@@ -162,43 +193,71 @@ each time: O(n^2)); assemble once.
   base + file_row_number, virtualized. BUILT, both languages.
 - Each file also records sp_run, the run (the writer's start time,
   UTC to the microsecond) that wrote it; row numbers restart each run.
-- The seam in duckdb_all is the ticket's stored_row: files up to it,
+- The seam in duckdb_all is a row boundary the store has, above the
+  ring's oldest quarter: the start of an unfinished file, the end of
+  its finished row groups, or the ticket's stored_row. Files up to it,
   memory after it, the same run only.
 - write_table implies a checkpoint (the cheapest moment). A timed
   checkpoint(tail) covers the rows between writes. checkpoint_seconds
   sets crash loss; row_group_seconds sets file quality.
+- Every decision of the writer is taken by time or by bytes, whichever
+  comes first. The host ends a file by time or by event (`cut()`); the
+  writer also ends it when its row groups reach 256 MB
+  (`FILE_CUT_BYTES`), and the next row group begins a new file with
+  the same label. The reason is the footer: it has an entry for each
+  row group and each column and is written at every checkpoint, so a
+  fast stream left to grow for hours would write megabytes of footer
+  every time. A slow stream never reaches the size.
 
 ## The views (connect -> SQL over everything)
 
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
     a = streaming_parquet.connect("probe/voltages", store=STORE)
     view = a.duckdb_all(con)                 # register once
-    con.sql(f"SELECT ... FROM {view.name}")  # every query sees one ticket
+    con.sql(f"SELECT ... FROM {view.name}")  # every query sees one state
 
-`duckdb_all(con)` is one DuckDB view over three pieces, all named by one
-ticket: the finished files of the catalog version the ticket names
-(downloaded with boto3 at exactly that ETag and attached from a local
-copy; DuckDB reads the files' byte ranges from the store), the
-unfinished files at the checkpoint versions the ticket lists (read
-through the parquet_checkpoint extension, so the connection is opened
-with `allow_unsigned_extensions`), and memory: the reader's ring rows
-after the ticket's `stored_row`, same run only. `duckdb_archive(con)` is
-the files alone; `duckdb_live(con)` is memory alone.
+`duckdb_all(con)` is one DuckDB view over three pieces: the finished
+files of the catalog version the ticket names (downloaded with boto3 at
+exactly that ETag and attached from a local copy; DuckDB reads the
+files' byte ranges from the store), the unfinished files the ticket
+lists, each up to the seam (read through the parquet_checkpoint
+extension, so the connection is opened with
+`allow_unsigned_extensions`), and memory: the ring's rows after the
+seam, same run only. `duckdb_archive(con)` is the files alone;
+`duckdb_live(con)` is memory alone.
 
-The view's text names the catalog copy, the checkpoint versions and the
-seam, so a query never mixes two tickets. One background thread per view
-replaces the view when the ticket changes: at once for a live reader,
-which sees the revision on its connection; on the ticket's own schedule
-(its write time plus its beat) for a reader without one. A catalog
-version the store no longer holds means a newer ticket: the view reads
-it again. Every checkpoint version, a live file's and a finished
-file's, stays 10 minutes after it is superseded (by the next version, or
-by the ticket dropping the file); the step that uploads a later one
-deletes it, nothing on a timer. So a polling reader's view never names a
+**The seam.** To the extent that rows are in the ring, the view uses
+them. The seam is the oldest row boundary the store has that is above
+the ring's oldest quarter; the boundaries are the start of each
+unfinished file, the end of its finished row groups, and the ticket's
+`stored_row`. A view uses the newest three quarters of the ring. The
+oldest quarter is the time a running query has: a query keeps the seam
+it began with, and the row after that seam must still be in the ring
+when the query's scan gets there. A query that arrives too late fails
+and says so; it never answers with rows missing. With the default ring
+of two row groups the ring always holds the unfinished row group, so
+the view reads finished row groups from the store, each once, and never
+the rows a checkpoint adds. This is the same for a remote reader, whose
+ring is fed over Flight, and for the process that writes the stream.
+
+**When the view changes.** The view's text names the catalog copy, the
+checkpoint versions and the seam, so a query never mixes two states.
+One background thread per view replaces the text when it must change:
+the seam moved (about once for each row group), the catalog changed, or
+a checkpoint version it names has been replaced for half the time the
+store keeps one. A view with no ring follows every ticket. The thread
+learns of a ticket at once on a live reader, which sees the revision on
+its connection, and on the ticket's own schedule (its write time plus
+its beat) on a reader without one. A catalog version the store no
+longer holds means a newer ticket: the view reads it again. Every
+checkpoint version, a live file's and a finished file's, stays 10
+minutes after it is superseded (by the next version, or by the ticket
+dropping the file; the ticket's `keep_seconds`); the step that uploads
+a later one deletes it, nothing on a timer. So a view never names a
 deleted one. Memory is read a chunk at a time, zero copy, pinning only
 the chunk in hand, so a query holds nothing of the ring between chunks
-however long it runs, and the writer never waits. Without a live writer (no
-ticket, or a stale one) the views read the store's current catalog.
+however long it runs, and the writer never waits. Without a live writer
+(no ticket, or a stale one) the views read the store's current catalog.
 
 The archive is `<store>/streams/<name>` under the store the reader
 connected through; a direct-ticket connect passes `store=`. A Stream
@@ -236,11 +295,18 @@ it in place of a name.
 A stream's ticket is one JSON object at `<store>/tickets/<name>.json`:
 who writes the stream (`name`, `host`, `port`, `run`), how often the
 store's data changes (`checkpoint_seconds`, `ship_seconds`,
-`beat_seconds`) and when to call the writer dead (`stale_after`), what
+`beat_seconds`) and when to call the writer dead (`stale_after`: three
+beats, and never under 30 seconds), what
 the store holds of this run (`stored_row`, `stored_at`), the files still
 unfinished (`unfinished`: each the real path of its newest checkpoint
-version), the published catalog's `catalog_etag`, a `revision` counting
-this run's ticket writes, and the write time `ts`.
+version; `files`: the same with each file's `first_row` on the stream's
+row numbers, the rows of its finished row groups `final_rows`, and its
+`rows`, so a view can place its seam with no download), how long the
+store keeps a checkpoint version after a newer one (`keep_seconds`),
+the published catalog's `catalog_etag`, a `revision` counting this
+run's ticket writes, and the write time `ts`. The Go host's ticket
+says who writes the stream, when it was written and its `stale_after`,
+and none of the store's facts.
 
 The writer writes it right after each upload and each catalog upload,
 and at least once a beat; it deletes it on clean close. When a file
@@ -273,9 +339,9 @@ chain applies; the public bucket needs none.
 | `live_table()` on the writer's machine | local disk | everything up to the local checkpoint |
 | any parquet tool | the store | finished files |
 
-The views read only what the ticket names, so every seam is a stored
-object: a catalog version, a checkpoint version, the ticket's
-stored_row. No reader lists the store.
+The views read only what the ticket names: a catalog version, a
+checkpoint version, and a seam at a row number the ticket gives. No
+reader lists the store.
 
 ## The catalog
 
@@ -375,7 +441,7 @@ stream. `S3Sink` fails fast (5 s connect, 15 s read, 2 attempts).
 | process crash | 0 rows past the last local checkpoint | assembly from local chunks + checkpoint |
 | disk loss | rows since the last S3 checkpoint PUT | assembly from S3, from any machine |
 | WAN outage | none (local copies continue; S3 catches up) | shipper drains the backlog |
-| crash during assembly | none; chunks and checkpoint are durable | re-run; a lifecycle rule deletes the dead multipart upload |
+| crash during assembly | none; objects and checkpoint are durable | re-run; a lifecycle rule deletes the dead multipart upload |
 | corrupted checkpoint version | none | header CRC refuses it; repair uses the newest version that holds |
 | corrupted chunk | detected | manifest CRC refuses it at read/assembly |
 | data page corruption | detected | page CRCs on by default; `verify()` reads every page |
@@ -397,7 +463,7 @@ create_stream(name, schema, store=STORE, spool=DEFAULT_SPOOL, memory=Memory(...)
     #       ticket at tickets/<name>.json)
     # spool: the local write-behind copy a bucket store writes through;
     #        default /var/tmp/streaming-parquet/<user>/, None for none
-    # Memory(lookback, maximum, rate_hint, segment_bytes): rows on this core
+    # Memory(lookback, maximum, segment_bytes): rows on this core
     # Archive(checkpoint_seconds, row_group_rows, row_group_seconds, ship_seconds,
     #         catalog_copy_seconds, parquet): tuning; None = memory only
 create_playback_stream(name, parquet_path, timestamp_column, latency_s, memory)

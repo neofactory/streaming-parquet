@@ -2,10 +2,12 @@
 
 Runs a telemetry-shaped load for a chosen duration: a writer thread at
 a target row rate (fixed-width + strings + lists), a hot-path reader
-polling read_row, a relation consumer acquiring/querying/releasing
-record sets, and a parquet flusher maintaining the archive+hot union
-view watermark. Verifies the union-view invariant continuously and
-prints throughput/memory statistics at the end.
+polling read_row, a relation consumer that queries the standing
+relation, and a parquet flusher that pins the rows after its watermark
+and maintains the archive+memory union view. Verifies the union-view
+invariant continuously and prints throughput/memory statistics at the
+end. No reader pins the whole ring: the writer waits only when it is a
+whole ring ahead of the flusher.
 
     python3 packages/arrow_ring/exerciser.py --seconds 10 --rate 20000
 
@@ -23,7 +25,6 @@ import time
 
 import duckdb
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -45,12 +46,11 @@ def main():
     ap.add_argument('--capacity', type=int, default=1 << 16)
     args = ap.parse_args()
 
-    ring = Ring(SCHEMA, capacity=args.capacity, rate_hint=args.rate,
-                lease_margin_s=0.0)
+    ring = Ring(SCHEMA, capacity=args.capacity)
     stop = threading.Event()
     errors = []
     stats = {'written': 0, 'hot_reads': 0, 'stale_reads': 0,
-             'relations': 0, 'flushes': 0, 'view_checks': 0}
+             'relations': 0, 'lapped': 0, 'flushes': 0, 'view_checks': 0}
 
     def writer():
         try:
@@ -94,17 +94,20 @@ def main():
     def relation_consumer():
         try:
             con = duckdb.connect()
+            con.register('live', ring.get_dynamic_relation())
             while not stop.is_set():
-                rel = ring.get_static_relation(duration_s=0.05)
-                if len(rel):
-                    con.register('hot', rel.table)
-                    n, mx = con.sql(
-                        "SELECT count(*), max(seq) FROM hot").fetchall()[0]
-                    assert n == len(rel), (n, len(rel))
-                    assert mx == rel.hi - 1
-                    con.unregister('hot')
+                try:
+                    n, mn, mx = con.sql(
+                        "SELECT count(*), min(seq), max(seq) "
+                        "FROM live").fetchall()[0]
+                except duckdb.Error as e:
+                    if 'StaleReadError' not in str(e):
+                        raise
+                    stats['lapped'] += 1    # the writer passed the scan
+                    continue
+                if n:
+                    assert n == mx - mn + 1, (n, mn, mx)
                     stats['relations'] += 1
-                rel.release()
                 time.sleep(0.005)
         except Exception as e:
             errors.append(('relation_consumer', e))
@@ -112,8 +115,10 @@ def main():
 
     with tempfile.TemporaryDirectory() as tmp:
         con = duckdb.connect()
+        con.register('live', ring.get_dynamic_relation())
         files = []
         wm = -1
+        held = None
         threads = [threading.Thread(target=writer),
                    threading.Thread(target=hot_reader),
                    threading.Thread(target=relation_consumer)]
@@ -124,40 +129,41 @@ def main():
             while time.monotonic() - t_start < args.seconds \
                     and not stop.is_set():
                 time.sleep(0.05)
-                rel = ring.get_static_relation(duration_s=0.2)
+                # The rows after the watermark, and no others. The pin
+                # of one pass is kept until the next pass has its own:
+                # the writer cannot recycle a row the archive has not
+                # written.
+                rel = ring.pin(wm + 1, 1 << 62)
                 if len(rel) == 0:
                     rel.release()
                     continue
-                if rel.lo > wm + 1:
+                if rel.lo != wm + 1:
                     errors.append(('flusher', AssertionError(
-                        f"hot window lost seam coverage: lo={rel.lo} "
-                        f"wm={wm}")))
+                        f"rows recycled before the archive had them: "
+                        f"lo={rel.lo} wm={wm}")))
                     break
-                hot = rel.table
-                fresh = hot.filter(pc.greater(hot['seq'], wm))
-                new_wm = wm
-                if fresh.num_rows:
-                    path = os.path.join(tmp, f'a{len(files)}.parquet')
-                    pq.write_table(fresh, path)
-                    files.append(path)
-                    new_wm = rel.hi - 1
-                    stats['flushes'] += 1
-                con.register('hot', hot)
+                if held is not None:
+                    held.release()
+                held = rel
+                path = os.path.join(tmp, f'a{len(files)}.parquet')
+                pq.write_table(rel.table, path)
+                files.append(path)
+                wm = rel.hi - 1
+                stats['flushes'] += 1
                 cnt, dst, mn, mx = con.sql(
                     f"SELECT count(*), count(DISTINCT seq), min(seq), "
                     f"max(seq) FROM (SELECT seq FROM "
                     f"read_parquet({files!r}) UNION ALL SELECT seq FROM "
-                    f"hot WHERE seq > {new_wm})").fetchall()[0]
-                con.unregister('hot')
-                rel.release()
+                    f"live WHERE seq > {wm})").fetchall()[0]
                 if not (cnt == dst == mx + 1 and mn == 0):
                     errors.append(('view', AssertionError(
                         f"count={cnt} distinct={dst} min={mn} max={mx}")))
                     break
-                wm = new_wm
                 stats['view_checks'] += 1
         finally:
             stop.set()
+            if held is not None:
+                held.release()
             for t in threads:
                 t.join()
 
@@ -169,7 +175,8 @@ def main():
               f"({stats['written'] / elapsed:,.0f} rows/s)")
         print(f"hot reads        {stats['hot_reads']:8d} "
               f"(stale: {stats['stale_reads']})")
-        print(f"relations        {stats['relations']:8d}")
+        print(f"relations        {stats['relations']:8d} "
+              f"(lapped: {stats['lapped']})")
         print(f"parquet flushes  {stats['flushes']:8d} ({len(files)} files)")
         print(f"view checks      {stats['view_checks']:8d} (all exact)")
         print(f"label pool segs  {pool_segs:8d} (bounded = reclaim works)")

@@ -1,7 +1,7 @@
 // Package ring is the Go host for the arrow_ring C core.
 //
 // The core (core/arrow_ring.h — the spec) owns storage, recycling,
-// pins, and leases; this binding is thin by design. Boundary language
+// and pins; this binding is thin by design. Boundary language
 // is the Arrow C Data Interface: schemas and batches go in via
 // arrow-go's cdata export, record sets come out as zero-copy record
 // batches via cdata import.
@@ -90,9 +90,7 @@ type Ring struct {
 
 // Options mirror ArRingOptions; zero values take the core's defaults.
 type Options struct {
-	RateHint     float64 // rows/s seed for lease exclusions
-	LeaseMarginS float64 // padding on lease estimates; default 0.5
-	SegmentBytes int64   // var-width pool segment size; default 1<<20
+	SegmentBytes int64 // var-width pool segment size; default 1<<20
 }
 
 func (r *Ring) err(st C.ArStatus) error {
@@ -111,8 +109,6 @@ func NewRing(schema *arrow.Schema, capacity int64, opts *Options) (*Ring, error)
 	cdata.ExportArrowSchema(schema, &cs)
 	var co C.ArRingOptions
 	if opts != nil {
-		co.rate_hint = C.double(opts.RateHint)
-		co.lease_margin_s = C.double(opts.LeaseMarginS)
 		co.segment_bytes = C.int64_t(opts.SegmentBytes)
 	}
 	var cr *C.ArRing
@@ -183,8 +179,8 @@ func (r *Ring) LeafPaths() []string {
 // ---- write side (single writer goroutine) --------------------------------
 
 // RowBegin allocates the next slot; block bounds the wait on a pinned
-// recycle target (IsPinStalled on timeout, with the overdue lease
-// named in the detail).
+// recycle target (IsPinStalled on timeout, with the pin named in the
+// detail).
 func (r *Ring) RowBegin(block time.Duration) (int64, error) {
 	var seq C.int64_t
 	st := C.ar_row_begin(r.c, C.int64_t(block/time.Millisecond), &seq)
@@ -436,11 +432,6 @@ func (r *Ring) GetBytes(seq int64, leaf int32) (v []byte, isNull bool, err error
 func (r *Ring) OldestSeq() int64 { return int64(C.ar_oldest_seq(r.c)) }
 func (r *Ring) NewestSeq() int64 { return int64(C.ar_newest_seq(r.c)) }
 
-// SetLeaseMargin adjusts the lease margin after construction (tests).
-func (r *Ring) SetLeaseMargin(marginS float64) {
-	C.ar_set_lease_margin(r.c, C.double(marginS))
-}
-
 // ---- wire frames ---------------------------------------------------------
 
 // WireEntry maps Size bytes at byte Offset of a packed frame to the
@@ -518,13 +509,14 @@ type RecordSet struct {
 	done bool
 }
 
-// StaticRelation pins a record set over the committed rows, excluding
-// the lease window for `duration` of expected use. Release (or
-// Detach) it — the pin, not the lease, is the guarantee, and an
-// overstayed pin stalls the writer loudly.
-func (r *Ring) StaticRelation(duration time.Duration) (*RecordSet, error) {
+// StaticRelation pins a record set over every committed row the ring
+// holds. Release (or Detach) it. On a full ring it holds the row the
+// writer needs next: the writer waits until the release, and stalls
+// loudly after its block time. A reader that must not make the writer
+// wait names newer rows with Pin.
+func (r *Ring) StaticRelation() (*RecordSet, error) {
 	var rs *C.ArRecordSet
-	st := C.ar_relation(r.c, C.double(duration.Seconds()), &rs)
+	st := C.ar_relation(r.c, &rs)
 	if st != C.AR_OK {
 		return nil, r.err(st)
 	}
@@ -534,9 +526,9 @@ func (r *Ring) StaticRelation(duration time.Duration) (*RecordSet, error) {
 }
 
 // Pin pins the rows [lo, hi) and no others: the publish and archive
-// paths' record set, the rows they send or write. No lease: the writer
-// meets this pin only after a whole ring of writes, and then the
-// holder is a leak. lo below the oldest readable row is raised to it
+// paths' record set, the rows they send or write. The writer meets
+// this pin only after a whole ring of writes, and then the holder is a
+// leak. lo below the oldest readable row is raised to it
 // (rs.Lo > lo: rows recycled); hi above committed is lowered to it.
 func (r *Ring) Pin(lo, hi int64) (*RecordSet, error) {
 	var rs *C.ArRecordSet

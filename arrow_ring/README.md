@@ -40,14 +40,14 @@ one owed.
 ## API
 
 ```
-Ring(schema, capacity, rate_hint=None, segment_bytes=None, lease_margin_s=None)
+Ring(schema, capacity, segment_bytes=None)
 ring.get_mutable_row(block_s=0) -> MutableRow      # row.field = v; row.servo.pos = v
 ring.commit() -> n
 ring.append_batch(batch) / ring.append_table(table)
 ring.read_row(seq) -> Row            # MutableRow is its writable subclass
 ring.oldest_seq / ring.newest_seq
-ring.get_static_relation(duration_s) -> RecordSet
-ring.pin(lo, hi) -> RecordSet                      # exactly these rows, no lease
+ring.get_static_relation() -> RecordSet            # every row the ring holds
+ring.pin(lo, hi) -> RecordSet                      # exactly these rows
 ring.iter_chunks(lo=0, hi=None, chunk_rows=16384)  # -> (first_seq, RecordBatch)...: a pin per chunk
 ring.chunked_reader(lo=0, hi=None, chunk_rows=16384) -> pyarrow.RecordBatchReader
 ring.get_dynamic_relation(chunk_rows=16384) -> DynamicRelation
@@ -73,14 +73,11 @@ schema = pa.schema([
              nullable=False),
     pa.field('label', pa.utf8()),           # nullable by default
 ])
-ring = arrow_ring.Ring(schema, capacity=600_000, rate_hint=10_000)
+ring = arrow_ring.Ring(schema, capacity=600_000)
 ```
 
 - `capacity` — rows. The total loss-free budget for every consumer
-  (lookback + regions in flight + lease exclusions). Size it 2x what
-  you think you need.
-- `rate_hint` — expected rows/second; seeds the lease-exclusion rate
-  until the observed rate takes over.
+  (lookback + regions in flight). Size it 2x what you think you need.
 
 ### Write side (single writer thread)
 
@@ -95,7 +92,7 @@ ring.commit()                     # freeze everything allocated so far
 - `get_mutable_row(block_s=0.0)` — the privileged allocator call (the
   long name is deliberate). Allocating seq S recycles seq S−capacity;
   if a pin holds that seq the call blocks up to `block_s` then raises
-  `PinStalledError` naming the overdue lease. On an origin ring treat
+  `PinStalledError` naming the pin. On an origin ring treat
   the raise as fatal. Allocation resets nullable leaves to null and
   var-width leaves to empty.
 - A store is one descriptor call and no call into C: `row.x = v`
@@ -125,7 +122,8 @@ r = ring.read_row(seq)            # read-only view, no pin
 r.servo.pos                       # StaleReadError if recycled
 r.mark                            # None when null
 
-with ring.get_static_relation(duration_s=2.0) as rs:
+newest = ring.newest_seq
+with ring.pin(newest - 999, newest + 1) as rs:   # the newest 1,000 rows
     con.register("hot", rs.table) # zero-copy pyarrow Table
     con.execute("SELECT ... FROM hot WHERE tv BETWEEN ? AND ?")
 ```
@@ -134,17 +132,19 @@ with ring.get_static_relation(duration_s=2.0) as rs:
   Consume immediately. Temporal/decimal leaves read back raw storage
   values; fixed_size_list and list leaves read back tuples; use a
   record set for logical values.
-- `get_static_relation(duration_s)` — a pinned, immutable record set. The
-  lease is the caller's honest hold estimate; the ring excludes the
-  oldest `peak_rate x (duration_s + margin)` rows so an honest holder
-  never blocks the writer. The pin, not the lease, is the guarantee.
-  Pins also hold the referenced pool segments (see below).
-- `pin(lo, hi)` — a pinned record set over exactly the rows named, and
-  no lease: for a caller that knows which rows it needs (the publish
+- `pin(lo, hi)` — a pinned, immutable record set over exactly the
+  rows named: for a caller that knows which rows it needs (the publish
   and archive paths pin the rows they send or write, usually a few).
+  The pin is the guarantee: a set that is held never becomes invalid.
   The writer meets this pin only after a whole ring of writes, and
   then the holder is a leak. `lo` below the oldest row is raised to
-  it (the set's `lo` says so); `hi` above committed is lowered.
+  it (the set's `lo` says so); `hi` above committed is lowered. Pins
+  also hold the referenced pool segments (see below).
+- `get_static_relation()` — a pinned record set over every row the
+  ring holds. On a full ring it holds the row the writer needs next,
+  so the writer waits until the release. Use it on a ring that is not
+  being written, or for a moment; a reader that follows a live writer
+  names its rows with `pin`, or reads by chunks (next).
 - `iter_chunks(lo, hi, chunk_rows)` — the read for a consumer that
   pulls batches one at a time (a DuckDB scan): nothing pinned at open;
   the range fixed at the first chunk, not at open, so a consumer that
@@ -152,7 +152,7 @@ with ring.get_static_relation(duration_s=2.0) as rs:
   own rows and no others, dropping the pin when the batch is freed. A
   row the writer recycles before the read reaches it raises
   `StaleReadError` naming the rows: the read was lapped. `DynamicRelation`
-  is this read behind `__arrow_c_stream__`; it needs no lease.
+  is this read behind `__arrow_c_stream__`.
 - `RecordSet.table` — zero-copy `pyarrow.Table`. Chunk boundaries:
   the physical ring wrap, plus segment boundaries / re-writes in
   var-width columns (Arrow offsets must be gap-free per chunk). String
@@ -177,8 +177,9 @@ freelist; dedicated ones drop when their record sets release.
 - `StaleReadError` — seq recycled or not yet committed. Recoverable:
   resync from `oldest_seq`/`newest_seq`.
 - `PinStalledError` — writer reached a pinned region: a consumer held
-  a record set for a whole ring's worth of writes. Message carries the
-  lease and hold time.
+  a record set for a whole ring's worth of writes. The message names
+  the pin's rows, how long it has been held, and where each live pin
+  was taken.
 - `TypeError` at construction for anything outside the type surface.
 
 ## C core
@@ -202,7 +203,7 @@ same status names): `SetF64` is 2.2 ns against 19.6 ns through cgo.
 Strings, lists and float16 keep the core's setters.
 
 ```go
-r, _ := ring.NewRing(schema, capacity, &ring.Options{RateHint: 5000})
+r, _ := ring.NewRing(schema, capacity, nil)
 seq, _ := r.RowBegin(time.Second)       // ar_row_begin
 r.SetI64(leaf, v); r.SetString(leaf, s) // leaf setters
 r.Commit()
@@ -211,7 +212,7 @@ r.AppendRecordAt(rec, firstSeq)         // attach-side seq alignment:
                                         //   gap = loud jump + floor
 v, isNull, err := r.GetI64(seq, leaf)   // hot-path read; IsStale(err)
 m, _ := r.NewWireMap(entries)           // FromWire / ToWire
-rs, _ := r.StaticRelation(2*time.Second)
+rs, _ := r.Pin(lo, hi)                  // exactly these rows
 recs, _ := rs.Records()                 // zero-copy arrow-go records
 rs.Release()                            // or rs.Detach()
 ```

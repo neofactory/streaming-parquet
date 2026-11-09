@@ -1,11 +1,11 @@
 // Package pqc is the Go host for the parquet_checkpoint C core.
 //
 // The core (core/pqc.h — the spec) does the format work: thrift offset
-// rebase, footer combining, chunk cutting, the PQC2 checkpoint object.
-// This host encodes parquet (see rows.go) and stores bytes through a
-// Sink (sink.go). The Python package is the reference implementation;
-// artifacts written here are read by it and vice versa
-// (run_go_compat.py proves it).
+// rebase, footer combining, which rows each object holds, chunk
+// cutting, the PQC2 checkpoint object. This host encodes parquet (see
+// rows.go) and stores bytes through a Sink (sink.go). The Python
+// writer is a host over the same core; artifacts written here are read
+// by the Python package and vice versa (run_go_compat.py proves it).
 package pqc
 
 // pqc_core.c and pqc.h are CHECKED-IN COPIES of ../../core/pqc.{c,h}
@@ -93,11 +93,13 @@ func bytesPtr(b []byte) *C.uint8_t {
 	return (*C.uint8_t)(unsafe.Pointer(&b[0]))
 }
 
-// Writer writes one crash-durable parquet file through a Sink,
-// mirroring the Python CheckpointWriter: AddGroupMini appends final
-// row groups (a complete mini parquet file) and implies a checkpoint;
-// Checkpoint publishes a durability claim with an optional provisional
-// tail; Close finalizes into an ordinary .parquet.
+// Writer writes one crash-durable parquet file through a Sink, a host
+// over the C core like the Python CheckpointWriter: AddGroupMini
+// appends final row groups (a complete mini parquet file) and implies
+// a checkpoint; CheckpointTail publishes a durability claim that
+// covers the rows after the last final row group too, storing only the
+// rows no object holds yet; Close finalizes into an ordinary .parquet.
+// One owner at a time, like a file handle.
 type Writer struct {
 	name     string
 	sink     Sink
@@ -109,11 +111,12 @@ type Writer struct {
 	versions []version // checkpoint objects stored, oldest first
 }
 
-// version is a stored checkpoint object and when a later one superseded
-// it (zero while it is the newest).
+// version is a stored checkpoint object, when a later one superseded
+// it (zero while it is the newest), and the objects it names.
 type version struct {
 	object     string
 	superseded time.Time
+	names      map[string]bool
 }
 
 // NewWriter refuses an existing final file or checkpoint (finalize
@@ -148,58 +151,137 @@ func NewWriter(name string, sink Sink, chunkBytes uint64, checkpointEveryWrite b
 
 // AddGroupMini appends the row group(s) of a complete mini parquet
 // file (offsets counting from 0 — any parquet writer over a fresh
-// buffer). Cut chunks are stored before anything claims them.
+// buffer): every row since the last AddGroupMini. They replace what
+// CheckpointTail stored of those rows. Every object is stored before
+// anything claims it.
 func (w *Writer) AddGroupMini(mini []byte) (int64, error) {
 	var eb [512]C.char
 	rows := C.pqc_add_group(w.w, bytesPtr(mini), C.size_t(len(mini)), &eb[0], 512)
 	if rows < 0 {
 		return 0, cerr(&eb)
 	}
-	if err := w.drainChunks(); err != nil {
+	if err := w.storeObjects(); err != nil {
 		return 0, err
 	}
 	if w.auto {
-		if _, err := w.Checkpoint(nil); err != nil {
+		if _, err := w.Checkpoint(); err != nil {
 			return 0, err
 		}
 	}
 	return int64(rows), nil
 }
 
-func (w *Writer) drainChunks() error {
+// storeObjects stores every object the core owes. A Put that fails
+// leaves the object with the core, which gives it again at the next
+// call.
+func (w *Writer) storeObjects() error {
 	var name [C.PQC_NAME_MAX]C.char
 	var data *C.uint8_t
 	var length C.uint64_t
 	var crc C.uint32_t
 	for {
-		rc := C.pqc_next_chunk(w.w, &name[0], &data, &length, &crc)
+		rc := C.pqc_next_object(w.w, &name[0], &data, &length, &crc)
 		if rc < 0 {
-			return fmt.Errorf("pqc_next_chunk failed")
+			return fmt.Errorf("pqc_next_object failed")
 		}
 		if rc == 0 {
 			return nil
 		}
 		body := C.GoBytes(unsafe.Pointer(data), C.int(length))
 		if err := w.sink.Put(C.GoString(&name[0]), body); err != nil {
-			return err // chunk stays pending; the next call retries
+			return err // the object stays with the core; the next call retries
 		}
-		C.pqc_chunk_stored(w.w)
+		C.pqc_object_stored(w.w)
 	}
 }
 
-// Checkpoint publishes the durability claim. tailMini (may be nil) is
-// a complete mini parquet file of rows not yet added as final groups;
-// they ride this checkpoint and are superseded by a later
-// AddGroupMini of the same rows.
-func (w *Writer) Checkpoint(tailMini []byte) (watermark uint64, err error) {
+// NextSpan: a checkpoint is due and newRows rows are in no object yet.
+// It returns the rows of the file to encode as ONE row group,
+// [firstRow, firstRow+rows): the new rows alone, or a merge that ends
+// with them. firstRow - RowsFinal() is where the span begins among the
+// rows after the last final row group.
+func (w *Writer) NextSpan(newRows uint64) (firstRow, rows uint64) {
+	var f, r C.uint64_t
+	C.pqc_next_span(w.w, C.uint64_t(newRows), &f, &r)
+	return uint64(f), uint64(r)
+}
+
+// AddUnfinishedMini takes the span of the last NextSpan as a complete
+// mini parquet file of exactly those rows, and stores its object.
+func (w *Writer) AddUnfinishedMini(mini []byte) (int64, error) {
+	var eb [512]C.char
+	rows := C.pqc_add_unfinished(w.w, bytesPtr(mini), C.size_t(len(mini)), &eb[0], 512)
+	if rows < 0 {
+		return 0, cerr(&eb)
+	}
+	if err := w.storeObjects(); err != nil {
+		return 0, err
+	}
+	return int64(rows), nil
+}
+
+// DropUnfinished forgets the rows after the last final row group: the
+// next Checkpoint claims the final rows only.
+func (w *Writer) DropUnfinished() { C.pqc_drop_unfinished(w.w) }
+
+// CheckpointTail publishes a durability claim that covers all final
+// rows and the tail: EVERY row since the last AddGroupMini, tailRows of
+// them, in order (provisional: a later AddGroupMini of the same rows
+// replaces them). A later tail begins with the rows of the one before.
+// encode(offset, rows) returns rows [offset, offset+rows) of the tail
+// as a complete mini parquet file; it is asked only for the rows no
+// object holds yet, or for a merge the core chose, so the cost follows
+// the new rows, not the tail.
+func (w *Writer) CheckpointTail(tailRows uint64, encode func(offset, rows uint64) ([]byte, error)) (uint64, error) {
+	if err := w.storeObjects(); err != nil { // one a failed Put left with the core
+		return 0, err
+	}
+	if tailRows == 0 {
+		w.DropUnfinished()
+		return w.Checkpoint()
+	}
+	have := w.RowsUnfinished()
+	if tailRows < have {
+		return 0, fmt.Errorf("%s: a tail of %d rows after one of %d: a tail holds every row since the last final row group, so it never gets shorter", w.name, tailRows, have)
+	}
+	if tailRows > have {
+		first, rows := w.NextSpan(tailRows - have)
+		mini, err := encode(first-w.RowsFinal(), rows)
+		if err != nil {
+			return 0, err
+		}
+		if _, err := w.AddUnfinishedMini(mini); err != nil {
+			return 0, err
+		}
+	}
+	return w.Checkpoint()
+}
+
+// Checkpoint publishes the durability claim for what the core holds:
+// the final rows, and the rows CheckpointTail stored after them.
+func (w *Writer) Checkpoint() (watermark uint64, err error) {
+	return w.checkpoint(nil)
+}
+
+// checkpoint builds the checkpoint object (the list of the stored
+// objects and the footer) and stores it as a new version. emptyMini is
+// for a writer with no rows: a complete empty parquet file.
+func (w *Writer) checkpoint(emptyMini []byte) (watermark uint64, err error) {
+	if err := w.storeObjects(); err != nil {
+		return 0, err
+	}
 	var eb [512]C.char
 	var n, wm C.uint64_t
-	p := C.pqc_build_checkpoint(w.w, bytesPtr(tailMini), C.size_t(len(tailMini)), &n, &wm, &eb[0], 512)
+	p := C.pqc_build_checkpoint(w.w, bytesPtr(emptyMini), C.size_t(len(emptyMini)), &n, &wm, &eb[0], 512)
 	if p == nil {
 		return 0, cerr(&eb)
 	}
 	ck := C.GoBytes(unsafe.Pointer(p), C.int(n))
 	C.pqc_free(unsafe.Pointer(p))
+	names, err := manifestNames(ck)
+	if err != nil {
+		return 0, err
+	}
 	w.seq++
 	obj := CkptObject(w.name, w.seq)
 	if err := w.sink.Put(obj, ck); err != nil {
@@ -207,24 +289,64 @@ func (w *Writer) Checkpoint(tailMini []byte) (watermark uint64, err error) {
 		return 0, err
 	}
 	// stored whole first: obj supersedes the newest; delete every
-	// version superseded at least SupersededKeep ago
+	// version superseded at least SupersededKeep ago, and with it each
+	// object that no kept version names
 	now := time.Now()
 	if n := len(w.versions); n > 0 {
 		w.versions[n-1].superseded = now
 	}
-	kept := w.versions[:0]
+	var kept, gone []version
 	for _, v := range w.versions {
 		if !v.superseded.IsZero() && now.Sub(v.superseded) >= SupersededKeep {
-			if err := w.sink.Delete(v.object); err != nil {
+			gone = append(gone, v)
+		} else {
+			kept = append(kept, v)
+		}
+	}
+	kept = append(kept, version{object: obj, names: names})
+	named := map[string]bool{}
+	for _, v := range kept {
+		for name := range v.names {
+			named[name] = true
+		}
+	}
+	w.versions = kept
+	for _, v := range gone {
+		if err := w.sink.Delete(v.object); err != nil { // the claim first
+			return 0, err
+		}
+		for name := range v.names {
+			if named[name] {
+				continue
+			}
+			if err := w.sink.Delete(name); err != nil {
 				return 0, err
 			}
-			continue
+			named[name] = true // once
 		}
-		kept = append(kept, v)
 	}
-	w.versions = append(kept, version{object: obj})
 	w.rowsCk = uint64(wm)
 	return uint64(wm), nil
+}
+
+// manifestNames is the set of objects a checkpoint object names.
+func manifestNames(ck []byte) (map[string]bool, error) {
+	var eb [512]C.char
+	r := C.pqc_reader_open(bytesPtr(ck), C.size_t(len(ck)), &eb[0], 512)
+	if r == nil {
+		return nil, cerr(&eb)
+	}
+	defer C.pqc_reader_free(r)
+	names := map[string]bool{}
+	n := uint32(C.pqc_reader_n_chunks(r))
+	for i := uint32(0); i < n; i++ {
+		var cn *C.char
+		var cl C.uint64_t
+		var crc C.uint32_t
+		C.pqc_reader_chunk(r, C.uint32_t(i), &cn, &cl, &crc)
+		names[C.GoString(cn)] = true
+	}
+	return names, nil
 }
 
 // CkptName is the newest checkpoint version's object name; "" before
@@ -236,20 +358,28 @@ func (w *Writer) CkptName() string {
 	return w.versions[len(w.versions)-1].object
 }
 
-// RowsFinal is the count of rows in added groups; RowsCheckpointed the
+// RowsFinal is the count of rows in added groups; RowsUnfinished the
+// rows CheckpointTail stored after them; RowsCheckpointed the
 // watermark of the last published checkpoint.
 func (w *Writer) RowsFinal() uint64        { return uint64(C.pqc_rows_final(w.w)) }
+func (w *Writer) RowsUnfinished() uint64   { return uint64(C.pqc_rows_unfinished(w.w)) }
 func (w *Writer) RowsCheckpointed() uint64 { return w.rowsCk }
 
-// Close publishes a final checkpoint (empty writers get a valid empty
-// file via an empty tail mini) and finalizes. The writer is freed.
+// FileBytes is the bytes of the file's final row groups so far: its
+// size without the footer.
+func (w *Writer) FileBytes() uint64 { return uint64(C.pqc_logical_end(w.w)) }
+
+// Close publishes a final checkpoint of the final rows (empty writers
+// get a valid empty file via an empty mini) and finalizes. The writer
+// is freed.
 func (w *Writer) Close(emptyMini []byte) error {
 	defer w.Free()
-	var tail []byte
+	w.DropUnfinished()
+	var empty []byte
 	if w.RowsFinal() == 0 && C.pqc_chunks_cut(w.w) == 0 {
-		tail = emptyMini // schema-only file; rows.go supplies one
+		empty = emptyMini // schema-only file; rows.go supplies one
 	}
-	if _, err := w.Checkpoint(tail); err != nil {
+	if _, err := w.checkpoint(empty); err != nil {
 		return err
 	}
 	_, err := Finalize(w.name, w.sink)
@@ -257,7 +387,7 @@ func (w *Writer) Close(emptyMini []byte) error {
 }
 
 // Free releases the C writer without finalizing (a crash leaves the
-// checkpoint + chunks for Finalize, from anywhere).
+// checkpoint + objects for Finalize, from anywhere).
 func (w *Writer) Free() {
 	if w.w != nil {
 		C.pqc_writer_free(w.w)
@@ -415,6 +545,16 @@ func Finalize(name string, sink Sink) (string, error) {
 		return "", err
 	}
 	return "recovered", nil
+}
+
+// DeadAfter is how long a writer with this beat must be silent before
+// it is dead: three beats, and never sooner than 30 seconds. It is the
+// core's rule (pqc_dead_after), the same one the Python host uses for
+// a ticket and for the start-up sweep. A zero beat: the writer does
+// not say how often it shows that it lives.
+func DeadAfter(beat time.Duration) time.Duration {
+	s := float64(C.pqc_dead_after(C.double(beat.Seconds())))
+	return time.Duration(s * float64(time.Second))
 }
 
 // CRC32 is the core's CRC (IEEE, zlib-compatible) for host-side use.

@@ -66,12 +66,14 @@ type ArchiveOptions struct {
 // parallel.
 const defaultRowGroupRows = 122_880
 
-// ringSizes settles a stream's ring rows and row group rows. A row
-// group's rows stay in the ring until the group is written, and the
-// archiver's read leaves out the rows the writer may reuse meanwhile
-// (2.5 s at the ring's peak rate), so the ring holds two row groups:
-// given neither size, DuckDB's row group; given one, the other follows;
-// given both, a ring under two row groups is refused.
+// ringSizes settles a stream's ring rows and row group rows. The ring
+// holds two row groups. The newest half holds the unfinished row group:
+// its rows stay in the ring until the group is written. The older half
+// is for readers: a view reads from the ring the rows the store does
+// not have yet, and keeps out of the oldest quarter, which is the time
+// a running query has. Given neither size, DuckDB's row group; given
+// one, the other follows; given both, a ring under two row groups is
+// refused.
 func ringSizes(name string, ringRows, rowGroupRows int64) (int64, int64, error) {
 	switch {
 	case ringRows == 0 && rowGroupRows == 0:
@@ -136,6 +138,14 @@ func newArchiver(r *ring.Ring, name, run string, o ArchiveOptions) (*archiver, e
 // bootSweep finalizes checkpoints a crashed prior run left behind in
 // this stream's directory.
 // hasCheckpoint reports whether file name has any checkpoint version.
+// FileCutBytes: a file is cut when its row groups reach this many
+// bytes, whenever the host cut it last (the Python FILE_CUT_BYTES).
+// Every decision of the writer is taken by time or by bytes, whichever
+// comes first; the host cuts by time, and a fast stream reaches this
+// first. The reason is the footer: it has an entry for each row group
+// and each column, and it is written at every checkpoint.
+var FileCutBytes uint64 = 256_000_000
+
 func (a *archiver) hasCheckpoint(name string) bool {
 	vs, err := pqc.CkptVersions(a.sink, name)
 	return err != nil || len(vs) > 0 // an unlistable sink: assume taken
@@ -331,10 +341,17 @@ func (a *archiver) flushRegion(committed int64) error {
 	a.hasClock = false
 	a.ckptMono = time.Now()
 	a.hasCkptCl = true
+	if a.w.FileBytes() >= FileCutBytes {
+		// the file is large enough: the next row group begins a new
+		// one, with the same label
+		return a.rotate()
+	}
 	return nil
 }
 
 func (a *archiver) checkpointTail(committed int64) error {
+	// the whole tail, pinned once: every row since the last row group
+	cursor := a.cursor
 	recs, cleanup, err := a.region(a.cursor, committed)
 	if err != nil {
 		return err
@@ -348,17 +365,47 @@ func (a *archiver) checkpointTail(committed int64) error {
 			return err
 		}
 	}
-	mini, err := a.encodeMini(recs)
-	if err != nil {
-		return err
+	if a.cursor != cursor {
+		// rows at the front of the tail were recycled (region said
+		// so): the objects stored of the tail hold rows it no longer
+		// has. Begin the tail again.
+		a.w.DropUnfinished()
 	}
-	if _, err := a.w.Checkpoint(mini); err != nil {
+	// The writer asks for the rows no object holds yet, or for a merge:
+	// rows [offset, offset+rows) of the tail.
+	_, err = a.w.CheckpointTail(uint64(committed-a.cursor), func(offset, rows uint64) ([]byte, error) {
+		span := sliceRecords(recs, int64(offset), int64(rows))
+		defer func() {
+			for _, r := range span {
+				r.Release()
+			}
+		}()
+		return a.encodeMini(span)
+	})
+	if err != nil {
 		return err
 	}
 	a.durable = committed
 	a.ckptMono = time.Now()
 	a.hasCkptCl = true
 	return nil
+}
+
+// sliceRecords returns rows [offset, offset+rows) of a list of record
+// batches, as slices the caller releases.
+func sliceRecords(recs []arrow.RecordBatch, offset, rows int64) []arrow.RecordBatch {
+	var out []arrow.RecordBatch
+	end := offset + rows
+	var pos int64
+	for _, rec := range recs {
+		n := rec.NumRows()
+		lo, hi := max64(offset-pos, 0), min64(end-pos, n)
+		if lo < hi {
+			out = append(out, rec.NewSlice(lo, hi))
+		}
+		pos += n
+	}
+	return out
 }
 
 // StartParquet begins a recording segment: rows committed from THIS

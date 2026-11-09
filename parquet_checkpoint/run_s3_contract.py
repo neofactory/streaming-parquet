@@ -123,35 +123,59 @@ def _():
     assert not sink.exists('rule/dest')
 
 
-@test("assemble: whole-object + range-copied last part, byte-exact")
+@test("assemble: a large object is copied; the smaller ones after it "
+      "travel once, as the last part; byte-exact")
 def _():
     big = os.urandom(1024) * (MIN_PART // 1024 + 1)     # just over 5MB
     small = bytes(range(256)) * 8
+    other = os.urandom(3000)
     sink.put('asm/big', big)
     sink.put('asm/small', small)
+    sink.put('asm/other', other)
     sink.assemble('asm/dest', [('asm/big', -1, -1),
                                ('asm/small', 100, 512)])
     assert sink.get('asm/dest') == big + small[100:612]
-    # our guard preempts an undersized non-last part locally
-    try:
-        sink.assemble('asm/bad', [('asm/small', -1, -1),
-                                  ('asm/big', -1, -1)])
-        raise AssertionError("undersized non-last part must refuse")
-    except SinkError as e:
-        assert 'must be >=' in str(e), e
+    # a chunk, then three smaller sources: S3 cannot join small
+    # objects, so they are fetched and sent together as one part
+    sink.assemble('asm/tail', [('asm/big', -1, -1), ('asm/small', -1, -1),
+                               ('asm/other', -1, -1), ('asm/small', 7, 90)])
+    assert sink.get('asm/tail') == big + small + other + small[7:97]
+    # a small source BEFORE a large one: the part takes the large one
+    # in, so that no part before the last is under the minimum
+    sink.assemble('asm/first', [('asm/small', -1, -1), ('asm/big', -1, -1)])
+    assert sink.get('asm/first') == small + big
+    # small sources alone
+    sink.assemble('asm/small2', [('asm/small', -1, -1), ('asm/other', -1, -1)])
+    assert sink.get('asm/small2') == small + other
 
 
-@test("lifecycle: write ~2 chunks + tail, remote read, finalize, exact")
+@test("lifecycle: ~2 chunks, row groups and tail objects; remote read; "
+      "finalize by copies and one uploaded part; exact")
 def _():
     w = CheckpointWriter('run.parquet', SCHEMA, sink=sink,
                          compression='none', checkpoint_every_write=False)
     i = 0
-    while len(sink.list('run.parquet.chunks/')) < 2:
+
+    def chunks():
+        return [m for m in CheckpointReader(w.ckpt_name, sink).manifest
+                if m[1] >= MIN_PART]
+    while w.ckpt_name is None or len(chunks()) < 2:
         w.write_table(make_rows(i, 60_000))
+        w.checkpoint()
         i += 60_000
         assert i <= 1_200_000, "chunks never cut"
-    w.checkpoint(tail=make_rows(i, 25))          # provisional tail rides
-    total = i + 25
+    w.write_table(make_rows(i, 60_000))          # and one that fills none
+    i += 60_000
+    # checkpoints of the rows after the last row group: an object for
+    # each one's new rows, beside the chunks and the row groups that
+    # do not fill a chunk yet
+    for tail in (25, 60, 61, 140):
+        w.checkpoint(tail=make_rows(i, tail))
+    total = i + 140
+    r0 = CheckpointReader(w.ckpt_name, sink)
+    sizes = [m[1] for m in r0.manifest]
+    assert len([x for x in sizes if x >= MIN_PART]) >= 2, sizes
+    assert len([x for x in sizes if x < MIN_PART]) >= 2, sizes
     # "another machine": a fresh sink, only the bucket in common
     remote = S3Sink(BUCKET, PREFIX)
     r = CheckpointReader(ckpt_versions(remote, 'run.parquet')[-1][1], remote)

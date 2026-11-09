@@ -116,7 +116,7 @@ def create_stream(name, schema, store=None, spool=DEFAULT_SPOOL,
              /var/tmp/streaming-parquet/<user>/. None = no local copy,
              the bucket is the first copy. Ignored for a directory
              store, which is written straight into.
-    memory:  Memory(lookback, maximum, rate_hint, segment_bytes). None =
+    memory:  Memory(lookback, maximum, segment_bytes). None =
              the defaults: a ring of two parquet row groups.
     archive: Archive(checkpoint_seconds, row_group_rows,
              row_group_seconds, ship_seconds, parquet): the tuning.
@@ -338,7 +338,8 @@ def connect(name=None, store=None, memory=None, columns=None, ticket=None):
         def memory_chunks(lo, a=a):
             return a._require().iter_chunks(lo)
         a._source = TicketSource(resolved_name, feeder_store, revisions=feeder,
-                                 run=lambda: feeder._run, memory=memory_chunks)
+                                 run=lambda: feeder._run, memory=memory_chunks,
+                                 window=lambda a=a: a._require().window())
     with _lock:
         _feeders[id(feeder)] = feeder
         _attached[id(a)] = a

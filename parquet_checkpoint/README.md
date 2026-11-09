@@ -2,22 +2,32 @@
 
 Crash-durable, queryable-while-open parquet. One growing logical file
 per stream/session instead of a file per flush; crash loss bounded to
-rows since the last checkpoint (zero at any checkpoint instant — the
-tail rides inside it); recovery is assembly, no data rewritten. Second
+rows since the last checkpoint; a checkpoint costs what its new rows
+cost, not what the file holds; recovery is assembly. Second
 package of the streaming-parquet trio (arrow-ring / parquet-checkpoint
-/ streaming-parquet); dependencies: pyarrow only (boto3 for the real
+/ streaming-parquet); dependencies: pyarrow, and cffi with a C compiler
+for the writer, whose format work is the C core's (boto3 for the real
 S3 sink, duckdb in the tests). Designed 2026-08-19/22 with Paul.
 
 ## The format
 
 Storage is behind a **sink** (a local directory or an S3 bucket —
-same names, same bytes). Two kinds of artifact per live file:
+same names, same bytes). Three kinds of artifact per live file:
 
 | artifact | meaning |
 |---|---|
 | `name.parquet` | done — an ORDINARY parquet file |
-| `name.parquet.chunks/000001` | a chunk: an immutable piece of the final file, cut at row-group boundaries, >= `chunk_bytes` (default 5 MB — the S3 multipart part minimum; a packaging size, never a durability boundary) |
-| `name.parquet.000017.ckpt` | a checkpoint: version 17, one object, written once and never changed. Each checkpoint is a new version. A version superseded for 10 minutes (`SUPERSEDED_KEEP_S`) is deleted in the step that stores a later one, so a reader told of an older version less than that long ago still finds it, and an opened object never changes under it. Nothing runs on a timer. Recovery assembles from the newest version whose CRC holds. A `name.parquet.ckpt` without a version (written before versions) reads as version 0. |
+| `name.parquet.chunks/000007` | an object: an immutable piece of the file, whole row groups, written once and never changed. Numbered in the order made. |
+| `name.parquet.000017.ckpt` | a checkpoint: version 17, one object, written once and never changed. Each checkpoint is a new version. A version superseded for 10 minutes (`SUPERSEDED_KEEP_S`) is deleted in the step that stores a later one, so a reader told of an older version less than that long ago still finds it, and an opened object never changes under it. An object is deleted with the last kept version that names it. Nothing runs on a timer. Recovery assembles from the newest version whose CRC holds. A `name.parquet.ckpt` without a version (written before versions) reads as version 0. |
+
+The file while it is written is a list of objects, in file order, and
+a footer:
+
+| object | holds | written |
+|---|---|---|
+| chunk | at least `chunk_bytes` of final row groups (default 5 MB — the S3 multipart part minimum; a packaging size, never a durability boundary) | when the row groups that wait reach `chunk_bytes`; it replaces their objects |
+| loose row group | one final row group that does not yet fill a chunk | once, at `write_table` (the row group that completes a chunk is written only in the chunk) |
+| unfinished | rows of the row group still being filled | at `checkpoint(tail)`: one object with only the rows no object holds yet; the next `write_table` replaces them all |
 
 Checkpoint layout:
 
@@ -26,19 +36,27 @@ Checkpoint layout:
 | header:   magic PQC2, version, CRC-32 of everything after    |
 |           the CRC field, final file name, watermark (rows    |
 |           covered), data offset                              |
-| manifest: ordered chunk list -- name, byte length, CRC-32    |
-| data:     [magic if no chunks][buffered final row groups]    |
-|           [provisional tail row group][footer]               |
+| manifest: the list of objects -- name, byte length, CRC-32   |
+| data:     the footer of the whole (for a file with no rows:  |
+|           a whole empty parquet file)                        |
 +--------------------------------------------------------------+
 ```
 
-The data region IS final-file bytes: finalize appends it verbatim
-after the chunks (on S3, a server-side range copy of the checkpoint
-object — no bytes travel to the host). The directory/prefix listing is
-the state machine. Durability ordering is the contract: a chunk is
-stored BEFORE any checkpoint that references it; the checkpoint
-replace is atomic at both sinks, so the manifest, tail, and footer can
-never disagree.
+The objects in list order, then the data region, ARE the file. Finalize
+joins them: on S3, a server-side copy for each object of at least the
+part minimum (no bytes travel), and one uploaded part for the smaller
+objects after the last chunk, with the footer (S3 cannot join small
+objects, and refuses a part under its minimum unless it is the last).
+The directory/prefix listing is the state machine. Durability ordering
+is the contract: an object is stored BEFORE any checkpoint that names
+it; a checkpoint version is one atomic object, so the list and the
+footer can never disagree.
+
+**The cost of a checkpoint follows its new rows**, not the size of the
+file: it stores one object with those rows and the checkpoint object,
+never a row a stored object already holds. Before 2026-11-09 a
+checkpoint object carried every row not yet in a chunk; for a stream
+that takes hours to fill 5 MB, that was most of the file, every time.
 
 ## API
 
@@ -109,11 +127,15 @@ multipart part rules (the Go side of FakeS3); sink_s3_test.go runs the
 sink contract and the writer lifecycle on it
 
 C core (core/pqc.h IS its spec; language-neutral: hosts encode
-parquet and do all storage):
+parquet and do all storage). The Python CheckpointWriter and the Go
+Writer are both hosts over it, so the writer's rules exist once; the
+DuckDB extension reads with it:
 pqc_writer_new(final_name, chunk_bytes)
 pqc_add_group(mini_parquet_bytes)     # core rebases + buffers
-pqc_next_chunk / pqc_chunk_stored     # host stores; ack-or-retry
-pqc_build_checkpoint(tail_mini)       # -> the PQC2 object bytes
+pqc_next_span(new_rows)               # which rows the next object holds
+pqc_add_unfinished(mini_parquet_bytes)  # those rows, of the unfinished row group
+pqc_next_object / pqc_object_stored   # host stores; ack-or-retry
+pqc_build_checkpoint()                # -> the PQC2 object bytes
 pqc_reader_open / name / watermark / chunk / data
 pqc_crc32  pqc_shift_footer
 ```
@@ -130,8 +152,10 @@ with CheckpointWriter('run.parquet', schema, sink=S3Sink('bucket'),
                       compression='zstd') as w:
     w.write_table(batch_or_table)     # final row group(s) + checkpoint
     w.checkpoint(tail=ring_rows)      # timed durability point between
-                                      #   writes: unwritten rows ride
-# close() -> ordinary run.parquet; chunks and checkpoint deleted
+                                      #   writes: tail = EVERY row since
+                                      #   the last write_table; the new
+                                      #   ones are stored
+# close() -> ordinary run.parquet; objects and checkpoints deleted
 
 # read side, while the writer is alive (or after close — same calls)
 r = CheckpointReader(ckpt_versions(sink, 'run.parquet')[-1][1], sink)
@@ -143,8 +167,12 @@ t = live_table('dir/run.parquet')      # local-path convenience
 recover_directory(sink)
 ```
 
-- `checkpoint()` cost: ~3 ms measured at 20k rows/s (encode the tail +
-  one PUT). Checkpoint per write and crash loss = zero committed rows.
+- `checkpoint(tail)`: `tail` holds every row since the last
+  `write_table`, in order, so a later tail begins with the rows of the
+  one before (a shorter one is refused). The writer encodes and stores
+  only the rows no object holds yet, or a merge (see "Merge in steps"):
+  one PUT for those rows and one for the checkpoint object. No tail:
+  the claim covers the final rows only.
 - `CheckpointWriter` refuses a name whose final file or checkpoint
   already exists (finalize first), and refuses `chunk_bytes` below the
   sink's `part_min` (finalize would be impossible on S3). Loud
@@ -248,19 +276,20 @@ Test content (all in `run_tests.py`, 14 tests):
 - The shipper: rides a WAN outage (local keeps writing), one catch-up
   pass ships missed chunks and only the latest checkpoint, remote
   final file byte-identical to the local one.
-- C core parity (`run_c_compat.py`, 6 tests): thrift rebase byte-exact
-  vs `_thrift_shift` on random schemas x120; same mini-file sequence
-  through both writers -> byte-identical chunks, CHECKPOINT OBJECTS,
-  and final files; cross-reading both directions; same refusals.
+- The C core (`run_c_compat.py`, 6 tests), against things that are not
+  the core: CRC-32 equal to zlib's; the thrift rebase read by pyarrow
+  before and after (every offset moved by the delta, nothing else
+  changed, random schemas x120); the core driven directly through 204
+  checkpoints and 21 merges, each read exactly by the Python reader;
+  the package's writer leaving byte for byte the objects the direct
+  driver left; the C reader opening them; the same refusals.
   Pure-C memory soak: `make -C core san` (ASan+UBSan) and
   `make -C core leaks` (0 leaks).
-- When the C core exists: byte-compatibility — C and Python produce
-  interchangeable artifacts; each finalizes the other's.
 
 ## Tests and tools
 
 ```sh
-python3 packages/parquet_checkpoint/run_tests.py     # 15 tests
+python3 packages/parquet_checkpoint/run_tests.py     # 28 tests
 python3 packages/parquet_checkpoint/run_stress.py --kills 25
 python3 packages/parquet_checkpoint/run_stress.py --seconds 60 --rate 20000
 python3 packages/parquet_checkpoint/run_s3_contract.py   # real S3, needs creds
@@ -329,13 +358,29 @@ parquet: any tool reads the files.
     writes bloom filters by default; untested territory until one
     does.
 
-## Tail policy (no knob)
+## Merge in steps (no knob)
 
-The provisional tail is re-encoded at every checkpoint, so its cost is
-bounded by its size. The bound IS the host's row-group cadence: rows
-become final (and leave the tail) at every `write_table`, so the tail
-never exceeds one row group. A growing tail means the host's row-group
-threshold is too big — fix the cadence, don't cap the tail.
+Each object of the unfinished row group is a row group, and the footer,
+written at every checkpoint, has an entry for each. So a small object
+left in place costs footer bytes at every checkpoint, and a merge costs
+its rows once more. The objects of one size are a run. When the footer
+bytes a run has cost reach the bytes of its objects, or the run reaches
+16 objects (`PQC_RUN_LIMIT`), the run and every object after it are
+replaced by one object of the same rows, one size step up.
+
+- A merge is the writer encoding those rows again, from the tail the
+  host gives it. The store joins nothing (S3 cannot).
+- A merge replaces only the end of the list, so no object that stays
+  ever moves, and each row is written once for each step, not once for
+  each checkpoint.
+- The rule lives once, in the C core (`pqc_next_span`), for the Python
+  and the Go writer. The writer counts the bytes itself: there is
+  nothing to set.
+- The 16 bounds what a reader that opens the file cold must fetch for
+  the unfinished row group: at most that many objects for each step.
+
+Before 2026-11-09 the whole tail was encoded again at every checkpoint,
+and the answer to its cost was a shorter row group.
 
 What this costs at each row rate, and the design that replaces the
 re-encoding: [what a checkpoint costs](../docs/checkpoint-cost.md).
@@ -344,6 +389,7 @@ re-encoding: [what a checkpoint costs](../docs/checkpoint-cost.md).
 
 - Multi-file compaction/expiry policy (streaming-parquet's concern).
 - Go S3 sink (DirSink only so far; the interface is the same).
-- Python binding over the C core (the Python implementation stays
-  authoritative; the C core's first native host is the Go package,
-  proven cross-compatible by run_go_compat.py).
+- The Python reader on the C core. The writer is on it (`_core.py`);
+  `CheckpointReader` and `CheckpointFile` still parse the checkpoint
+  object themselves, checked against the core by run_c_compat.py and
+  run_go_compat.py.

@@ -112,8 +112,8 @@ class WorkerPool:
             # otherwise reference the finished task (and any detached
             # record-set pin riding its args) until the next task
             # arrives -- on a quiet stream, forever. Found by the
-            # both-layers jam test: publish's 2s-lease pin outlived
-            # its lease with nothing draining it.
+            # both-layers jam test: publish's pin stayed held with
+            # nothing draining it.
             kind, stream_name = task.kind, task.stream_name
             task = None
             # Mark slot free; promote a parked task if any.
