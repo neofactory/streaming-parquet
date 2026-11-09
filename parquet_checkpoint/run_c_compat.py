@@ -1,19 +1,24 @@
 """C core <-> Python parity suite for parquet_checkpoint.
 
-Run:  python3 packages/parquet_checkpoint/run_c_compat.py
+Run:  python3 parquet_checkpoint/run_c_compat.py
 
-Builds core/libpqc.dylib (make) and proves the C core against the
-Python reference implementation on IDENTICAL inputs:
+The package's writer is a host over the C core (core/pqc.c). This suite
+builds core/libpqc.dylib (make) and proves the core, and the writer
+over it, against the Python writer as it was before that move
+(_reference.ReferenceWriter, kept as the oracle) on IDENTICAL inputs:
 
   - thrift offset rebase: byte-exact vs _thrift_shift, many random
     schemas and deltas
-  - the full writer: same mini-file sequence -> byte-exact chunks and
-    manifest, checkpoints interchangeable (C-built read by the Python
-    CheckpointReader, Python-built read by the C reader), finalize of
-    C artifacts yields a final file byte-exact vs the Python writer's
+  - the core driven directly: same mini-file sequence -> byte-exact
+    chunks and manifest, checkpoints interchangeable (C-built read by
+    the Python CheckpointReader, reference-built read by the C reader),
+    finalize of C artifacts yields a final file byte-exact vs the
+    reference writer's
+  - the package's writer: the same writes through CheckpointWriter and
+    through the reference writer leave the same objects, byte for byte,
+    after every step: every chunk, every checkpoint version, the final
+    file
   - refusals: corrupt checkpoint, tampered chunk CRC visible
-
-The Python package stays authoritative until this suite is green.
 """
 
 import io
@@ -32,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from parquet_checkpoint import (ckpt_object, ckpt_versions,
                                 CheckpointReader, CheckpointWriter, FakeS3,
                                 finalize)
+from parquet_checkpoint._reference import ReferenceWriter
 from parquet_checkpoint._thrift_shift import shift_footer_offsets
 
 CORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'core')
@@ -258,9 +264,9 @@ def _():
     opts = {'compression': 'none', 'write_page_checksum': True}
     c_sink, p_sink = FakeS3(part_min=4096), FakeS3(part_min=4096)
     cw = CWriter('par.parquet', c_sink, 32 * 1024)
-    pw = CheckpointWriter('par.parquet', SCHEMAS[0], sink=p_sink,
-                          chunk_bytes=32 * 1024,
-                          checkpoint_every_write=False, **opts)
+    pw = ReferenceWriter('par.parquet', SCHEMAS[0], sink=p_sink,
+                         chunk_bytes=32 * 1024,
+                         checkpoint_every_write=False, **opts)
     i = 0
     for k in range(12):
         n = rng.randrange(50, 800)
@@ -328,6 +334,121 @@ def _():
         assert pq.read_table(pa.BufferReader(fp)).equals(tt)
         print("        (final files semantically equal; footer bytes "
               "differ)")
+
+
+def same_files(name, schema, steps, **writer_kwargs):
+    """Run `steps` (each a function of a writer) through the package's
+    CheckpointWriter and through the reference writer, each into its own
+    store. After every step both stores must hold the same objects with
+    the same bytes, and both writers must say the same of themselves.
+    Returns the number of object comparisons made."""
+    stores = FakeS3(part_min=4096), FakeS3(part_min=4096)
+    writers = (CheckpointWriter(name, schema, sink=stores[0], **writer_kwargs),
+               ReferenceWriter(name, schema, sink=stores[1], **writer_kwargs))
+    held = 0
+    for k, step in enumerate(steps):
+        got = [step(w) for w in writers]
+        assert got[0] == got[1], f"step {k}: returned {got[0]!r} and {got[1]!r}"
+        a = {n: stores[0].get(n) for n in stores[0].list('')}
+        b = {n: stores[1].get(n) for n in stores[1].list('')}
+        assert sorted(a) == sorted(b), f"step {k}: {sorted(a)} and {sorted(b)}"
+        for n in a:
+            assert a[n] == b[n], f"step {k}: {n} differs"
+        said = [(w.rows_written, w.rows_checkpointed, w.ckpt_name)
+                for w in writers]
+        assert said[0] == said[1], f"step {k}: {said}"
+        held += len(a)
+    return held
+
+
+@test("the package's writer, a host over the core, leaves byte for byte "
+      "the objects the Python writer left before: every chunk, every "
+      "checkpoint version, the final file, after every step")
+def _():
+    rng = random.Random(11)
+    compared = 0
+
+    def write(t):
+        return lambda w: w.write_table(t)
+
+    def checkpoint(t=None):
+        return lambda w: w.checkpoint(t)
+
+    def close(**kw):
+        return lambda w: w.close(**kw)
+
+    # 1. each schema, each compression: row groups, tails, chunks cut,
+    #    a checkpoint with nothing new, the final file
+    for schema in SCHEMAS:
+        for opts in ({'compression': 'none'}, {'compression': 'zstd'},
+                     {'compression': 'snappy', 'use_dictionary': False}):
+            steps = []
+            for k in range(14):
+                steps.append(write(rand_table(rng, schema,
+                                              rng.randrange(40, 700))))
+                if k % 3 == 1:
+                    steps.append(checkpoint(rand_table(
+                        rng, schema, rng.randrange(1, 60))))
+                if k % 5 == 4:
+                    steps.append(checkpoint())      # nothing new to claim
+            steps.append(close())
+            compared += same_files('a.parquet', schema, steps,
+                                   chunk_bytes=32 * 1024, **opts)
+    # 2. no checkpoint at a write: the host asks for each one
+    steps = [write(rand_table(rng, SCHEMAS[0], 300)), checkpoint(),
+             write(rand_table(rng, SCHEMAS[0], 900)),
+             write(rand_table(rng, SCHEMAS[0], 900)),
+             checkpoint(rand_table(rng, SCHEMAS[0], 25)), checkpoint(),
+             close(keep_checkpoints=True)]
+    compared += same_files('b.parquet', SCHEMAS[0], steps,
+                           chunk_bytes=32 * 1024,
+                           checkpoint_every_write=False, compression='none')
+    # 3. rows that are only a tail: no row group yet
+    steps = [checkpoint(rand_table(rng, SCHEMAS[1], 10)),
+             checkpoint(rand_table(rng, SCHEMAS[1], 30)),
+             write(rand_table(rng, SCHEMAS[1], 30)), close()]
+    compared += same_files('c.parquet', SCHEMAS[1], steps,
+                           chunk_bytes=32 * 1024, compression='none')
+    # 4. no rows at all: a checkpoint, then a file with none
+    compared += same_files('d.parquet', SCHEMAS[2], [checkpoint(), close()],
+                           chunk_bytes=32 * 1024)
+    compared += same_files('e.parquet', SCHEMAS[2], [close()],
+                           chunk_bytes=32 * 1024)
+    # 5. a write of no rows, and a tail of no rows
+    empty = rand_table(rng, SCHEMAS[0], 0)
+    steps = [write(empty), checkpoint(empty),
+             write(rand_table(rng, SCHEMAS[0], 50)), checkpoint(empty),
+             close()]
+    compared += same_files('f.parquet', SCHEMAS[0], steps,
+                           chunk_bytes=32 * 1024, compression='none')
+    # 6. as a stream writes: the writer's schema carries file metadata
+    #    that the tables do not, zstd 9, no dictionary, the integer and
+    #    float encodings of streaming_parquet
+    flat = pa.schema([F('n', pa.int64(), nullable=False),
+                      F('x', pa.float64(), nullable=False),
+                      F('y', pa.float32(), nullable=False),
+                      F('s', pa.string(), nullable=False)])
+    with_md = flat.with_metadata({b'sp_run': b'2026-11-09T00:00:00.000000Z',
+                                  b'sp_base_seq': b'1234'})
+
+    def rows(i, n):
+        return pa.table({'n': list(range(i, i + n)),
+                         'x': [j * 0.25 for j in range(i, i + n)],
+                         'y': [float(j % 7) for j in range(i, i + n)],
+                         's': [f'row-{j}' for j in range(i, i + n)]},
+                        schema=flat)
+    steps, i = [], 0
+    for k in range(10):
+        steps.append(write(rows(i, 2000)))
+        i += 2000
+        steps.append(checkpoint(rows(i, 100 + k)))
+    steps.append(close())
+    compared += same_files(
+        'g.parquet', with_md, steps, chunk_bytes=32 * 1024,
+        compression='zstd', compression_level=9, use_dictionary=False,
+        column_encoding={'n': 'DELTA_BINARY_PACKED', 'x': 'BYTE_STREAM_SPLIT',
+                         'y': 'BYTE_STREAM_SPLIT'})
+    print(f"        ({compared} object comparisons, all equal)")
 
 
 @test("empty checkpoint: C accepts an empty mini as the data region")
