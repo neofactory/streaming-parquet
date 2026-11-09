@@ -80,6 +80,11 @@ class _StreamData:
         """Highest committed seq (absolute, ignoring any playback clock)."""
         return self.ring.newest_seq
 
+    def window(self):
+        """(oldest row, newest visible row, capacity): the rows the ring
+        holds now and how many it can hold. newest < oldest: no rows."""
+        return self.oldest_seq, self.newest_visible_seq(), self.ring.capacity
+
     def read_row(self, seq):
         """Read-only row view; playback-clamped when a clock is set."""
         if self._playback_clock is not None and seq > self.newest_visible_seq():

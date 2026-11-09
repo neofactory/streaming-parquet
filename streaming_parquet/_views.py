@@ -14,18 +14,37 @@ What the view reads, all named by one ticket:
                     ranges from the store
   unfinished files  the checkpoint versions the ticket lists, read
                     through the parquet_checkpoint extension
-                    (read_parquet('pqc://<path>'))
-  memory            duckdb_all only: the reader's ring, rows after the
-                    ticket's stored_row (same run only)
+                    (read_parquet('pqc://<path>')), each up to the seam
+  memory            duckdb_all only: the ring, rows after the seam
+                    (same run only)
 
-The view's text names all three, so a query never mixes two tickets.
-When the ticket changes, our code replaces the view in one statement
-(CREATE OR REPLACE VIEW, on its own cursor of the caller's database).
-One background thread per view decides when: a live reader learns of
-every ticket write from the revision on its connection; a reader
-without one reads the ticket on the schedule its write time and beat
-give. A catalog or checkpoint version the store no longer holds means a
-newer ticket exists: the view reads the ticket again.
+The seam is the row where the view changes from the store to the ring.
+To the extent that rows are in the ring, the view uses them: the seam
+is the oldest row boundary the store has that is above the ring's
+oldest quarter (choose_seam). A view uses the newest three quarters of
+the ring; the oldest quarter is the time a running query has before the
+writer reuses the rows after its seam. With the default ring of two row
+groups the ring always holds the unfinished row group, so the seam is
+the end of a finished row group: the view reads finished row groups
+from the store, each once, and never the rows a checkpoint adds. This
+holds for a remote reader, whose ring is fed over Flight, and for the
+process that writes the stream, whose ring is the source. A view with
+no ring (duckdb_archive, or a reader not connected) has its seam at the
+ticket's stored_row.
+
+The view's text names all three pieces and the seam, so a query never
+mixes two states. Our code replaces the view in one statement (CREATE
+OR REPLACE VIEW, on its own cursor of the caller's database) when the
+text must change: the seam moved (about once for each row group), the
+catalog changed, or a checkpoint version the text names has been
+replaced for half the time the store keeps it (the ticket's
+keep_seconds; a version is deleted that long after a newer one replaces
+it). A view with no ring follows every ticket. One background thread
+per view decides when: a live reader learns of every ticket write from
+the revision on its connection; a reader without one reads the ticket
+on the schedule its write time and beat give. A catalog or checkpoint
+version the store no longer holds means a newer ticket exists: the view
+reads the ticket again.
 
 The connection must load the parquet_checkpoint extension (_extension:
 opened with allow_unsigned_extensions). Views are closed at exit,
@@ -42,6 +61,9 @@ import threading
 import time
 
 import pyarrow as pa
+import pyarrow.compute as pc
+
+import parquet_checkpoint
 
 from . import _tickets
 from ._catalog import CATALOG
@@ -56,6 +78,17 @@ POLL_MARGIN_S = 1.0
 #: Catalog copies kept attached: the current one and those a query
 #: still running may hold.
 KEEP_CATALOGS = 3
+#: The share of the ring a view leaves alone: its oldest rows. A query
+#: keeps the seam it began with, and the row after that seam must still
+#: be in the ring when the query's scan reaches the ring. A seam above
+#: the oldest quarter gives the query that many rows of the writer's
+#: time. (Not a pin: a scan pins one chunk for under a millisecond. This
+#: is the time between a query's start and its scan of the ring.)
+RING_MARGIN_SHARE = 0.25
+#: A view names a checkpoint version until the seam moves, or until the
+#: version has been replaced for this share of the time the store keeps
+#: a replaced version.
+REPOINT_SHARE = 0.5
 
 
 def _safe(s):
@@ -78,16 +111,19 @@ class TicketSource:
     memory(lo):   the ring's rows from seq lo on, as (first_seq, batch)
                   pairs read a chunk at a time (Ring.iter_chunks), or
                   None.
+    window():     (oldest row, newest row, capacity) of that ring, or
+                  None: what a view places its seam by.
     """
 
     def __init__(self, name, store, ticket=None, revisions=None, run=None,
-                 memory=None):
+                 memory=None, window=None):
         self.name = name
         self.store = store
         self.ticket = ticket or (lambda: _tickets.get_ticket(store, name))
         self.revisions = revisions
         self.run = run or (lambda: None)
         self.memory = memory
+        self.window = window
         folder = _tickets.archive_dir(store, name)
         if folder is None:
             raise ValueError(
@@ -97,41 +133,133 @@ class TicketSource:
 
 
 class _MemoryProxy:
-    """Per query: the ring's committed rows after `floor()`, with their
-    row numbers in _seq (the view keeps the rows after its ticket's
-    stored_row; floor is the oldest such seam a view version still in
-    use names). Read a chunk at a time through Ring.iter_chunks, zero
+    """Per query: the ring's committed rows, each with its row number in
+    _seq and, in _first, the row number of the first row this read
+    delivered (the ring's oldest row when the scan began). The view's
+    text keeps the rows after its seam, and fails the query when _first
+    is past the row after the seam: the ring no longer held the rows the
+    query needed. Read a chunk at a time through Ring.iter_chunks, zero
     copy: nothing is pinned until the scan reaches memory, which in a
     query over the store may be seconds in, and then only the chunk in
     hand. (2026-10-27 a whole-window pin held for such a query stalled
     the writer; a copy patched it; the chunk read retires the copy.)
     A reader with no connection yet scans an empty memory."""
 
-    def __init__(self, chunks, schema, floor):
+    def __init__(self, chunks, schema):
         self._chunks = chunks
-        self._floor = floor
-        self._schema = schema.append(pa.field('_seq', pa.int64()))
+        self._schema = (schema.append(pa.field('_seq', pa.int64()))
+                        .append(pa.field('_first', pa.int64())))
 
     def __arrow_c_stream__(self, requested_schema=None):
         try:
-            it = self._chunks(self._floor() + 1)
+            it = self._chunks(0)        # from the ring's oldest row
         except Exception:
             it = ()
-        # map, not a generator: a generator's loop variable would hold
-        # each batch, and its chunk's pin, until the next pull.
         return pa.RecordBatchReader.from_batches(
-            self._schema, map(_seq_column, it)).__arrow_c_stream__(requested_schema)
+            self._schema, _Numbered(it)).__arrow_c_stream__(requested_schema)
 
 
-def _seq_column(pair):
-    first, batch = pair
-    return batch.append_column(
-        '_seq', pa.array(range(first, first + batch.num_rows), type=pa.int64()))
+class _Numbered:
+    """(first_seq, batch) pairs as batches with _seq and _first. A class
+    with __next__, not a generator: a generator's loop variable would
+    hold each batch, and its chunk's pin, until the next pull."""
+
+    def __init__(self, pairs):
+        self._pairs = iter(pairs)
+        self._first = None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        first, batch = next(self._pairs)
+        if self._first is None:
+            self._first = first
+        n = batch.num_rows
+        return (batch.append_column('_seq', _row_numbers(first, n))
+                .append_column('_first', pa.repeat(
+                    pa.scalar(self._first, pa.int64()), n)))
 
 
-def _with_seq(table, start):
-    return table.append_column(
-        '_seq', pa.array(range(start, start + table.num_rows), type=pa.int64()))
+_counting = None
+
+
+def _row_numbers(first, n):
+    """The int64 array first, first + 1, ..., first + n - 1."""
+    global _counting
+    if _counting is None or len(_counting) < n:
+        _counting = pa.array(range(max(n, 1 << 14)), type=pa.int64())
+    return pc.add(_counting.slice(0, n), pa.scalar(first, pa.int64()))
+
+
+def choose_seam(stored_row, files, window):
+    """Where a view changes from the store to the ring.
+
+    stored_row:  the newest row in the store (the ticket's).
+    files:       the ticket's unfinished files: dicts with first_row and
+                 final_rows (either may be None: not known).
+    window:      (oldest row, newest row, capacity) of the ring, or None
+                 (no ring: a view of the files only).
+
+    Returns (seam, use_ring, why). The view reads the store up to row
+    `seam` and, when use_ring, the ring after it. The row boundaries the
+    store has are the start of each unfinished file, the end of its
+    finished row groups, and stored_row. The seam is the oldest of them
+    that the ring covers and that is above the ring's oldest quarter.
+
+    why, when the choice is not that one:
+      'tight'  no boundary is above the oldest quarter, but the ring
+               reaches stored_row: the seam is stored_row, and a running
+               query has less than a quarter of the ring.
+      'short'  the ring is full and begins after stored_row + 1: it is
+               too short for the store's lag. No ring piece.
+      'late'   the ring is not full and begins after stored_row + 1 (a
+               reader that connected after the ticket's checkpoint; a
+               later ticket reaches its first row). No ring piece.
+    """
+    if window is None:
+        return stored_row, False, None
+    oldest, newest, capacity = window
+    if newest < oldest:                 # the ring holds no rows yet
+        return stored_row, True, None
+    # the first row above the oldest quarter of a full ring: the writer
+    # reuses row r once it has written row r + capacity
+    above = newest + 1 - capacity + int(capacity * RING_MARGIN_SHARE)
+    candidates = {stored_row}
+    for f in files:
+        first = f.get("first_row")
+        if first is None:
+            continue
+        candidates.add(first - 1)
+        if f.get("final_rows") is not None:
+            candidates.add(first + f["final_rows"] - 1)
+    usable = [c for c in candidates
+              if c <= stored_row and c + 1 >= oldest and c + 1 >= above]
+    if usable:
+        return min(usable), True, None
+    if oldest <= stored_row + 1:
+        return stored_row, True, 'tight'
+    full = newest - oldest + 1 >= capacity
+    return stored_row, False, ('short' if full else 'late')
+
+
+def _ticket_files(ticket):
+    """The ticket's unfinished files, as dicts with checkpoint,
+    first_row, final_rows and rows. A ticket from a writer before
+    `files` lists the checkpoint paths alone: the numbers are None."""
+    if not ticket:
+        return []
+    if ticket.get("files") is not None:
+        return list(ticket["files"])
+    return [{"checkpoint": c, "first_row": None, "final_rows": None,
+             "rows": None} for c in ticket.get("unfinished") or ()]
+
+
+def _file_of(checkpoint):
+    """The path of the file a checkpoint version's path belongs to."""
+    folder, _, obj = checkpoint.rpartition("/")
+    got = parquet_checkpoint.parse_ckpt_object(obj)
+    return (folder + "/" + got[0]) if got is not None else checkpoint
 
 
 _views = set()
@@ -164,7 +292,6 @@ class StoreView:
         sid = _safe(name)
         self._sid = sid
         self._mem_name = f"__sp_mem_{sid}"
-        self._seams = [-1]              # the seams of view versions in use
         self._empty_name = f"__sp_empty_{sid}"
         if schema is not None:
             empty = pa.table({f.name: pa.array([], type=f.type) for f in schema})
@@ -172,15 +299,21 @@ class StoreView:
                 c.register(self._empty_name, empty)
                 if self._with_memory:
                     c.register(self._mem_name,
-                               _MemoryProxy(source.memory, schema,
-                                            self._memory_floor))
+                               _MemoryProxy(source.memory, schema))
         self._tmp = tempfile.mkdtemp(prefix="sp-view-")
         self._lock = threading.Lock()
         self._k = 0
         self._catalogs = []             # [(etag, alias, path)], newest last
-        self._built = None              # the ticket facts the view names
+        self._built = None              # the facts the view's text names
         self._ticket = None
         self._seen_revision = None
+        # file -> (the checkpoint version the text names, when a newer
+        # one was first seen or None)
+        self._named = {}
+        self._named_seam = None
+        self.seam = None                # the row the text changes at
+        self.rebuilds = 0               # times the view's text was replaced
+        self.ring_note = None           # why the ring is not used as wanted
         self.error = None               # the last refresh's failure
         self._stop = threading.Event()
         self.refresh()                  # the first build raises
@@ -216,26 +349,55 @@ class StoreView:
         live = (t is not None and "revision" in t
                 and time.time() - float(t.get("ts", 0)) < _tickets.stale_after(t))
         etag = t.get("catalog_etag") if live else None
-        unfinished = tuple(t.get("unfinished") or ()) if t else ()
+        files = _ticket_files(t)
         run = t.get("run") if t else None
-        seam = t.get("stored_row", -1) if t else -1
-        memory_ok = (self._with_memory and live and run is not None
-                     and run == src.run())
-        facts = (etag if live else "current", unfinished, run, seam, memory_ok)
+        stored = t.get("stored_row", -1) if t else -1
+        seam, use_ring, why = stored, False, None
+        if (self._with_memory and live and run is not None
+                and run == src.run()):
+            seam, use_ring, why = choose_seam(stored, files, self._window())
+        self._note_ring(why, stored)
+        keep = float((t or {}).get("keep_seconds")
+                     or parquet_checkpoint.SUPERSEDED_KEEP_S)
+        named = self._name_versions(files, seam, keep * REPOINT_SHARE)
+        facts = (etag if live else "current", tuple(named), run, seam,
+                 use_ring)
         if facts == self._built and live:
             return
         catalog = self._catalog(etag, exact=live)
         pieces = []
         if catalog is not None:
             pieces.append(f'SELECT * FROM "{catalog}".data')
-        if unfinished:
-            paths = ", ".join("'pqc://" + p.replace("'", "''") + "'"
-                              for p in unfinished)
-            pieces.append(f"SELECT * FROM read_parquet([{paths}], "
-                          f"union_by_name=true)")
-        if memory_ok:
-            pieces.append(f'SELECT * EXCLUDE (_seq) FROM "{self._mem_name}" '
-                          f'WHERE _seq > {int(seam)}')
+        for path, last_row in named:
+            quoted = "'pqc://" + path.replace("'", "''") + "'"
+            if last_row is None:
+                pieces.append(f"SELECT * FROM read_parquet({quoted})")
+            else:
+                # the file up to the seam: DuckDB opens no object of the
+                # file past that row
+                pieces.append(
+                    f"SELECT * EXCLUDE (file_row_number) FROM "
+                    f"read_parquet({quoted}, file_row_number=true) "
+                    f"WHERE file_row_number <= {int(last_row)}")
+        if use_ring:
+            # The view reads the store up to the seam and the ring after
+            # it. If the ring begins past the row after the seam, rows
+            # are in neither: the query fails, it does not answer short.
+            what = (f"{self.name}: the ring does not hold row "
+                    f"{int(seam) + 1}; it begins at row ")
+            why = (". This query read the rows up to "
+                   f"{int(seam)} from the store. Either it reached the ring "
+                   "after the stream had written more rows than the ring "
+                   "keeps for a running query, or this reader connected a "
+                   "moment ago and the store has not reached its first row "
+                   "yet. Run it again; for longer queries connect with a "
+                   "larger Memory(lookback=...).")
+            pieces.append(
+                f'SELECT * EXCLUDE (_seq, _first) FROM "{self._mem_name}" '
+                f'WHERE _seq > {int(seam)} AND CASE WHEN _first > '
+                f"{int(seam) + 1} THEN error('" + what.replace("'", "''")
+                + "' || _first || '" + why.replace("'", "''")
+                + "') ELSE true END")
         if not pieces:
             if self._schema is None:
                 raise ValueError(
@@ -246,13 +408,78 @@ class StoreView:
         if src.folder.startswith("s3://"):
             self._give_duckdb_s3(src.folder)
         sql = " UNION ALL BY NAME ".join(f"({p})" for p in pieces)
-        if memory_ok:
-            # before the text naming it: a query on the new text must
-            # find its rows in the memory piece
-            self._seams = (self._seams + [int(seam)])[-(KEEP_CATALOGS + 1):]
         self._cur.execute(f'CREATE OR REPLACE VIEW "{self.name}" AS {sql}')
         self._built = facts
+        self.seam = seam
+        self.rebuilds += 1
         self._detach_old()
+
+    def _window(self):
+        """The ring's (oldest row, newest row, capacity), or None."""
+        if self._source.window is None:
+            return None
+        try:
+            return self._source.window()
+        except Exception:
+            return None                 # a reader not yet connected
+
+    def _name_versions(self, files, seam, repoint_s):
+        """[(checkpoint path, last file row or None)] for the unfinished
+        files the text reads: those that begin at or before the seam,
+        each up to the seam (None: the whole file, its place on the row
+        numbers not known). A file keeps the checkpoint version the text
+        already names until the seam moves or that version has been
+        replaced for repoint_s: every version holds the rows up to the
+        seam it was named for."""
+        now = time.monotonic()
+        moved = seam != self._named_seam
+        named, keeps = [], {}
+        for f in files:
+            first = f.get("first_row")
+            if first is not None and first > seam:
+                continue                # after the seam: the ring has it
+            key = _file_of(f["checkpoint"])
+            path, since = f["checkpoint"], None
+            old = self._named.get(key)
+            if old is not None and not moved and old[0] != path:
+                since = old[1] if old[1] is not None else now
+                if now - since < repoint_s:
+                    path = old[0]       # still there: keep naming it
+                else:
+                    since = None
+            keeps[key] = (path, since)
+            named.append((path, None if first is None else seam - first))
+        self._named = keeps
+        self._named_seam = seam
+        return named
+
+    def _note_ring(self, why, stored):
+        """Say, once for each change, why the ring is not used as
+        wanted. 'late' is not said: a later ticket ends it."""
+        note = None
+        if why in ('short', 'tight'):
+            oldest, newest, capacity = self._window() or (0, -1, 0)
+            behind = newest - stored
+            want = int(behind / (1 - RING_MARGIN_SHARE)) + 1
+            if why == 'short':
+                note = (f"the ring holds rows {oldest} to {newest} and the "
+                        f"store ends at row {stored}: the ring is too short "
+                        f"for the store's lag of {behind} rows, so the view "
+                        f"reads the files only and is that far behind. "
+                        f"Connect with Memory(lookback={want}) or more "
+                        f"(now {capacity}).")
+            else:
+                note = (f"the store is {behind} rows behind a ring of "
+                        f"{capacity}: a running query has less than a "
+                        f"quarter of the ring to reach memory. Connect with "
+                        f"Memory(lookback={want}) or more.")
+        if (note is None) != (self.ring_note is None):
+            if note is not None:
+                _diag.warning(f"[{self._source.name}] view {self.name}: {note}")
+            else:
+                _diag.info(f"[{self._source.name}] view {self.name}: the "
+                           f"ring is in use again")
+        self.ring_note = note
 
     def _catalog(self, etag, exact):
         """The alias of the attached catalog copy for `etag` (None when
@@ -276,10 +503,6 @@ class StoreView:
         self._cur.execute(f"ATTACH 'ducklake:{path}' AS \"{alias}\" (READ_ONLY)")
         self._catalogs.append((got, alias, path))
         return alias
-
-    def _memory_floor(self):
-        """The oldest seam a view version still in use names."""
-        return min(self._seams)
 
     def _detach_old(self):
         while len(self._catalogs) > KEEP_CATALOGS:

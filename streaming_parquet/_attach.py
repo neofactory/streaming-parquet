@@ -303,7 +303,7 @@ class Attached:
         return TicketSource(
             self.name, store, revisions=feeder,
             run=(lambda: feeder._run) if feeder is not None else None,
-            memory=memory_chunks)
+            memory=memory_chunks, window=lambda: self._require().window())
 
     def duckdb_archive(self, con, name=None, store=None):
         """The stream's files as one DuckDB view: the finished files of
@@ -319,10 +319,12 @@ class Attached:
 
     def duckdb_all(self, con, name=None, store=None):
         """Memory plus the files, one DuckDB view, exact at the seam:
-        the files the ticket names up to its stored_row, memory after
-        it; kept current from the ticket (_views). Without the live
-        connection the memory piece is left out and `standing()` says
-        why; the files still answer."""
+        the files the ticket names up to the seam, memory after it. To
+        the extent that rows are in memory the view uses them: the seam
+        is the oldest row boundary the store has above the ring's
+        oldest quarter (_views). Without the live connection the memory
+        piece is left out and `standing()` says why; the files still
+        answer."""
         from ._views import StoreView
         src = self._view_source(store)
         return StoreView(con, src, name or f"sp_{_safe(self.name)}",
