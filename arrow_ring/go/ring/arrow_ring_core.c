@@ -1032,10 +1032,9 @@ int64_t ar_recordset_lo(const ArRecordSet *rs) { return rs->lo; }
 int64_t ar_recordset_hi(const ArRecordSet *rs) { return rs->hi; }
 
 /* The record set over [lo, hi), both already clamped to the readable
- * window: pinned when non-empty. Shared by ar_relation (every row the
- * ring holds) and ar_pin (the caller names the rows). */
-static ArStatus make_relation(ArRing *r, int64_t lo, int64_t hi,
-                              ArRecordSet **out) {
+ * window: pinned when non-empty. */
+static ArStatus make_record_set(ArRing *r, int64_t lo, int64_t hi,
+                                ArRecordSet **out) {
   ArRecordSet *rs = calloc(1, sizeof(ArRecordSet));
   if (!rs) return err(AR_ERR_NOMEM, "record set");
   atomic_init(&rs->refs, 1);
@@ -1064,11 +1063,6 @@ static ArStatus make_relation(ArRing *r, int64_t lo, int64_t hi,
   return AR_OK;
 }
 
-ArStatus ar_relation(ArRing *r, ArRecordSet **out) {
-  *out = NULL;
-  return make_relation(r, ar_oldest_seq(r), atomic_load(&r->committed), out);
-}
-
 ArStatus ar_pin(ArRing *r, int64_t lo, int64_t hi, ArRecordSet **out) {
   *out = NULL;
   if (lo < 0 || hi < lo)
@@ -1081,7 +1075,7 @@ ArStatus ar_pin(ArRing *r, int64_t lo, int64_t hi, ArRecordSet **out) {
   int64_t committed = atomic_load(&r->committed);
   if (lo < oldest) lo = oldest;
   if (hi > committed) hi = committed;
-  return make_relation(r, lo, hi, out);
+  return make_record_set(r, lo, hi, out);
 }
 
 /* ---- export: chunk computation ------------------------------------------------- */

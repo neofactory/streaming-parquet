@@ -124,14 +124,14 @@ func TestAppendRecordBulk(t *testing.T) {
 	}
 }
 
-func TestStaticRelationZeroCopyOut(t *testing.T) {
+func TestPinZeroCopyOut(t *testing.T) {
 	r, err := NewRing(testSchema(), 512, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer r.Close()
 	fill(t, r, 0, 400)
-	rs, err := r.StaticRelation()
+	rs, err := r.Pin(0, r.NewestSeq()+1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +172,7 @@ func TestPinStallsWriterLoudly(t *testing.T) {
 	}
 	defer r.Close()
 	fill(t, r, 0, 64) // full
-	rs, err := r.StaticRelation()
+	rs, err := r.Pin(0, r.NewestSeq()+1)
 	if err != nil {
 		t.Fatal(err)
 	}

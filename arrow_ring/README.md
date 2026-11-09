@@ -46,7 +46,6 @@ ring.commit() -> n
 ring.append_batch(batch) / ring.append_table(table)
 ring.read_row(seq) -> Row            # MutableRow is its writable subclass
 ring.oldest_seq / ring.newest_seq
-ring.get_static_relation() -> RecordSet            # every row the ring holds
 ring.pin(lo, hi) -> RecordSet                      # exactly these rows
 ring.iter_chunks(lo=0, hi=None, chunk_rows=16384)  # -> (first_seq, RecordBatch)...: a pin per chunk
 ring.chunked_reader(lo=0, hi=None, chunk_rows=16384) -> pyarrow.RecordBatchReader
@@ -139,12 +138,10 @@ with ring.pin(newest - 999, newest + 1) as rs:   # the newest 1,000 rows
   The writer meets this pin only after a whole ring of writes, and
   then the holder is a leak. `lo` below the oldest row is raised to
   it (the set's `lo` says so); `hi` above committed is lowered. Pins
-  also hold the referenced pool segments (see below).
-- `get_static_relation()` — a pinned record set over every row the
-  ring holds. On a full ring it holds the row the writer needs next,
-  so the writer waits until the release. Use it on a ring that is not
-  being written, or for a moment; a reader that follows a live writer
-  names its rows with `pin`, or reads by chunks (next).
+  also hold the referenced pool segments (see below). There is no
+  call that pins the whole ring: a pin on the oldest row of a full
+  ring makes the writer wait at once, so a reader names the rows it
+  needs, or reads by chunks (next).
 - `iter_chunks(lo, hi, chunk_rows)` — the read for a consumer that
   pulls batches one at a time (a DuckDB scan): nothing pinned at open;
   the range fixed at the first chunk, not at open, so a consumer that

@@ -91,6 +91,11 @@ def test(name):
     return decorator
 
 
+def all_rows(ring):
+    """A record set over every row the ring holds."""
+    return ring.pin(0, ring.newest_seq + 1)
+
+
 def fill(stream, count, start=0):
     for i in range(start, start + count):
         row = stream.get_mutable_row(block_s=1.0)
@@ -162,12 +167,12 @@ def _():
         pass
 
 
-@test("ring static relation via a.ring + DuckDB over the hot window")
+@test("a record set over the ring's rows via a._ring + DuckDB over the hot window")
 def _():
     s = sp.create_stream("v2test/rel", SCHEMA, memory=Memory(lookback=500))
     fill(s, 100)
     a = sp.connect("v2test/rel")
-    with a._ring.get_static_relation() as rs:
+    with all_rows(a._ring) as rs:
         assert (rs.lo, rs.hi) == (0, 100)
         con = duckdb.connect()
         con.register('hot', rs.table)
@@ -216,12 +221,12 @@ def _():
     assert a._read_row(49).label == 'r49'
 
 
-@test("held static relation stalls the writer, loudly, then releases")
+@test("a held pin on the oldest row stalls the writer, loudly, then releases")
 def _():
     s = sp.create_stream("v2test/pin", SCHEMA, memory=Memory(lookback=32))
     fill(s, 32)
     a = sp.connect("v2test/pin")
-    rs = a._ring.get_static_relation()
+    rs = all_rows(a._ring)
     try:
         s.get_mutable_row(block_s=0.05)
         assert False, "pinned ring should stall the writer"
@@ -394,7 +399,7 @@ def _():
         time.sleep(0.5)
         wait_for(lambda: a._newest_seq == N - 1, what="hostile rows over Flight")
         # the attached ring carried nulls/NaN/unicode/lists intact
-        with a._ring.get_static_relation() as rs:
+        with all_rows(a._ring) as rs:
             assert_hostile_equal(rs.table, 0, N)
         # and the whole timeline (catalog + unfinished file + memory) is exact
         con = view_con()
@@ -1016,7 +1021,7 @@ def _():
     # second wave
     fill(s, 30, start=30)
     wait_for(lambda: a._newest_seq == 59, what="second wave")
-    with a._ring.get_static_relation() as rs:
+    with all_rows(a._ring) as rs:
         assert rs.table.num_rows == 60
 
 
@@ -1059,7 +1064,7 @@ def _():
     assert a._oldest_seq == 40, a._oldest_seq
     for seq in (40, 50, 59):
         assert a._read_row(seq).tv == float(seq)
-    with a._ring.get_static_relation() as rs:
+    with all_rows(a._ring) as rs:
         assert rs.lo == 40 and rs.hi == 60
 
 

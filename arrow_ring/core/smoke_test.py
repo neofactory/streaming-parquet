@@ -42,7 +42,7 @@ ArStatus ar_get_var(const ArRing *ring, int64_t seq, int32_t leaf,
 int64_t ar_oldest_seq(const ArRing *ring);
 int64_t ar_newest_seq(const ArRing *ring);
 uint64_t ar_leaf_data_address(const ArRing *ring, int32_t leaf);
-ArStatus ar_relation(ArRing *ring, ArRecordSet **out);
+ArStatus ar_pin(ArRing *ring, int64_t lo, int64_t hi, ArRecordSet **out);
 int64_t ar_recordset_lo(const ArRecordSet *rs);
 int64_t ar_recordset_hi(const ArRecordSet *rs);
 ArStatus ar_recordset_stream(ArRecordSet *rs, void *out_stream);
@@ -120,7 +120,7 @@ ok(lib.ar_get_var(ring, 4, L['label'], d, dn, nul))
 check("get_var utf8", ffi.buffer(d[0], dn[0])[:] == b'row-4')
 
 rsp = ffi.new("ArRecordSet **")
-ok(lib.ar_relation(ring, rsp))
+ok(lib.ar_pin(ring, 0, 2**63 - 1, rsp))
 rs = rsp[0]
 t = table_of(rs)
 check("table rows", t.num_rows == 6)

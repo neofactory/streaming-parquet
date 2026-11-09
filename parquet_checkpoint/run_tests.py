@@ -521,7 +521,7 @@ def _():
             row.s = f'row-{i}'
             i += 1
         ring.commit()
-        rel = ring.get_static_relation()
+        rel = ring.pin(0, ring.newest_seq + 1)   # every row
         hot = rel.table
         fresh = hot.filter(pc.greater_equal(hot['n'], w.rows_checkpointed))
         if fresh.num_rows:

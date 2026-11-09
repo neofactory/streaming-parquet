@@ -33,6 +33,11 @@ SCHEMA = pa.schema([F('seq', pa.int64(), nullable=False),
                     F('label', pa.utf8(), nullable=False)])
 
 
+def all_rows(ring):
+    """A record set over every row the ring holds."""
+    return ring.pin(0, ring.newest_seq + 1)
+
+
 def fill(ring, count, start=0):
     for i in range(start, start + count):
         row = ring.get_mutable_row()
@@ -49,7 +54,7 @@ def test_parquet_write_and_duckdb_readback():
     fill(ring, 100)
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, 'archive-0.parquet')
-        with ring.get_static_relation() as rs:
+        with all_rows(ring) as rs:
             pq.write_table(rs.table, path)
         got = duckdb.sql(
             f"SELECT count(*) c, min(seq) mn, max(seq) mx, sum(tv) s "
@@ -69,7 +74,7 @@ def test_parquet_rotation_row_groups():
         wm = -1                     # last flushed seq (the watermark)
         for cycle in range(4):
             fill(ring, 50, start=(wm + 1))
-            with ring.get_static_relation() as rs:
+            with all_rows(ring) as rs:
                 t = rs.table.filter(pc.greater(rs.table['seq'], wm))
                 path = os.path.join(tmp, f'archive-{cycle}.parquet')
                 pq.write_table(t, path)
@@ -165,7 +170,7 @@ def test_union_view_invariant_under_live_writer():
 def test_duckdb_query_over_hot_relation():
     ring = Ring(SCHEMA, capacity=256)
     fill(ring, 200)
-    with ring.get_static_relation() as rs:
+    with all_rows(ring) as rs:
         con = duckdb.connect()
         con.register('hot', rs.table)
         got = con.sql("SELECT sum(tv) FROM hot "
@@ -228,7 +233,7 @@ def test_flight_loopback_ring_to_ring():
             super().__init__('grpc://127.0.0.1:0')
 
         def do_get(self, context, ticket):
-            rel = a.get_static_relation()
+            rel = all_rows(a)
             table = rel.table       # zero-copy of pinned ring memory
             rel.release()           # table's refcounts keep memory alive
             return fl.RecordBatchStream(table)
@@ -239,8 +244,8 @@ def test_flight_loopback_ring_to_ring():
         got = client.do_get(fl.Ticket(b'hot')).read_all()
         b = Ring(SCHEMA, capacity=256)
         b.append_table(got)
-        with b.get_static_relation() as rs_b:
-            with a.get_static_relation() as rs_a:
+        with all_rows(b) as rs_b:
+            with all_rows(a) as rs_a:
                 assert rs_b.table.to_pylist() == rs_a.table.to_pylist()
         assert b.read_row(149).label == 'v149'
     finally:

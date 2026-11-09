@@ -7,7 +7,6 @@ Public API (the README is the contract):
     ring.get_mutable_row(block_s=0.0) -> MutableRow
     ring.commit() -> int
     ring.read_row(seq) -> Row (MutableRow is its writable subclass)
-    ring.get_static_relation() -> RecordSet     # every row the ring holds
     ring.pin(lo, hi) -> RecordSet               # exactly these rows
     ring.get_dynamic_relation(chunk_rows=16384) -> DynamicRelation
     ring.oldest_seq / ring.newest_seq

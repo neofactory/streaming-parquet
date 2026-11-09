@@ -4,7 +4,7 @@
 //
 //	leak-bisect <stage> <seconds>
 //	  ingest    ring + string AppendRecord churn only
-//	  relation  ingest + StaticRelation/Records/Release churn
+//	  relation  ingest + Pin/Records/Release churn
 //	  encode    relation + pqarrow encode of the records
 //
 // Prints "t=<s> rss=<MB> heap=<MB>" every 5s. RSS from getrusage
@@ -83,7 +83,7 @@ func main() {
 		n += 1200
 
 		if stage == "relation" || stage == "encode" {
-			rs, err := r.StaticRelation()
+			rs, err := r.Pin(0, r.NewestSeq()+1)
 			if err == nil {
 				recs, err := rs.Records()
 				if err != nil {
