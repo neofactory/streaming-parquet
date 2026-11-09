@@ -126,7 +126,7 @@ static uint32_t rnd(void) {
 int main(void) {
     char err[512];
     uint8_t mini[1 << 16];
-    uint8_t *store[512];        /* pretend sink for chunk bodies */
+    uint8_t *store[2048];       /* pretend sink for object bodies */
     int n_store = 0;
 
     /* shift round: idempotence-ish (shift by d then -d = original) */
@@ -156,6 +156,11 @@ int main(void) {
         PqcWriter *w = pqc_writer_new("soak.parquet",
                                       1024 + rnd() % 8192, err, 512);
         assert(w);
+        char name[PQC_NAME_MAX];
+        const uint8_t *data;
+        uint64_t len;
+        uint32_t crc;
+        int rc;
         int groups = 1 + (int)(rnd() % 12);
         for (int g = 0; g < groups; g++) {
             size_t pages = 200 + rnd() % 4000;
@@ -164,38 +169,73 @@ int main(void) {
                                  (int64_t)(rnd() % 500));
             int64_t rows = pqc_add_group(w, mini, n, err, 512);
             assert(rows >= 0);
+            /* a checkpoint may not claim what is not stored */
+            if (rnd() % 5 == 0) {
+                uint64_t cl0, wm0;
+                assert(pqc_build_checkpoint(w, NULL, 0, &cl0, &wm0,
+                                            err, 512) == NULL);
+            }
             /* drain */
-            char name[PQC_NAME_MAX];
-            const uint8_t *data;
-            uint64_t len;
-            uint32_t crc;
-            int rc;
-            while ((rc = pqc_next_chunk(w, name, &data, &len, &crc)) == 1) {
+            while ((rc = pqc_next_object(w, name, &data, &len, &crc)) == 1) {
                 assert(pqc_crc32(data, len) == crc);
                 if (rnd() % 4 == 0) {          /* failed store: retry   */
                     const uint8_t *d2;
                     uint64_t l2;
                     uint32_t c2;
-                    assert(pqc_next_chunk(w, name, &d2, &l2, &c2) == 1);
+                    assert(pqc_next_object(w, name, &d2, &l2, &c2) == 1);
                     assert(l2 == len && c2 == crc);
                 }
-                assert(n_store < 512);
+                assert(n_store < 2048);
                 store[n_store] = malloc(len);
                 memcpy(store[n_store++], data, len);
-                pqc_chunk_stored(w);
+                pqc_object_stored(w);
             }
             assert(rc == 0);
-            if (rnd() % 3 == 0) {              /* checkpoint w/ tail    */
+            assert(pqc_rows_unfinished(w) == 0);
+            /* checkpoints of the unfinished row group: each one's new
+             * rows as an object, merged in steps */
+            int ckpts = (int)(rnd() % 40);
+            uint64_t unfinished = 0;
+            for (int c = 0; c < ckpts; c++) {
+                uint64_t fresh = 1 + rnd() % 30, first, span;
+                pqc_next_span(w, fresh, &first, &span);
+                unfinished += fresh;
+                assert(first >= pqc_rows_final(w));
+                assert(first + span == pqc_rows_final(w) + unfinished);
                 size_t tn = mini_file(mini, 100 + rnd() % 500, 1, 2,
-                                      (int64_t)(rnd() % 50));
+                                      (int64_t)span);
+                if (rnd() % 7 == 0) {          /* the wrong rows: refused */
+                    size_t bad = mini_file(mini, 100, 1, 2,
+                                           (int64_t)span + 1);
+                    assert(pqc_add_unfinished(w, mini, bad, err, 512) < 0);
+                    tn = mini_file(mini, 100 + rnd() % 500, 1, 2,
+                                   (int64_t)span);
+                }
+                assert(pqc_add_unfinished(w, mini, tn, err, 512)
+                       == (int64_t)span);
                 uint64_t cl, wm;
-                uint8_t *ck = pqc_build_checkpoint(w, mini, tn, &cl, &wm,
+                assert(pqc_build_checkpoint(w, NULL, 0, &cl, &wm, err, 512)
+                       == NULL);               /* its object is not stored */
+                int stored = 0;
+                while ((rc = pqc_next_object(w, name, &data, &len, &crc))
+                       == 1) {
+                    assert(pqc_crc32(data, len) == crc);
+                    assert(n_store < 2048);
+                    store[n_store] = malloc(len);
+                    memcpy(store[n_store++], data, len);
+                    pqc_object_stored(w);
+                    stored++;
+                }
+                assert(rc == 0 && stored == 1);
+                assert(pqc_rows_unfinished(w) == unfinished);
+                uint8_t *ck = pqc_build_checkpoint(w, NULL, 0, &cl, &wm,
                                                    err, 512);
                 assert(ck);
+                assert(wm == pqc_rows_final(w) + unfinished);
                 PqcReader *r = pqc_reader_open(ck, cl, err, 512);
                 assert(r);
                 assert(strcmp(pqc_reader_name(r), "soak.parquet") == 0);
-                assert(pqc_reader_n_chunks(r) == pqc_chunks_cut(w));
+                assert(pqc_reader_n_chunks(r) >= pqc_chunks_cut(w) + 1);
                 uint64_t off, dl;
                 pqc_reader_data(r, &off, &dl);
                 assert(off + dl == cl);
@@ -205,7 +245,12 @@ int main(void) {
                 pqc_reader_free(r);
                 pqc_free(ck);
             }
+            if (rnd() % 6 == 0) {              /* claim the final rows only */
+                pqc_drop_unfinished(w);
+                assert(pqc_rows_unfinished(w) == 0);
+            }
         }
+        pqc_drop_unfinished(w);
         uint64_t cl, wm;
         uint8_t *ck = pqc_build_checkpoint(w, NULL, 0, &cl, &wm, err, 512);
         assert(ck && wm == pqc_rows_final(w));
@@ -220,7 +265,7 @@ int main(void) {
         PqcWriter *w = pqc_writer_new("e.parquet", 1024, err, 512);
         uint64_t cl, wm;
         assert(pqc_build_checkpoint(w, NULL, 0, &cl, &wm, err, 512)
-               == NULL);                        /* empty needs tail_mini */
+               == NULL);                        /* no rows: needs a mini */
         pqc_writer_free(w);
     }
     printf("san_test: OK\n");
