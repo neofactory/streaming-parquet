@@ -98,6 +98,26 @@ tier or mode.
   3,000 rows per second; a view whose ring is too short says so
   (`ring_note`) and names the `Memory(lookback=...)` to set.
 
+## The margins
+
+One margin for each hazard:
+
+| What it guards | Margin | Where |
+|---|---|---|
+| A reader and the ring | A quarter of the ring | `_views.RING_MARGIN_SHARE` |
+| A reader and the store | 10 minutes: the store keeps an object that long after the list stops naming it, and a view looks again every 5 | `parquet_checkpoint.SUPERSEDED_KEEP_S`, `_views.REPOINT_SHARE` |
+| A dead writer | Three beats, at least 30 seconds | `pqc_dead_after` in the C core (`parquet_checkpoint.dead_after`, Go `pqc.DeadAfter`) |
+
+A beat is the longest time between two writes of the writer's ticket
+(`beat_seconds`; 60 seconds for the Go host). The writer puts the
+result in its ticket as `stale_after`. A reader of the ticket, a writer
+that takes the stream over and the start-up sweep all use that one
+rule. The sweep by hand (`python3 -m parquet_checkpoint mend`) does
+not know a beat, so it waits the 30 seconds.
+
+The ring has no margin of its own. A pin holds exactly its rows, and
+the writer waits only for a pin on the row it must reuse.
+
 ## Assembly (= repair; one mechanism)
 
 - `CreateMultipartUpload` on the final key
@@ -275,7 +295,8 @@ it in place of a name.
 A stream's ticket is one JSON object at `<store>/tickets/<name>.json`:
 who writes the stream (`name`, `host`, `port`, `run`), how often the
 store's data changes (`checkpoint_seconds`, `ship_seconds`,
-`beat_seconds`) and when to call the writer dead (`stale_after`), what
+`beat_seconds`) and when to call the writer dead (`stale_after`: three
+beats, and never under 30 seconds), what
 the store holds of this run (`stored_row`, `stored_at`), the files still
 unfinished (`unfinished`: each the real path of its newest checkpoint
 version; `files`: the same with each file's `first_row` on the stream's
@@ -284,8 +305,8 @@ row numbers, the rows of its finished row groups `final_rows`, and its
 store keeps a checkpoint version after a newer one (`keep_seconds`),
 the published catalog's `catalog_etag`, a `revision` counting this
 run's ticket writes, and the write time `ts`. The Go host's ticket
-says who writes the stream and when it was written, and none of the
-store's facts.
+says who writes the stream, when it was written and its `stale_after`,
+and none of the store's facts.
 
 The writer writes it right after each upload and each catalog upload,
 and at least once a beat; it deletes it on clean close. When a file
@@ -442,7 +463,7 @@ create_stream(name, schema, store=STORE, spool=DEFAULT_SPOOL, memory=Memory(...)
     #       ticket at tickets/<name>.json)
     # spool: the local write-behind copy a bucket store writes through;
     #        default /var/tmp/streaming-parquet/<user>/, None for none
-    # Memory(lookback, maximum, rate_hint, segment_bytes): rows on this core
+    # Memory(lookback, maximum, segment_bytes): rows on this core
     # Archive(checkpoint_seconds, row_group_rows, row_group_seconds, ship_seconds,
     #         catalog_copy_seconds, parquet): tuning; None = memory only
 create_playback_stream(name, parquet_path, timestamp_column, latency_s, memory)

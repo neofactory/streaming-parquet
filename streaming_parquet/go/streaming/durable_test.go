@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/parquet/file"
+	"github.com/neofactory/streaming-parquet/parquet_checkpoint/go/pqc"
 )
 
 // Durable: the first seq not yet in the archive. A consumer that must
@@ -198,4 +199,44 @@ func parquetRows(path string) (int, error) {
 	}
 	defer r.Close()
 	return int(r.NumRows()), nil
+}
+
+// A writer's ticket says when a reader may call it dead: three beats,
+// at least 30 seconds, by the one rule in the core. A ticket that does
+// not say gets the rule for a writer with no beat.
+func TestTicketSaysWhenItIsStale(t *testing.T) {
+	root := t.TempDir()
+	tel, err := Init(Config{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tel.Close()
+	s, err := tel.CreateStream("t/stale", testSchema(), StreamOptions{RingRows: 2000,
+		Archive: ArchiveOptions{BaseDir: t.TempDir()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var tk *Ticket
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		if tk, err = tel.tickets.get("t/stale"); err != nil {
+			t.Fatal(err)
+		}
+		if tk != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if tk == nil {
+		t.Fatal("no ticket after 5 s")
+	}
+	if want := 3 * heartbeatInterval.Seconds(); tk.StaleAfter != want || tk.staleAfter() != want {
+		t.Fatalf("stale_after: the ticket says %v, want three beats = %v", tk.StaleAfter, want)
+	}
+	if got := (&Ticket{Name: "t/old"}).staleAfter(); got != 30 {
+		t.Fatalf("a ticket that names no stale_after: %v s, want 30", got)
+	}
+	if got := pqc.DeadAfter(5 * time.Second); got != 30*time.Second {
+		t.Fatalf("a 5 s beat: dead after %v, want 30 s", got)
+	}
 }

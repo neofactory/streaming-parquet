@@ -116,7 +116,7 @@ def create_stream(name, schema, store=None, spool=DEFAULT_SPOOL,
              /var/tmp/streaming-parquet/<user>/. None = no local copy,
              the bucket is the first copy. Ignored for a directory
              store, which is written straight into.
-    memory:  Memory(lookback, maximum, rate_hint, segment_bytes). None =
+    memory:  Memory(lookback, maximum, segment_bytes). None =
              the defaults: a ring of two parquet row groups.
     archive: Archive(checkpoint_seconds, row_group_rows,
              row_group_seconds, ship_seconds, parquet): the tuning.

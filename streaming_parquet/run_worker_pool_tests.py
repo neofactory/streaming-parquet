@@ -65,7 +65,7 @@ def promoted_task_releases_pin(module, workers, capture, fail=False):
     for value in range(16):
         ring.get_mutable_row().n = value
     ring.commit()
-    relation = ring.get_static_relation(0.0)
+    relation = ring.get_static_relation()
     assert (relation.lo, relation.hi) == (0, 16)
     table = relation.detach()
     table_ref = weakref.ref(table)

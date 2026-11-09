@@ -1,7 +1,7 @@
 /* arrow_ring.c — v1 implementation of the arrow-ring C core.
  *
  * Covers: ring lifecycle over an ArrowSchema, leaf-indexed set/get,
- * commit/pins/leases, the segmented var-width pool, and record-set
+ * commit/pins, the segmented var-width pool, and record-set
  * export as ArrowArrayStream (zero-copy chunks).
  *
  * Not yet (loud AR_ERR_INVALID stubs, see core/README.md):
@@ -136,8 +136,7 @@ typedef struct Leaf {
 
 typedef struct Pin {
   int64_t lo, hi;
-  bool ranged;        /* ar_pin: the caller named [lo, hi); no lease */
-  double duration_s, t0_mono;
+  double t0_mono;
   int64_t *var_lo;    /* per var-leaf elem_lo, indexed by var ordinal */
   struct Pin *next;
 } Pin;
@@ -155,7 +154,6 @@ struct ArRing {
                                 received locally) */
   Pin *pins;
   pthread_mutex_t pin_mu;
-  double lease_margin_s, rate_ewma, rate_peak, last_commit_mono;
   int64_t segment_bytes;
   ArAllocator alc;
   void (*diag)(void *, const char *); void *diag_ctx;
@@ -165,7 +163,6 @@ struct ArRecordSet {
   atomic_int refs;
   ArRing *ring;
   int64_t lo, hi;
-  double duration_s;
   Pin *pin;           /* NULL when unpinned (empty set) or released */
   bool released;
 };
@@ -509,19 +506,14 @@ ArStatus ar_ring_new(const struct ArrowSchema *schema, int64_t capacity,
   atomic_init(&r->committed, 0);
   pthread_mutex_init(&r->pin_mu, NULL);
   r->capacity = capacity;
-  r->lease_margin_s = 0.5;
   r->segment_bytes = 1 << 20;
   r->alc.alloc = default_alloc;
   r->alc.free = default_free;
   if (opts) {
-    r->rate_ewma = r->rate_peak = opts->rate_hint;
-    if (opts->lease_margin_s > 0) r->lease_margin_s = opts->lease_margin_s;
-    if (opts->lease_margin_s < 0) r->lease_margin_s = 0.0;
     if (opts->segment_bytes > 0) r->segment_bytes = opts->segment_bytes;
     if (opts->allocator.alloc) r->alc = opts->allocator;
     r->diag = opts->diag; r->diag_ctx = opts->diag_ctx;
   }
-  r->last_commit_mono = -1.0;
 
   Flatten fl = {0};
   ArStatus st = flatten(schema, "", &fl);
@@ -642,20 +634,12 @@ static ArStatus wait_recyclable(ArRing *r, int64_t seq, int64_t block_ms) {
     Pin copy;
     if (pin_blocking(r, victim, &copy) == NULL) return AR_OK;
     double t = now_mono();
-    if (t >= deadline) {
-      if (copy.ranged)
-        return err(AR_ERR_PIN_STALLED,
-                   "writer stalled at seq %lld: recycling seq %lld is blocked "
-                   "by a range pin [%lld, %lld) held %.1fs, a whole ring "
-                   "behind the writer", (long long)seq, (long long)victim,
-                   (long long)copy.lo, (long long)copy.hi, t - copy.t0_mono);
+    if (t >= deadline)
       return err(AR_ERR_PIN_STALLED,
                  "writer stalled at seq %lld: recycling seq %lld is blocked "
-                 "by a record set [%lld, %lld) held %.1fs against a %.1fs "
-                 "lease", (long long)seq, (long long)victim,
-                 (long long)copy.lo, (long long)copy.hi,
-                 t - copy.t0_mono, copy.duration_s);
-    }
+                 "by a pin on [%lld, %lld) held %.1fs, a whole ring behind "
+                 "the writer", (long long)seq, (long long)victim,
+                 (long long)copy.lo, (long long)copy.hi, t - copy.t0_mono);
     struct timespec ts = {0, 1000000};   /* 1 ms */
     nanosleep(&ts, NULL);
   }
@@ -839,21 +823,7 @@ ArStatus ar_commit(ArRing *r, int64_t *out_count) {
   int64_t pending = atomic_load(&r->pending);
   int64_t committed = atomic_load(&r->committed);
   int64_t n = pending - committed;
-  if (n > 0) {
-    atomic_store(&r->committed, pending);
-    double t = now_mono();
-    if (r->last_commit_mono >= 0) {
-      double dt = t - r->last_commit_mono;
-      if (dt > 0) {
-        double inst = (double)n / dt;
-        double alpha = dt / 10.0;   /* RATE_TAU_S */
-        if (alpha > 1.0) alpha = 1.0;
-        r->rate_ewma += alpha * (inst - r->rate_ewma);
-        if (r->rate_ewma > r->rate_peak) r->rate_peak = r->rate_ewma;
-      }
-    }
-    r->last_commit_mono = t;
-  }
+  if (n > 0) atomic_store(&r->committed, pending);
   if (out_count) *out_count = n;
   return AR_OK;
 }
@@ -987,8 +957,6 @@ ArStatus ar_get_var(const ArRing *r, int64_t seq, int32_t leaf,
   return err(AR_ERR_INVALID, "field '%s': no var view for this leaf", lf->path);
 }
 
-double ar_lease_rate(const ArRing *r) { return r->rate_peak; }
-
 uint64_t ar_leaf_data_address(const ArRing *r, int32_t leaf) {
   if (leaf < 0 || leaf >= r->n_leaves) return 0;
   return (uint64_t)(uintptr_t)r->leaves[leaf].data;
@@ -1020,10 +988,6 @@ int64_t ar_pool_oversized_count(const ArRing *r, int32_t leaf) {
   if (leaf < 0 || leaf >= r->n_leaves) return -1;
   Leaf *lf = &((ArRing *)r)->leaves[leaf];
   return lf->kind == K_VAR ? lf->pool.oversized : -1;
-}
-
-void ar_set_lease_margin(ArRing *r, double margin_s) {
-  r->lease_margin_s = margin_s >= 0 ? margin_s : 0.0;
 }
 
 /* ---- record sets ------------------------------------------------------------------ */
@@ -1068,17 +1032,15 @@ int64_t ar_recordset_lo(const ArRecordSet *rs) { return rs->lo; }
 int64_t ar_recordset_hi(const ArRecordSet *rs) { return rs->hi; }
 
 /* The record set over [lo, hi), both already clamped to the readable
- * window: pinned when non-empty. Shared by ar_relation (the ring picks
- * the range from a lease) and ar_pin (the caller names it). */
+ * window: pinned when non-empty. Shared by ar_relation (every row the
+ * ring holds) and ar_pin (the caller names the rows). */
 static ArStatus make_relation(ArRing *r, int64_t lo, int64_t hi,
-                              double duration_s, bool ranged,
                               ArRecordSet **out) {
   ArRecordSet *rs = calloc(1, sizeof(ArRecordSet));
   if (!rs) return err(AR_ERR_NOMEM, "record set");
   atomic_init(&rs->refs, 1);
   rs->ring = r;
   ring_ref(r);
-  rs->duration_s = duration_s;
   if (lo >= hi) {
     rs->lo = rs->hi = lo;
     *out = rs;
@@ -1087,8 +1049,6 @@ static ArStatus make_relation(ArRing *r, int64_t lo, int64_t hi,
   rs->lo = lo; rs->hi = hi;
   Pin *pin = calloc(1, sizeof(Pin));
   pin->lo = lo; pin->hi = hi;
-  pin->ranged = ranged;
-  pin->duration_s = duration_s;
   pin->t0_mono = now_mono();
   pin->var_lo = calloc((size_t)(r->n_var ? r->n_var : 1), sizeof(int64_t));
   for (int32_t i = 0; i < r->n_var; i++) {
@@ -1104,21 +1064,9 @@ static ArStatus make_relation(ArRing *r, int64_t lo, int64_t hi,
   return AR_OK;
 }
 
-ArStatus ar_relation(ArRing *r, double duration_s, ArRecordSet **out) {
+ArStatus ar_relation(ArRing *r, ArRecordSet **out) {
   *out = NULL;
-  double excl_d = r->rate_peak * (duration_s + r->lease_margin_s);
-  int64_t exclusion = (int64_t)excl_d;
-  if ((double)exclusion < excl_d) exclusion++;
-  /* Exclude the rows the writer will RECYCLE during an honest hold:
-   * the recycle frontier after the hold is pending + exclusion -
-   * capacity. A ring that is not near full excludes nothing (the
-   * naive oldest+exclusion formula broke the archive+hot union view
-   * on cold start -- found by the exerciser 2026-08-19). */
-  int64_t lo = atomic_load(&r->pending) + exclusion - r->capacity;
-  int64_t oldest = ar_oldest_seq(r);
-  if (lo < oldest) lo = oldest;
-  int64_t hi = atomic_load(&r->committed);
-  return make_relation(r, lo, hi, duration_s, false, out);
+  return make_relation(r, ar_oldest_seq(r), atomic_load(&r->committed), out);
 }
 
 ArStatus ar_pin(ArRing *r, int64_t lo, int64_t hi, ArRecordSet **out) {
@@ -1128,13 +1076,12 @@ ArStatus ar_pin(ArRing *r, int64_t lo, int64_t hi, ArRecordSet **out) {
                (long long)lo, (long long)hi);
   /* Clamp to the readable window: rows below the oldest are gone (the
    * caller sees rs->lo > lo), rows at or above committed do not exist
-   * yet (rs->hi < hi). No lease, no exclusion: the pin holds exactly
-   * the rows asked for. */
+   * yet (rs->hi < hi). The pin holds exactly the rows asked for. */
   int64_t oldest = ar_oldest_seq(r);
   int64_t committed = atomic_load(&r->committed);
   if (lo < oldest) lo = oldest;
   if (hi > committed) hi = committed;
-  return make_relation(r, lo, hi, 0.0, true, out);
+  return make_relation(r, lo, hi, out);
 }
 
 /* ---- export: chunk computation ------------------------------------------------- */
@@ -1678,19 +1625,6 @@ ArStatus ar_append_batch_at(ArRing *r, struct ArrowArray *batch,
     }
     atomic_store(&r->pending, pending + n);
     atomic_store(&r->committed, pending + n);
-    /* rate observation, same as commit */
-    double t = now_mono();
-    if (r->last_commit_mono >= 0) {
-      double dt = t - r->last_commit_mono;
-      if (dt > 0) {
-        double inst = (double)n / dt;
-        double alpha = dt / 10.0;
-        if (alpha > 1.0) alpha = 1.0;
-        r->rate_ewma += alpha * (inst - r->rate_ewma);
-        if (r->rate_ewma > r->rate_peak) r->rate_peak = r->rate_ewma;
-      }
-    }
-    r->last_commit_mono = t;
   }
 done:
   batch->release(batch);   /* we consumed it (C-interface ownership) */

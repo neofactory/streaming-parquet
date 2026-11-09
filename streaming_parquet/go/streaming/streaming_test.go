@@ -116,8 +116,7 @@ func TestAttachedArchivesParquet(t *testing.T) {
 		t.Fatal(err)
 	}
 	a, err := tel.Attach("t/arch", AttachOptions{
-		Ticket:   &Ticket{Name: "t/arch", Host: "127.0.0.1", Port: tel.FlightPort()},
-		RingRows: 5000, // the lease at this test's rate needs more than two 200-row groups
+		Ticket: &Ticket{Name: "t/arch", Host: "127.0.0.1", Port: tel.FlightPort()},
 		Archive: ArchiveOptions{BaseDir: subDir, RowGroupRows: 200,
 			CheckpointSeconds: 0.05},
 	})

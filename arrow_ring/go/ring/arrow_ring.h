@@ -115,8 +115,6 @@ typedef struct ArAllocator {
 } ArAllocator;                          /* all-NULL = malloc/free      */
 
 typedef struct ArRingOptions {
-  double  rate_hint;        /* rows/s seed for lease exclusions; 0 = none */
-  double  lease_margin_s;   /* padding on lease estimates; default 0.5    */
   int64_t segment_bytes;    /* var-width pool segment size; default 1<<20 */
   ArAllocator allocator;
   void (*diag)(void *ctx, const char *msg);  /* oversized-value etc.;
@@ -162,9 +160,9 @@ const char *ar_leaf_path(const ArRing *ring, int32_t leaf);
 
 /* Allocate the next slot ("the open row"). Allocating seq S recycles
  * seq S - capacity: if a pin holds that seq, blocks up to block_ms then
- * returns AR_ERR_PIN_STALLED with the overdue lease named in
- * ar_last_error. Nullable leaves reset to null; var-width leaves reset
- * to empty. out_seq may be NULL. */
+ * returns AR_ERR_PIN_STALLED with the pin named in ar_last_error.
+ * Nullable leaves reset to null; var-width leaves reset to empty.
+ * out_seq may be NULL. */
 ArStatus ar_row_begin(ArRing *ring, int64_t block_ms, int64_t *out_seq);
 
 /* Setters write the open row. Integer setters range-check against the
@@ -262,7 +260,6 @@ int64_t ar_oldest_seq(const ArRing *ring);
 int64_t ar_newest_seq(const ArRing *ring);   /* -1 when empty */
 
 /* Diagnostics (tests, debuggers, watchdogs — not for data access). */
-double   ar_lease_rate(const ArRing *ring);          /* rows/s, peak   */
 uint64_t ar_leaf_data_address(const ArRing *ring, int32_t leaf);
                               /* base address of the leaf's ring buffer:
                                  a host may store fixed-width values
@@ -278,28 +275,25 @@ uint64_t ar_var_data_address(const ArRing *ring, int32_t leaf,
                                  element, 0 if not live               */
 int32_t  ar_pool_segment_count(const ArRing *ring, int32_t leaf);
 int64_t  ar_pool_oversized_count(const ArRing *ring, int32_t leaf);
-/* Adjust the lease margin after construction (tests want exact relation
- * bounds; production leaves the default). */
-void     ar_set_lease_margin(ArRing *ring, double margin_s);
 
 /* ---- read side: record sets (pinned, immutable, zero-copy) -------------- */
 
-/* Pin a record set over the committed rows, excluding the oldest
- * peak_rate x (duration_s + margin) rows — the lease. The pin, not the
- * lease, is the guarantee: overstaying never invalidates the set, it
- * eventually stalls the writer (loudly, AR_ERR_PIN_STALLED at
- * ar_row_begin). Referenced var-width segments are held too. An empty
- * window yields an empty set. */
-ArStatus ar_relation(ArRing *ring, double duration_s, ArRecordSet **out);
+/* Pin a record set over every committed row the ring holds. The pin is
+ * the guarantee: a set that is held never becomes invalid. On a full
+ * ring it holds the row the writer needs next, so the writer waits
+ * until the release (AR_ERR_PIN_STALLED at ar_row_begin after its
+ * block_ms). A reader that must not make the writer wait names newer
+ * rows with ar_pin. Referenced var-width segments are held too. An
+ * empty window yields an empty set. */
+ArStatus ar_relation(ArRing *ring, ArRecordSet **out);
 
 /* Pin a record set over the rows the caller names, [lo, hi), and no
- * others. No lease and no exclusion: the writer meets this pin only
- * after a whole ring of writes, and then the holder is a leak
- * (AR_ERR_PIN_STALLED names the range). lo below the oldest readable
- * row is raised to it (the set's lo says so: rows recycled); hi above
- * committed is lowered to it. The publish and archive paths pin this
- * way: the rows they send or write, usually a few. AR_ERR_INVALID
- * when hi < lo. */
+ * others. The writer meets this pin only when it is a whole ring past
+ * the pin's first row (AR_ERR_PIN_STALLED names the range). lo below
+ * the oldest readable row is raised to it (the set's lo says so: rows
+ * recycled); hi above committed is lowered to it. The publish and
+ * archive paths pin this way: the rows they send or write, usually a
+ * few. AR_ERR_INVALID when hi < lo. */
 ArStatus ar_pin(ArRing *ring, int64_t lo, int64_t hi, ArRecordSet **out);
 
 int64_t ar_recordset_lo (const ArRecordSet *rs);  /* first seq          */

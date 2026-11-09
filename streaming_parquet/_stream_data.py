@@ -9,10 +9,10 @@ Referenced by zero or more Attached read faces. Reads are lock-free
 against writes (the ring's committed cursor is an atomic); the only way
 a reader gets stale data is falling more than `capacity` rows behind,
 which raises StaleReadError. There is NO back-pressure on the producer
-from readers that use read_row (unpinned); a held static relation CAN
+from readers that use read_row (unpinned); a held record set CAN
 stall the producer via the ring's pin — that is deliberate and loud
-(PinStalledError names the overdue lease), and on an origin ring it is
-fatal territory. Producers run free; consumers keep up, skip ahead, or
+(PinStalledError names the pin and where it was taken), and on an
+origin ring it is fatal territory. Producers run free; consumers keep up, skip ahead, or
 get named in the stall message. Trade chosen because a silently stalled
 producer on a machine connector would blow its fieldbus deadlines.
 
@@ -48,11 +48,10 @@ class _StreamData:
     __slots__ = ("name", "schema", "ring", "_closed", "_lock",
                  "_playback_clock")
 
-    def __init__(self, name, schema, capacity, rate_hint=None,
-                 segment_bytes=None):
+    def __init__(self, name, schema, capacity, segment_bytes=None):
         self.name = name
         self.schema = schema
-        self.ring = arrow_ring.Ring(schema, capacity, rate_hint=rate_hint,
+        self.ring = arrow_ring.Ring(schema, capacity,
                                     segment_bytes=segment_bytes)
         self._closed = False
         self._lock = threading.Lock()  # only for the closed flag
@@ -92,9 +91,11 @@ class _StreamData:
                 f"seq {seq} not yet visible (playback clock)")
         return self.ring.read_row(seq)
 
-    def get_static_relation(self, duration_s):
-        """Pinned record set over the visible window."""
-        rs = self.ring.get_static_relation(duration_s)
+    def get_static_relation(self):
+        """Pinned record set over the visible window: every row the
+        ring holds. On a full ring the writer waits until the release
+        (arrow_ring.Ring.get_static_relation)."""
+        rs = self.ring.get_static_relation()
         if self._playback_clock is not None:
             visible_hi = self.newest_visible_seq() + 1
             if visible_hi < rs.hi:

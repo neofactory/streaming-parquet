@@ -66,7 +66,8 @@ import pyarrow.parquet as pq
 from ._sinks import DirSink, FakeS3, S3Sink, SubSink, SinkError  # noqa: F401
 
 __all__ = ['CheckpointWriter', 'CheckpointReader', 'finalize',
-           'recover_directory', 'live_table', 'live_metadata', 'verify',
+           'recover_directory', 'dead_after',
+           'live_table', 'live_metadata', 'verify',
            'CheckpointError', 'DirSink', 'FakeS3', 'S3Sink', 'SubSink', 'Shipper']
 
 MAGIC = b'PAR1'
@@ -695,18 +696,27 @@ def discard_checkpoints(name, sink):
 FINALIZE_SLOW_S = 1.0
 
 
-#: A checkpoint younger than this is presumed to have a LIVE writer
-#: (writers rewrite it on their checkpoint cadence); sweeping it would
-#: finalize under a running process. Sized well above any sane cadence.
-LIVE_SWEEP_THRESHOLD_S = 30.0
+def dead_after(beat_seconds=0.0):
+    """Seconds of silence after which a writer is dead: three of its
+    beats, and never sooner than 30 seconds. The one rule for a dead
+    writer (pqc_dead_after in the C core, shared with the Go host): a
+    ticket's reader, a writer that takes a stream over, and the sweep
+    below all use it. beat_seconds: how often the writer shows that it
+    lives; 0 when it does not say."""
+    from . import _core
+    return _core.dead_after(beat_seconds)
 
 
-def recover_directory(sink_or_dir, min_age_s=LIVE_SWEEP_THRESHOLD_S):
+def recover_directory(sink_or_dir, min_age_s=None):
     """The boot sweep: finalize every checkpoint under the sink —
     EXCEPT ones modified within min_age_s, whose writer is presumed
-    alive; those come back as ('alive', name), untouched. Pass
-    min_age_s=0 only when you know no writer is running."""
+    alive; those come back as ('alive', name), untouched. min_age_s
+    None: the dead-writer rule for a writer whose beat is not known
+    (dead_after(), 30 seconds). Pass min_age_s=0 only when you know no
+    writer is running."""
     import time
+    if min_age_s is None:
+        min_age_s = dead_after()
     sink = (DirSink(sink_or_dir) if isinstance(sink_or_dir, str)
             else sink_or_dir)
     results = []

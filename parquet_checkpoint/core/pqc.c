@@ -44,6 +44,11 @@ uint32_t pqc_crc32(const uint8_t *data, size_t len) {
     return c ^ 0xFFFFFFFFu;
 }
 
+double pqc_dead_after(double beat_seconds) {
+    double beats = PQC_DEAD_WRITER_BEATS * beat_seconds;
+    return beats > PQC_DEAD_WRITER_MIN_S ? beats : PQC_DEAD_WRITER_MIN_S;
+}
+
 /* ---- growable buffer -------------------------------------------------- */
 
 typedef struct { uint8_t *p; size_t len, cap; } Buf;

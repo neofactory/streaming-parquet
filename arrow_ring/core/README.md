@@ -3,7 +3,7 @@
 `arrow_ring.h` is the spec. This document is how it hangs together.
 Status 2026-08-19: v1 implemented and passing its smoke test.
 `arrow_ring.c` (single file for v1; the module split below is the
-target shape) covers ring lifecycle, leaf set/get, commit/pins/leases,
+target shape) covers ring lifecycle, leaf set/get, commit/pins,
 the segment pool, and record-set export as ArrowArrayStream — verified
 end-to-end against pyarrow via the C interfaces (`make` then
 `python3 smoke_test.py`, 14/14: fixed/struct/nullable/utf8/list
@@ -57,7 +57,7 @@ parquet writer — same buffers either way.
 
 | file | contents | deps |
 |---|---|---|
-| `ring.c` | slots, cursors, commit, pins, leases, rate EWMA | none |
+| `ring.c` | slots, cursors, commit, pins | none |
 | `schema.c` | ArrowSchema walk -> flattened leaves, type surface | nanoarrow |
 | `pool.c` | segmented var-width pool (immortal 1MB segments, no-straddle, oversized, freelist) | none |
 | `ingest.c` | ar_append_batch/stream, ar_from_wire/to_wire | nanoarrow |
@@ -75,9 +75,8 @@ format strings are parsed directly.
 Identical to the Python package (see its README): mutable -> frozen ->
 recycled slot lifecycle; monotonic seqs, slot = seq % capacity;
 nullable leaves reset to null on allocation, var leaves stamp the pool
-cursor (keeps elem-starts cumulative for chunk math); leases exclude
-`peak_rate x (duration + margin)` oldest rows; the pin is the
-guarantee, the lease is the diagnosis; writer-blocks-on-pin with the
+cursor (keeps elem-starts cumulative for chunk math); the pin is the
+guarantee, and a pin holds exactly its rows; writer-blocks-on-pin with the
 caller owning the grace policy (AR_ERR_PIN_STALLED after block_ms);
 pool growth never stalls the writer, pins only delay segment reuse;
 chunk cuts at ring wrap + segment boundaries + rewrite

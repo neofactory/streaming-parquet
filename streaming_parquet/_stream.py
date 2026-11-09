@@ -27,6 +27,8 @@ import time
 
 import pyarrow as pa
 
+import parquet_checkpoint
+
 from ._diag import _diag, console_print
 from ._options import Memory, Archive, ArchiveState, MirrorState, MemoryState
 from ._stream_data import _StreamData
@@ -65,9 +67,6 @@ FILE_CUT_BYTES = 256_000_000
 class Stream:
     """A local publishing stream. Create via streaming_parquet.create_stream()."""
 
-    #: a ticket is stale after three beats, and never sooner than this:
-    #: one S3 ticket write has taken 5 s on the box
-    TICKET_STALE_MIN_S = 30.0
     #: the heartbeat thread never sleeps longer than this between its
     #: time-due checks, whatever the cadences say
     HEARTBEAT_MAX_WAIT_S = 60.0
@@ -90,7 +89,6 @@ class Stream:
         ring_rows, row_group_rows = _ring_sizes(name, memory.lookback,
                                                 row_group_rows)
         self._data = _StreamData(name, schema, capacity=ring_rows,
-                                 rate_hint=memory.rate_hint,
                                  segment_bytes=memory.segment_bytes)
         self._ring = self._data.ring
         self._flight_server = flight_server
@@ -149,7 +147,9 @@ class Stream:
             self._beat_seconds = a.checkpoint_seconds
         else:
             self._beat_seconds = a.ship_seconds
-        self._stale_after = max(3 * self._beat_seconds, self.TICKET_STALE_MIN_S)
+        # When a reader may call this writer dead: the one rule (three
+        # beats, at least 30 seconds), written into the ticket.
+        self._stale_after = parquet_checkpoint.dead_after(self._beat_seconds)
 
         self._pool = get_pool()
         self._closed = False
@@ -890,11 +890,18 @@ DEFAULT_ROW_GROUP_ROWS = 122_880
 
 def _ring_sizes(name, ring_rows, row_group_rows):
     """Settle a stream's ring rows and row group rows (the Go host's
-    ringSizes). A row group's rows stay in the ring until the group is
-    written, and the archive's read leaves out the rows the writer may
-    reuse meanwhile, so the ring holds two row groups: given neither
-    size, DuckDB's row group; given one, the other follows; given both,
-    a ring under two row groups is refused."""
+    ringSizes). The ring holds two row groups, and each part of it has
+    a job:
+
+        the newest half      the unfinished row group: its rows stay in
+                             the ring until the group is written
+        the next quarter     the store's lag: a view reads from the
+                             ring every row the store does not have yet
+        the oldest quarter   the time a running query has: a view does
+                             not start in it (_views.RING_MARGIN_SHARE)
+
+    Given neither size, DuckDB's row group; given one, the other
+    follows; given both, a ring under two row groups is refused."""
     if ring_rows is None and row_group_rows is None:
         return 2 * DEFAULT_ROW_GROUP_ROWS, DEFAULT_ROW_GROUP_ROWS
     if ring_rows is None:

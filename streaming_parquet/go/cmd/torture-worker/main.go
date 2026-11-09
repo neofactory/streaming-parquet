@@ -130,8 +130,7 @@ func runPub(tel *streaming.Telemetry, name, kind string, rate int,
 			RowGroupRows: int64(rate) * 3}
 	}
 	s, err := tel.CreateStream(name, schemaFor(kind),
-		streaming.StreamOptions{RingRows: int64(rate) * 6,
-			RateHint: float64(rate), Archive: arch})
+		streaming.StreamOptions{RingRows: int64(rate) * 6, Archive: arch})
 	if err != nil {
 		die(err)
 	}
