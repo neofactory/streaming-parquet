@@ -1,5 +1,6 @@
 """The model behind docs/checkpoint-cost.md: the bytes a writer puts in
-the store, per checkpoint, under four designs.
+the store, per checkpoint, under four designs. The package does
+steps_bytes; `before` is what it did until 2026-11-09.
 
     python3 docs/checkpoint_cost_model.py        # prints the tables of the document
 
@@ -9,16 +10,19 @@ at a constant row rate, with a checkpoint every CHECKPOINT_S.
 
 The four designs:
 
-  today        every checkpoint writes one checkpoint object: every
+  before       every checkpoint writes one checkpoint object: every
                finished row group not yet in a 5 MiB chunk, the whole
                unfinished row group, and the footer.
   steps_time   every checkpoint writes only the new rows, as a small
                object. Small objects merge in steps (class Steps). A
                finished row group is written once, as its own object.
-               The file is cut by time.
+               The file is cut by time. When it is cut, the objects
+               after the last chunk are sent once more, as the last
+               part of the finished file.
   steps_bytes  steps_time and two byte rules: the file is also cut at
-               FILE_CUT_KB, and a checkpoint whose new rows reach the
-               S3 part minimum writes them straight into a chunk.
+               FILE_CUT_KB (the writer's FILE_CUT_BYTES), and a
+               checkpoint whose new rows reach the S3 part minimum
+               writes them straight into a chunk.
   groups_only  no checkpoints: a row group is written when it is full.
                Same objects and byte rules as steps_bytes.
 
@@ -64,53 +68,61 @@ def footer_kb(entries):
 
 
 class Steps:
-    """The objects of the unfinished row group, merged in steps.
+    """The objects of the unfinished row group, merged in steps, as the
+    C core does it (pqc_next_span in parquet_checkpoint/core/pqc.c).
 
-    Every checkpoint adds one small object. Objects of one size form a
-    run. A run merges into one object of the next size when the footer
-    bytes the run has cost reach the size of the merged object, or when
-    the run reaches RUN_LIMIT objects. The footer cost of a run is
-    FOOTER_ENTRY_KB for each of its objects at each checkpoint, because
-    every object is a row group with its own entry in the footer, and
-    the footer is written at every checkpoint."""
+    The objects are a list in row order. Every checkpoint adds its new
+    rows at the end. Each object has a step: 0 for the new rows of one
+    checkpoint, one more for each merge. Steps never rise along the
+    list. Each step counts the footer bytes its objects have cost:
+    FOOTER_ENTRY_KB for each object at each checkpoint, because every
+    object is a row group with its own entry in the footer, and the
+    footer is written at every checkpoint.
+
+    A step is due when it has two objects or more and those footer
+    bytes have reached the size of its objects, or when it has
+    RUN_LIMIT objects. At a checkpoint the highest step that is due
+    merges: its first object and every object after it, to the end of
+    the list, are written again as one object of the next step, with
+    the new rows in it."""
 
     def __init__(self, overhead_kb=None):
         self.overhead_kb = overhead_kb
-        self.runs = [[]]            # runs[k]: the row counts of the objects of size k
-        self.paid = [0.0]           # footer KB the objects of runs[k] have cost
+        self.objects = []           # (rows, step), in row order
+        self.paid = {}              # step -> footer KB its objects have cost
 
     def add(self, rows):
         """A checkpoint with `rows` new rows. Returns the KB written."""
-        self.runs[0].append(rows)
-        written, new_rows_written, k = 0.0, False, 0
-        while k < len(self.runs):
-            run = self.runs[k]
-            merged_kb = unfinished_kb(sum(run), self.overhead_kb)
-            if len(run) >= 2 and (self.paid[k] >= merged_kb or len(run) >= RUN_LIMIT):
-                written += merged_kb
-                new_rows_written = new_rows_written or k == 0
-                if k + 1 == len(self.runs):
-                    self.runs.append([])
-                    self.paid.append(0.0)
-                self.runs[k + 1].append(sum(run))
-                self.runs[k], self.paid[k] = [], 0.0
-            k += 1
-        if not new_rows_written:
-            written += unfinished_kb(rows, self.overhead_kb)
-        return written
+        count, size = {0: 1}, {0: 0.0}      # the new rows would be one more object of step 0
+        for object_rows, step in self.objects:
+            count[step] = count.get(step, 0) + 1
+            size[step] = size.get(step, 0.0) + unfinished_kb(object_rows, self.overhead_kb)
+        due = [step for step in count if count[step] >= 2
+               and (self.paid.get(step, 0.0) >= size[step] or count[step] >= RUN_LIMIT)]
+        if not due:
+            self.objects.append((rows, 0))
+            return unfinished_kb(rows, self.overhead_kb)
+        merge = max(due)
+        first = next(i for i, (_rows, step) in enumerate(self.objects) if step <= merge)
+        merged = sum(object_rows for object_rows, _step in self.objects[first:]) + rows
+        self.objects[first:] = [(merged, merge + 1)]
+        for step in self.paid:      # the steps that merged owe nothing more
+            if step <= merge:
+                self.paid[step] = 0.0
+        return unfinished_kb(merged, self.overhead_kb)
 
     def count(self):
-        return sum(len(run) for run in self.runs)
+        return len(self.objects)
 
     def charge_footer(self):
-        for k, run in enumerate(self.runs):
-            self.paid[k] += FOOTER_ENTRY_KB * len(run)
+        for _rows, step in self.objects:
+            self.paid[step] = self.paid.get(step, 0.0) + FOOTER_ENTRY_KB
 
     def clear(self):
-        self.runs, self.paid = [[]], [0.0]
+        self.objects, self.paid = [], {}
 
 
-def today(rate, parts=False):
+def before(rate, parts=False):
     """Returns (KB per checkpoint, largest checkpoint object in KB).
     parts=True: instead the mean KB per checkpoint of the three parts
     of the checkpoint object (waiting row groups, unfinished rows,
@@ -167,12 +179,16 @@ def steps(rate, byte_rules, with_checkpoints=True, overhead_kb=None):
 
     def cut_file():
         """The unfinished rows become one finished row group, and one
-        last checkpoint object names it. S3 builds the file from the
-        chunks and the objects left over: nothing else is written."""
+        last checkpoint object names it. S3 builds the file by copy
+        from the chunks. It cannot join the objects after the last
+        chunk, which are under 5 MiB together: the writer sends them
+        once more, with the footer, as the last part of the file."""
         nonlocal total
-        if unfinished:
-            total += unfinished_kb(unfinished, overhead_kb)
-        total += checkpoint_object(groups + (1 if unfinished else 0), chunks + loose + 1)
+        entries = groups + (1 if unfinished else 0)
+        last = unfinished_kb(unfinished, overhead_kb) if unfinished else 0.0
+        total += last
+        total += checkpoint_object(entries, chunks + loose + 1)
+        total += loose * ROW_GROUP_KB + last + footer_kb(entries)
 
     for _ in range(checkpoints):
         unfinished += new_rows
@@ -232,26 +248,26 @@ def main():
     print(f"Sizes: {COLUMNS} columns, {KB_PER_ROW * 1000:.1f} bytes per row, a checkpoint every "
           f"{CHECKPOINT_S:.0f} s, one {RUN_HOURS:.0f}-hour run.\n")
 
-    print("Table 1. Today: the checkpoint object.\n")
+    print("Table 1. Before: the checkpoint object.\n")
     print("| Rows/s | New rows per checkpoint, KB | Written per checkpoint, KB | Largest checkpoint object, KB |")
     print("|---|---|---|---|")
     for rate in RATES:
-        mean, largest = today(rate)
+        mean, largest = before(rate)
         print(f"| {rate:,} | {kb(rate * CHECKPOINT_S * KB_PER_ROW)} | {kb(mean)} | {kb(largest)} |")
 
-    print("\nTable 1b. Today, at 100 rows/s: the parts of the checkpoint object.\n")
+    print("\nTable 1b. Before, at 100 rows/s: the parts of the checkpoint object.\n")
     print("| Part | Mean KB per checkpoint | Share |")
     print("|---|---|---|")
-    split = today(100, parts=True)
+    split = before(100, parts=True)
     for name, part in zip(("Finished row groups that wait for a 5 MiB chunk",
                            "The rows of the unfinished row group", "The footer"), split):
         print(f"| {name} | {kb(part)} | {100 * part / sum(split):.0f}% |")
 
     print("\nTable 2. KB put in the store per checkpoint interval.\n")
-    print("| Rows/s | New rows | Today | Steps, by time | Steps, by time or bytes | Row groups only |")
+    print("| Rows/s | New rows | Before | Steps, by time | Now: steps, by time or bytes | Row groups only |")
     print("|---|---|---|---|---|---|")
     for rate in RATES:
-        print(f"| {rate:,} | {kb(rate * CHECKPOINT_S * KB_PER_ROW)} | {kb(today(rate)[0])} "
+        print(f"| {rate:,} | {kb(rate * CHECKPOINT_S * KB_PER_ROW)} | {kb(before(rate)[0])} "
               f"| {kb(steps(rate, False)[0])} | {kb(steps(rate, True)[0])} "
               f"| {kb(steps(rate, True, with_checkpoints=False)[0])} |")
 
@@ -262,7 +278,7 @@ def main():
         fill = min(ROW_GROUP_ROWS / rate, RUN_HOURS * 3600)
         print(f"| {rate:,} | {span(CHECKPOINT_S)} | {span(fill)} |")
 
-    print("\nTable 4. Steps, by time or bytes: what a reader meets.\n")
+    print("\nTable 4. Now: what a reader meets.\n")
     print("| Rows/s | Most small objects in the unfinished row group | Largest checkpoint object, KB | Files in the run |")
     print("|---|---|---|---|")
     for rate in RATES:

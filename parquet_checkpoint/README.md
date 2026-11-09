@@ -382,8 +382,8 @@ replaced by one object of the same rows, one size step up.
 Before 2026-11-09 the whole tail was encoded again at every checkpoint,
 and the answer to its cost was a shorter row group.
 
-What this costs at each row rate, and the design that replaces the
-re-encoding: [what a checkpoint costs](../docs/checkpoint-cost.md).
+What a checkpoint costs at each row rate, now and before:
+[what a checkpoint costs](../docs/checkpoint-cost.md).
 
 ## Not yet
 
