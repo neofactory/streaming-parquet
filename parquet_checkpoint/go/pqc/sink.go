@@ -128,11 +128,18 @@ func (d *DirSink) Exists(name string) bool {
 }
 
 func (d *DirSink) Delete(name string) error {
-	err := os.Remove(filepath.Join(d.Root, name))
-	if os.IsNotExist(err) {
-		return nil
+	p := filepath.Join(d.Root, name)
+	err := os.Remove(p)
+	if err != nil && !os.IsNotExist(err) {
+		return err
 	}
-	return err
+	// An object's folder goes with its last object (a file's
+	// <name>.chunks/): a store has no empty folders. Remove fails on
+	// a folder that still holds something.
+	if folder := filepath.Dir(p); filepath.Clean(folder) != filepath.Clean(d.Root) {
+		_ = os.Remove(folder)
+	}
+	return nil
 }
 
 func (d *DirSink) List(prefix string) ([]string, error) {

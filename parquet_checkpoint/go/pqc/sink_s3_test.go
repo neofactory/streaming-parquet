@@ -76,10 +76,23 @@ func TestS3SinkContract(t *testing.T) {
 		t.Fatalf("deleting an absent object is not an error: %v", err)
 	}
 
-	// Assembly: a part before the last under the minimum is refused
-	// before any copy, and the upload is aborted.
-	if err := sink.Assemble("out", []Source{{Name: "a.parquet.ckpt", Offset: -1, Length: -1}, {Name: "x", Offset: -1, Length: -1}}); err == nil || !strings.Contains(err.Error(), "parts before the last must be >= 5242880") {
-		t.Fatalf("small first part: %v", err)
+	// Assembly: sources under the part minimum travel together, as one
+	// uploaded part. S3 cannot join small objects, and refuses a part
+	// under the minimum unless it is the last.
+	if err := sink.Assemble("joined", []Source{{Name: "a.parquet.ckpt", Offset: -1, Length: -1}, {Name: "x", Offset: -1, Length: -1}}); err != nil {
+		t.Fatalf("two small sources: %v", err)
+	}
+	one, _ := sink.Get("a.parquet.ckpt", 0, -1)
+	two, _ := sink.Get("x", 0, -1)
+	if joined, err := sink.Get("joined", 0, -1); err != nil || !bytes.Equal(joined, append(append([]byte{}, one...), two...)) {
+		t.Fatalf("two small sources joined: %q %v", joined, err)
+	}
+	if err := sink.Delete("joined"); err != nil {
+		t.Fatal(err)
+	}
+	// A source that is absent: refused, and the upload is aborted.
+	if err := sink.Assemble("out", []Source{{Name: "a.parquet.ckpt", Offset: -1, Length: -1}, {Name: "absent", Offset: -1, Length: -1}}); err == nil {
+		t.Fatal("an assembly with an absent source succeeded")
 	}
 	if fake.OpenUploads() != 0 {
 		t.Fatal("a refused assembly left its multipart upload open")

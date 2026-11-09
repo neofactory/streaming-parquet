@@ -1571,7 +1571,11 @@ def _():
         finally:
             s.close()
         assert _catalog_rows(d) == [(30, 0, 29)]
-        assert [n for n in os.listdir(d) if os.path.isdir(os.path.join(d, n))] == []
+        # the catalog makes no folder of its own. A finished file's
+        # objects stay beside its checkpoint versions, for readers told
+        # of them, until the keep time has passed.
+        assert [n for n in os.listdir(d) if os.path.isdir(os.path.join(d, n))
+                and not n.endswith('.parquet.chunks')] == []
 
 
 @test("catalog: the reconcile at start registers every finished file the "
