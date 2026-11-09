@@ -8,31 +8,44 @@ Three things, each usable alone:
 
 Artifacts (relative names, resolved by a sink -- local dir or S3):
 
-  run.parquet.chunks/000001   immutable pieces of the final file, cut
-      at row-group boundaries, >= chunk_bytes (5 MB: the S3 multipart
-      part minimum -- a packaging size, never a durability boundary).
+  run.parquet.chunks/000007   an object: an immutable piece of the
+      file, whole row groups, written once and never changed. The file
+      while it is written is a list of objects in file order:
+        chunks       >= chunk_bytes of final row groups each (5 MB:
+                     the S3 multipart part minimum, a packaging size,
+                     never a durability boundary)
+        loose groups final row groups that do not yet fill a chunk,
+                     one object each
+        unfinished   the rows of the row group still being filled: one
+                     object for each checkpoint's new rows, merged in
+                     steps (core/pqc.h)
   run.parquet.000017.ckpt     a checkpoint: version 17 of the file's
       checkpoint, one object, written once and never changed. Each
       checkpoint is a new version; a version superseded for
       SUPERSEDED_KEEP_S (10 minutes) is deleted in the step that uploads
       a later one, so a reader told of an older version less than that
       long ago still finds it, and an object a reader has opened never
-      changes under it. Layout:
+      changes under it. An object is deleted with the last kept version
+      that names it. Layout:
         header    magic PQC2, version, CRC-32 of everything after the
                   CRC field, final file name, watermark (rows covered),
                   data offset
-        manifest  ordered chunk list: name, byte length, CRC-32
-        data      [magic if no chunks][buffered final row groups]
-                  [provisional tail row group][footer thrift+len+magic]
-      The data region IS final-file bytes: finalize appends it verbatim
-      after the chunks (on S3, a server-side range copy).
+        manifest  the list of objects: name, byte length, CRC-32
+        data      the footer of the whole [thrift+len+magic]; for a
+                  file with no rows, a whole empty parquet file
+      The objects in list order, then the data region, ARE the file:
+      finalize joins them (on S3 server-side: a copy for each chunk,
+      and one last part of whatever is smaller).
   run.parquet                 the finished ordinary parquet file.
 
-Durability ordering: chunks are stored before any checkpoint that
-references them; a checkpoint version is stored whole before older
-versions are deleted. Crash loss = rows since the last checkpoint (zero
-at any checkpoint instant: the tail rides inside it). Recovery uses the
-newest version whose CRC holds. write_table implies a checkpoint by
+The cost of a checkpoint follows its new rows, not the size of the
+file: it stores one object with those rows and the checkpoint object,
+never a row a stored object already holds.
+
+Durability ordering: an object is stored before any checkpoint that
+names it; a checkpoint version is stored whole before older versions
+are deleted. Crash loss = rows since the last checkpoint. Recovery uses
+the newest version whose CRC holds. write_table implies a checkpoint by
 default.
 
 Rows have ordinal identity: the checkpoint's watermark is its row
@@ -92,20 +105,31 @@ SUPERSEDED_KEEP_S = 600.0
 _CKPT_RE = re.compile(r'^(?P<name>.+\.parquet)(?:\.(?P<seq>\d{6,}))?\.ckpt$')
 
 
-def _supersede(sink, versions, new, keep_s):
-    """`new` (just stored) supersedes the newest of `versions`; delete
-    every version superseded at least keep_s ago. Returns the list."""
+def _supersede(sink, versions, new, keep_s, names=()):
+    """`new` (just stored; it names the objects `names`) supersedes the
+    newest of `versions`; delete every version superseded at least
+    keep_s ago, and with it each object that no kept version names. A
+    version is [object, when superseded or None, the objects it names].
+    Returns the list."""
     now = time.monotonic()
     if versions:
         versions[-1][1] = now
-    kept = []
-    for obj, at in versions:
-        if at is not None and now - at >= keep_s:
-            sink.delete(obj)
-        else:
-            kept.append([obj, at])
-    kept.append([new, None])
+    kept, gone = [], []
+    for v in versions:
+        (gone if v[1] is not None and now - v[1] >= keep_s else kept).append(v)
+    kept.append([new, None, frozenset(names)])
+    named = set().union(*(v[2] for v in kept))
+    for obj, _at, its in gone:
+        sink.delete(obj)                # the claim first, then its objects
+        for name in sorted(its - named):
+            sink.delete(name)
+            named.add(name)             # once
     return kept
+
+
+def _named_by(ckpt):
+    """The object names a checkpoint object's manifest lists."""
+    return [m[0] for m in CheckpointReader(ckpt).manifest]
 
 
 def ckpt_object(name, seq):
@@ -197,14 +221,21 @@ class CheckpointWriter:
         self._rows_checkpointed = 0
         self._seq = 0                # the newest checkpoint version's number
         self._keep_s = superseded_keep_s
-        # [object, when superseded (monotonic) or None], oldest first
+        # [object, when superseded (monotonic) or None, the objects it
+        # names], oldest first
         self._versions = []
+        # what the newest version claims: (final rows, unfinished rows).
+        # The same count of rows is not the same claim: a final row
+        # group that replaces the unfinished objects is a new one.
+        self._claimed = None
         self._closed = False
 
     # ---- write -----------------------------------------------------------
 
     def write_table(self, table):
-        """Append final row group(s). Implies checkpoint() by default."""
+        """Append final row group(s): `table` holds every row since the
+        last write_table, and replaces what checkpoint(tail) stored of
+        them. Implies checkpoint() by default."""
         if self._closed:
             raise CheckpointError("writer is closed")
         if table.num_rows:
@@ -213,43 +244,64 @@ class CheckpointWriter:
                                                **self._opts))
             except self._core_error as e:
                 raise CheckpointError(f"{self.name}: {e}") from None
-            self._store_chunks()
+            self._store_objects()
         if self._auto:
             self.checkpoint()
 
-    def _store_chunks(self):
-        """Store every chunk the core has cut: durable BEFORE any claim.
-        A put that fails leaves the chunk with the core, which gives it
-        again at the next call."""
+    def _store_objects(self):
+        """Store every object the core owes: durable BEFORE any claim.
+        A put that fails leaves the object with the core, which gives
+        it again at the next call."""
         while True:
-            chunk = self._w.next_chunk()
-            if chunk is None:
+            obj = self._w.next_object()
+            if obj is None:
                 return
-            self.sink.put(*chunk)
-            self._w.chunk_stored()
+            self.sink.put(*obj)
+            self._w.object_stored()
 
     def checkpoint(self, tail=None):
         """Publish a durability claim covering all final rows plus the
-        optional `tail` (a Table of rows not written anywhere yet --
-        provisional: superseded by a later write_table)."""
+        optional `tail`: a Table of EVERY row since the last
+        write_table, in order (provisional: a later write_table of the
+        same rows replaces them). A later tail begins with the rows of
+        the one before. Only the rows no object holds yet are encoded
+        and stored, or a merge the core asks for: the cost follows the
+        new rows, not the tail. No tail: the claim covers the final
+        rows only."""
         if self._closed:
             raise CheckpointError("writer is closed")
-        self._store_chunks()         # one a failed put left with the core
-        mini = None
-        if tail is not None and tail.num_rows:
-            mini = _encode_mini(tail, schema=self.schema, **self._opts)
-        total_rows = self._w.rows_final + (tail.num_rows if mini else 0)
-        if (mini is None and total_rows == self._rows_checkpointed
-                and self._versions):
-            return self._rows_checkpointed        # nothing new to claim
-        if mini is None and self._w.rows_final == 0:
-            # zero rows anywhere: the data region is a complete, valid,
-            # empty parquet file so finalize always yields a readable file
-            buf = io.BytesIO()
-            pq.ParquetWriter(buf, self.schema, **self._opts).close()
-            mini = buf.getvalue()
+        w = self._w
         try:
-            ckpt, total_rows = self._w.build_checkpoint(mini)
+            self._store_objects()       # one a failed put left with the core
+            tail_rows = tail.num_rows if tail is not None else 0
+            if tail_rows == 0:
+                w.drop_unfinished()
+                if self._claimed == (w.rows_final, 0):
+                    return self._rows_checkpointed    # nothing new to claim
+            else:
+                have = w.rows_unfinished
+                if tail_rows < have:
+                    raise CheckpointError(
+                        f"{self.name}: checkpoint(tail) with {tail_rows} "
+                        f"rows after one with {have}: a tail holds every "
+                        f"row since the last write_table, so it never "
+                        f"gets shorter")
+                if self._claimed == (w.rows_final, tail_rows):
+                    return self._rows_checkpointed    # nothing new to claim
+                first, rows = w.next_span(tail_rows - have)
+                span = tail.slice(first - w.rows_final, rows)
+                w.add_unfinished(_encode_mini(span, schema=self.schema,
+                                              **self._opts))
+                self._store_objects()
+            empty = None
+            if w.rows_final == 0 and w.rows_unfinished == 0:
+                # zero rows anywhere: the data region is a complete,
+                # valid, empty parquet file so finalize always yields a
+                # readable file
+                buf = io.BytesIO()
+                pq.ParquetWriter(buf, self.schema, **self._opts).close()
+                empty = buf.getvalue()
+            ckpt, total_rows = w.build_checkpoint(empty)
         except self._core_error as e:
             raise CheckpointError(f"{self.name}: {e}") from None
         # A number is used once, also when its put fails: a put that
@@ -259,8 +311,10 @@ class CheckpointWriter:
         obj = ckpt_object(self.name, self._seq)
         self.sink.put(obj, ckpt)
         self._versions = _supersede(self.sink, self._versions, obj,
-                                    self._keep_s)   # stored whole first
+                                    self._keep_s,   # stored whole first
+                                    _named_by(ckpt))
         self._rows_checkpointed = total_rows
+        self._claimed = (w.rows_final, w.rows_unfinished)
         return total_rows
 
     @property
@@ -285,8 +339,8 @@ class CheckpointWriter:
             w.close()
             self.sink.put(self.name, buf.getvalue())
             if not keep_checkpoints:
-                for obj, _at in self._versions:
-                    self.sink.delete(obj)
+                for version in self._versions:
+                    self.sink.delete(version[0])
                 self._versions = []
         else:
             finalize(self.name, self.sink, keep_checkpoints=keep_checkpoints)
@@ -402,15 +456,16 @@ class CheckpointReader:
 class CheckpointFile:
     """A checkpoint state as a read-only seekable file.
 
-    The file's bytes are: each manifest chunk in order, then the
-    checkpoint's own data region (provisional tail + footer). Reads
-    map offsets onto those segments. A chunk holds WHOLE row groups,
-    so its size tracks the row-group size; two fetch strategies:
+    The file's bytes are: each object of the manifest in order, then
+    the checkpoint's own data region (the footer). Reads map offsets
+    onto those segments. An object holds WHOLE row groups, so its size
+    tracks what it holds: a chunk, one row group, or the rows of a few
+    checkpoints. Two fetch strategies:
 
-      small chunk (<= WHOLE_FETCH_MAX): fetched whole on first
-        touch, manifest CRC verified (corrupt chunk fails loudly),
-        kept in a small LRU.
-      large chunk: RANGED reads of exactly the requested bytes —
+      small object (<= WHOLE_FETCH_MAX): fetched whole on first
+        touch, manifest CRC verified (corrupt object fails loudly),
+        kept while the kept ones fit in CACHE_BYTES.
+      large object: RANGED reads of exactly the requested bytes —
         this is what lets a columnar reader's pruning reach the
         storage (a 128 MB row group's chunk is never fetched whole
         to read one column). No manifest-CRC check on this path;
@@ -421,15 +476,16 @@ class CheckpointFile:
     The tail segment is served from memory.
     """
 
-    _CACHE_CHUNKS = 4          # ~4 x chunk size of memory, bounded
-    WHOLE_FETCH_MAX = 8 << 20  # ranged reads above this chunk size
+    WHOLE_FETCH_MAX = 8 << 20  # ranged reads above this object size
+    CACHE_BYTES = 4 * WHOLE_FETCH_MAX   # the whole objects kept, bounded
 
     def __init__(self, reader):
         self._r = reader
         self._pos = 0
         self._closed = False
         self._lock = threading.Lock()
-        self._cache = {}       # cname -> bytes (LRU by insertion order)
+        self._cache = {}       # cname -> bytes, the oldest first
+        self._cached = 0       # their bytes
         # segment table: (start, end, cname or None=tail)
         self._segments = []
         off = 0
@@ -502,8 +558,9 @@ class CheckpointFile:
                         f"{cname}: length/CRC mismatch vs manifest -- "
                         f"corrupt")
                 self._cache[cname] = b
-                while len(self._cache) > self._CACHE_CHUNKS:
-                    self._cache.pop(next(iter(self._cache)))
+                self._cached += len(b)
+                while self._cached > self.CACHE_BYTES and len(self._cache) > 1:
+                    self._cached -= len(self._cache.pop(next(iter(self._cache))))
             return b
 
     def _read_at(self, pos, n):

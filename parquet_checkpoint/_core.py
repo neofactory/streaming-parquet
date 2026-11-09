@@ -1,13 +1,15 @@
 """CFFI binding of the parquet_checkpoint C core: core/pqc.c, whose
 header pqc.h is the format's spec.
 
-The core does the format work and no I/O. A host encodes each row group
-as a complete parquet file (a "mini file", offsets from 0) and hands it
-the bytes; the core rebases the footer's offsets to the group's place
-in the final file, cuts chunks, builds the combined footer and the
-checkpoint object, and hands bytes back for the host to store. The Go
-host (go/pqc) and the DuckDB extension use the same core; this module
-is what the Python writer calls, so the format's rules exist once.
+The core does the format work and no I/O. A host encodes rows as a
+complete parquet file (a "mini file", offsets from 0) and hands it the
+bytes; the core rebases the footer's offsets to the rows' place in the
+final file, decides which rows each object holds (the new rows of a
+checkpoint, or a merge), cuts chunks, builds the combined footer and
+the checkpoint object, and hands bytes back for the host to store. The
+Go host (go/pqc) and the DuckDB extension use the same core; this
+module is what the Python writer calls, so the format's rules exist
+once.
 
 The library is built with `make` and the system C compiler the first
 time this module is imported, next to its sources (core/), like
@@ -34,14 +36,20 @@ PqcWriter *pqc_writer_new(const char *final_name, uint64_t chunk_bytes,
 void pqc_writer_free(PqcWriter *w);
 int64_t pqc_add_group(PqcWriter *w, const uint8_t *mini, size_t len,
                       char *err, size_t errlen);
-int pqc_next_chunk(PqcWriter *w, char name[256], const uint8_t **data,
-                   uint64_t *len, uint32_t *crc);
-void pqc_chunk_stored(PqcWriter *w);
-uint8_t *pqc_build_checkpoint(PqcWriter *w, const uint8_t *tail_mini,
-                              size_t tail_len, uint64_t *out_len,
+void pqc_next_span(PqcWriter *w, uint64_t new_rows,
+                   uint64_t *first_row, uint64_t *rows);
+int64_t pqc_add_unfinished(PqcWriter *w, const uint8_t *mini, size_t len,
+                           char *err, size_t errlen);
+void pqc_drop_unfinished(PqcWriter *w);
+int pqc_next_object(PqcWriter *w, char name[256], const uint8_t **data,
+                    uint64_t *len, uint32_t *crc);
+void pqc_object_stored(PqcWriter *w);
+uint8_t *pqc_build_checkpoint(PqcWriter *w, const uint8_t *empty_mini,
+                              size_t empty_len, uint64_t *out_len,
                               uint64_t *out_watermark,
                               char *err, size_t errlen);
 uint64_t pqc_rows_final(const PqcWriter *w);
+uint64_t pqc_rows_unfinished(const PqcWriter *w);
 uint32_t pqc_chunks_cut(const PqcWriter *w);
 uint64_t pqc_logical_end(const PqcWriter *w);
 void pqc_free(void *p);
@@ -92,44 +100,67 @@ class Writer:
         return ffi.string(self._err).decode('utf-8', 'replace')
 
     def add_group(self, mini):
-        """Append the row group(s) of a complete parquet file. Returns
-        the rows added."""
+        """Append the final row group(s) of a complete parquet file.
+        They replace every unfinished object. Returns the rows added."""
         rows = lib.pqc_add_group(self._w, mini, len(mini), self._err, _ERRLEN)
         if rows < 0:
             raise CoreError(self._message())
         return rows
 
-    def next_chunk(self):
-        """The next cut chunk as (name, bytes), or None when none is
-        ready. The same chunk comes again until chunk_stored()."""
+    def next_span(self, new_rows):
+        """A checkpoint is due and new_rows rows are in no object yet:
+        (first_row, rows), the rows of the file to encode as one row
+        group. The new rows alone, or a merge that ends with them."""
+        first = ffi.new('uint64_t *')
+        rows = ffi.new('uint64_t *')
+        lib.pqc_next_span(self._w, new_rows, first, rows)
+        return int(first[0]), int(rows[0])
+
+    def add_unfinished(self, mini):
+        """The span of the last next_span, as a complete parquet file.
+        Returns its rows."""
+        rows = lib.pqc_add_unfinished(self._w, mini, len(mini), self._err,
+                                      _ERRLEN)
+        if rows < 0:
+            raise CoreError(self._message())
+        return rows
+
+    def drop_unfinished(self):
+        """Forget the unfinished objects: the next checkpoint claims
+        the final rows only."""
+        lib.pqc_drop_unfinished(self._w)
+
+    def next_object(self):
+        """The next object to store as (name, bytes), or None when none
+        is owed. The same object comes again until object_stored()."""
         name = ffi.new(f'char[{NAME_MAX}]')
         data = ffi.new('const uint8_t **')
         length = ffi.new('uint64_t *')
         crc = ffi.new('uint32_t *')
-        rc = lib.pqc_next_chunk(self._w, name, data, length, crc)
+        rc = lib.pqc_next_object(self._w, name, data, length, crc)
         if rc < 0:
-            raise CoreError("out of memory cutting a chunk")
+            raise CoreError("out of memory preparing an object")
         if rc == 0:
             return None
         return (ffi.string(name).decode('utf-8'),
                 bytes(ffi.buffer(data[0], length[0])))
 
-    def chunk_stored(self):
-        """The chunk next_chunk() gave is in the store: the core may
+    def object_stored(self):
+        """The object next_object() gave is in the store: the core may
         now name it in a checkpoint."""
-        lib.pqc_chunk_stored(self._w)
+        lib.pqc_object_stored(self._w)
 
-    def build_checkpoint(self, tail_mini=None):
-        """(checkpoint object bytes, rows covered). tail_mini: a
-        complete parquet file of rows not yet added as a row group, or
-        None."""
+    def build_checkpoint(self, empty_mini=None):
+        """(checkpoint object bytes, rows covered): the list of the
+        stored objects and the footer. empty_mini: for a writer with no
+        rows, a complete empty parquet file; None otherwise."""
         n = ffi.new('uint64_t *')
         watermark = ffi.new('uint64_t *')
-        if tail_mini is None:
+        if empty_mini is None:
             p = lib.pqc_build_checkpoint(self._w, ffi.NULL, 0, n, watermark,
                                          self._err, _ERRLEN)
         else:
-            p = lib.pqc_build_checkpoint(self._w, tail_mini, len(tail_mini),
+            p = lib.pqc_build_checkpoint(self._w, empty_mini, len(empty_mini),
                                          n, watermark, self._err, _ERRLEN)
         if p == ffi.NULL:
             raise CoreError(self._message())
@@ -141,6 +172,10 @@ class Writer:
     @property
     def rows_final(self):
         return int(lib.pqc_rows_final(self._w))
+
+    @property
+    def rows_unfinished(self):
+        return int(lib.pqc_rows_unfinished(self._w))
 
     @property
     def chunks_cut(self):
