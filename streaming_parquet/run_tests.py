@@ -2373,6 +2373,57 @@ def _():
             s.close()
 
 
+@test("a file is cut when its row groups reach FILE_CUT_BYTES: the next "
+      "row group begins a new file with the same label, and every row "
+      "is there once")
+def _():
+    import random as _random
+    from streaming_parquet import _stream
+    flat = pa.schema([F('n', pa.int64(), nullable=False),
+                      F('s', pa.utf8(), nullable=False)])
+    rng = _random.Random(3)
+    was = _stream.FILE_CUT_BYTES
+    _stream.FILE_CUT_BYTES = 10_000      # about two row groups of these rows
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            s = sp.create_stream("v2test/bytecut", flat, store=tmp,
+                                 memory=Memory(lookback=400),
+                                 archive=Archive(checkpoint_seconds=0.05,
+                                                 row_group_rows=200))
+            try:
+                s.start_parquet("RUN")
+                for k in range(0, 2400, 10):
+                    s.append(pa.record_batch(
+                        [pa.array(range(k, k + 10)),
+                         pa.array([f"{rng.getrandbits(160):040x}"
+                                   for _ in range(10)])], schema=flat))
+                    time.sleep(0.01)
+                d = s.archive_state().location
+
+                def finished():
+                    return sorted(f for f in os.listdir(d)
+                                  if f.endswith('.parquet'))
+                wait_for(lambda: len(finished()) >= 4,
+                         what="four files cut by their bytes")
+                con = view_con()
+                v = s.duckdb_all(con)
+                wait_for(lambda: con.sql(
+                    f"SELECT count(*), count(DISTINCT n), min(n), max(n) "
+                    f"FROM {v.name}").fetchall()[0] == (2400, 2400, 0, 2399),
+                    what="every row once, across the files and memory")
+                files = finished()
+                assert all('-RUN' in f for f in files), files
+                for f in files:           # a file is cut after it is large
+                    size = pq.ParquetFile(os.path.join(d, f)).metadata
+                    assert os.path.getsize(os.path.join(d, f)) >= 10_000, (f, size)
+                    assert size.num_row_groups <= 4, (f, size.num_row_groups)
+                v.close()
+            finally:
+                s.close()
+    finally:
+        _stream.FILE_CUT_BYTES = was
+
+
 print("\n--- diagnostics ---")
 
 @test("diag log: $STREAMING_PARQUET_DIAG_LOG moves it; default is the cwd")

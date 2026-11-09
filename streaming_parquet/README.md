@@ -180,6 +180,14 @@ each time: O(n^2)); assemble once.
 - write_table implies a checkpoint (the cheapest moment). A timed
   checkpoint(tail) covers the rows between writes. checkpoint_seconds
   sets crash loss; row_group_seconds sets file quality.
+- Every decision of the writer is taken by time or by bytes, whichever
+  comes first. The host ends a file by time or by event (`cut()`); the
+  writer also ends it when its row groups reach 256 MB
+  (`FILE_CUT_BYTES`), and the next row group begins a new file with
+  the same label. The reason is the footer: it has an entry for each
+  row group and each column and is written at every checkpoint, so a
+  fast stream left to grow for hours would write megabytes of footer
+  every time. A slow stream never reaches the size.
 
 ## The views (connect -> SQL over everything)
 

@@ -1,11 +1,14 @@
 package streaming
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/apache/arrow-go/v18/parquet/file"
 )
 
 // Durable: the first seq not yet in the archive. A consumer that must
@@ -128,4 +131,71 @@ func TestCheckpointSkipsWhenNothingNew(t *testing.T) {
 	if after := ckpt(); !after.Equal(before) {
 		t.Fatalf("an idle stream rewrote its checkpoint (%v -> %v)", before, after)
 	}
+}
+
+// A file is cut when its row groups reach FileCutBytes: the next row
+// group begins a new file, and no row is lost at the cut.
+func TestFileIsCutByBytes(t *testing.T) {
+	was := FileCutBytes
+	FileCutBytes = 4000
+	defer func() { FileCutBytes = was }()
+	tel, err := Init(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tel.Close()
+	dir := t.TempDir()
+	s, err := tel.CreateStream("t/bytecut", testSchema(),
+		StreamOptions{RingRows: 400, Parquet: true,
+			Archive: ArchiveOptions{BaseDir: dir, RowGroupRows: 200, Compression: "none"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k := 0; k < 12; k++ { // 12 row groups of 200 rows
+		writeRows(t, s, k*200, 200)
+		if _, err := s.Publish(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.StopParquet(); err != nil {
+		t.Fatal(err)
+	}
+	var files []string
+	rows := 0
+	err = filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err == nil && strings.HasSuffix(p, ".parquet") && !info.IsDir() {
+			files = append(files, p)
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) < 3 {
+		t.Fatalf("12 row groups with a cut at 4,000 bytes made %d file(s): %v", len(files), files)
+	}
+	for _, f := range files {
+		n, err := parquetRows(f)
+		if err != nil {
+			t.Fatalf("%s: %v", f, err)
+		}
+		rows += n
+	}
+	if rows != 2400 {
+		t.Fatalf("the files hold %d rows, want 2400", rows)
+	}
+}
+
+// parquetRows is the row count of the parquet file at path.
+func parquetRows(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	r, err := file.NewParquetReader(bytes.NewReader(data))
+	if err != nil {
+		return 0, err
+	}
+	defer r.Close()
+	return int(r.NumRows()), nil
 }

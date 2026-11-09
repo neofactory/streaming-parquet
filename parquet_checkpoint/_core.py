@@ -178,6 +178,12 @@ class Writer:
         return int(lib.pqc_rows_unfinished(self._w))
 
     @property
+    def logical_end(self):
+        """Where the next final row group begins: the bytes of the
+        file so far, without its footer."""
+        return int(lib.pqc_logical_end(self._w))
+
+    @property
     def chunks_cut(self):
         return int(lib.pqc_chunks_cut(self._w))
 
