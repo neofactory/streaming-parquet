@@ -382,6 +382,9 @@ replaced by one object of the same rows, one size step up.
 Before 2026-11-09 the whole tail was encoded again at every checkpoint,
 and the answer to its cost was a shorter row group.
 
+What a checkpoint costs at each row rate, now and before:
+[what a checkpoint costs](../docs/checkpoint-cost.md).
+
 ## Not yet
 
 - Multi-file compaction/expiry policy (streaming-parquet's concern).

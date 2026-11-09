@@ -48,6 +48,8 @@ needs no build.
 - `<pkg>/go/` — the Go host (cgo over the same core)
 - `<pkg>/run_*.py` — standalone suites: unit, stress, cross-language
   parity
+- `docs/` — documents that cross the packages:
+  [what a checkpoint costs](docs/checkpoint-cost.md)
 
 ## Open question: native implementations
 
