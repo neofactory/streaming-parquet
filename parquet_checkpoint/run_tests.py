@@ -752,6 +752,68 @@ def _():
         assert remote.get('sv.parquet') == local.get('sv.parquet')
 
 
+@test("the shipper sends each object once; after an outage it sends only "
+      "what the newest version names; the remote keeps no object that no "
+      "kept version names")
+def _():
+    from parquet_checkpoint import Shipper
+    with tempfile.TemporaryDirectory() as d:
+        local, remote = DirSink(d), FakeS3(part_min=1024)
+        w = CheckpointWriter('so.parquet', SCHEMA, sink=local,
+                             chunk_bytes=64 * 1024, compression='none',
+                             checkpoint_every_write=False)
+        ship = Shipper('so.parquet', local, remote, superseded_keep_s=0)
+
+        def remote_puts():
+            got = [o[len('put:'):] for o in remote.op_log
+                   if o.startswith('put:')]
+            del remote.op_log[:]
+            return got
+
+        def remote_reads(k):
+            r = CheckpointReader(w.ckpt_name, remote)
+            check_exact(r.table(), k * 40)
+            return {m[0] for m in r.manifest}
+        # a poll at each checkpoint: one new object and the version
+        for k in range(1, 31):
+            w.checkpoint(make_rows(0, k * 40))
+            assert ship.poll()['state'] == 'shipped'
+            puts = remote_puts()
+            assert len(puts) == 2 and puts[-1] == w.ckpt_name, (k, puts)
+            named = remote_reads(k)
+            # with no keep time: what the newest version names, and at
+            # most what the one before it named
+            assert named <= set(remote.list('so.parquet.chunks/')), k
+        # an outage: 25 checkpoints with no poll, small objects merged
+        # and gone meanwhile; one poll ships what the newest names and
+        # the remote lacks, nothing the outage swallowed
+        for k in range(31, 56):
+            w.checkpoint(make_rows(0, k * 40))
+        assert ship.poll()['state'] == 'shipped'
+        puts = remote_puts()
+        named = remote_reads(55)
+        assert puts[-1] == w.ckpt_name and set(puts[:-1]) <= named, puts
+        assert len(puts) < 20, puts
+        # the next poll deletes the version before and its objects
+        w.checkpoint(make_rows(0, 56 * 40))
+        assert ship.poll()['state'] == 'shipped'
+        before = remote_reads(56)
+        w.checkpoint(make_rows(0, 57 * 40))
+        assert ship.poll()['state'] == 'shipped'
+        named = remote_reads(57)
+        assert set(remote.list('so.parquet.chunks/')) <= named | before, (
+            sorted(set(remote.list('so.parquet.chunks/')) - named - before))
+        # the final rows, then both copies finish the same file
+        w.write_table(make_rows(0, 57 * 40))
+        w.checkpoint()
+        assert ship.poll()['state'] == 'shipped'
+        w.close()
+        assert ship.close() == ('recovered', 'so.parquet')
+        assert remote.get('so.parquet') == local.get('so.parquet')
+        assert remote.list('') == ['so.parquet'], remote.list('')
+        assert sorted(os.listdir(d)) == ['so.parquet'], os.listdir(d)
+
+
 @test("a checkpoint stores only its new rows: one object for each, the "
       "checkpoint object holds the list and the footer and no row, and "
       "every row is read back after every checkpoint")
