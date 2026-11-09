@@ -36,6 +36,9 @@ project depends on a checkout like this:
 `arrow_ring` builds its C core with `make` and the system C compiler
 on first import, next to its sources (`arrow_ring/core/`), so that
 directory must be writable; in an editable install it is the checkout.
+`parquet_checkpoint` does the same for its core
+(`parquet_checkpoint/core/`) the first time a file is written; reading
+needs no build.
 
 ## Layout
 

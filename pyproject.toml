@@ -12,7 +12,7 @@ license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "pyarrow>=14",   # Flight; concat_tables(promote_options=); __arrow_c_stream__
-    "cffi",          # ABI mode: arrow_ring builds its C core with `make` on first import
+    "cffi",          # ABI mode: arrow_ring and parquet_checkpoint build their C cores with `make` on first use
 ]
 
 [project.optional-dependencies]
@@ -24,3 +24,4 @@ packages = ["arrow_ring", "parquet_checkpoint", "streaming_parquet"]
 
 [tool.setuptools.package-data]
 arrow_ring = ["core/Makefile", "core/arrow_ring.c", "core/arrow_ring.h"]
+parquet_checkpoint = ["core/Makefile", "core/pqc.c", "core/pqc.h"]

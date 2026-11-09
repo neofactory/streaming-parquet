@@ -5,7 +5,8 @@ per stream/session instead of a file per flush; crash loss bounded to
 rows since the last checkpoint (zero at any checkpoint instant — the
 tail rides inside it); recovery is assembly, no data rewritten. Second
 package of the streaming-parquet trio (arrow-ring / parquet-checkpoint
-/ streaming-parquet); dependencies: pyarrow only (boto3 for the real
+/ streaming-parquet); dependencies: pyarrow, and cffi with a C compiler
+for the writer, whose format work is the C core's (boto3 for the real
 S3 sink, duckdb in the tests). Designed 2026-08-19/22 with Paul.
 
 ## The format
@@ -109,7 +110,9 @@ multipart part rules (the Go side of FakeS3); sink_s3_test.go runs the
 sink contract and the writer lifecycle on it
 
 C core (core/pqc.h IS its spec; language-neutral: hosts encode
-parquet and do all storage):
+parquet and do all storage). The Python CheckpointWriter and the Go
+Writer are both hosts over it, so the writer's rules exist once; the
+DuckDB extension reads with it:
 pqc_writer_new(final_name, chunk_bytes)
 pqc_add_group(mini_parquet_bytes)     # core rebases + buffers
 pqc_next_chunk / pqc_chunk_stored     # host stores; ack-or-retry
@@ -248,14 +251,18 @@ Test content (all in `run_tests.py`, 14 tests):
 - The shipper: rides a WAN outage (local keeps writing), one catch-up
   pass ships missed chunks and only the latest checkpoint, remote
   final file byte-identical to the local one.
-- C core parity (`run_c_compat.py`, 6 tests): thrift rebase byte-exact
+- C core parity (`run_c_compat.py`, 7 tests): thrift rebase byte-exact
   vs `_thrift_shift` on random schemas x120; same mini-file sequence
-  through both writers -> byte-identical chunks, CHECKPOINT OBJECTS,
-  and final files; cross-reading both directions; same refusals.
+  through the core and the Python writer of before -> byte-identical
+  chunks, CHECKPOINT OBJECTS, and final files; cross-reading both
+  directions; same refusals. The package's writer became a host over
+  the core on 2026-11-09: the same writes through it and through the
+  writer of before (`_reference.ReferenceWriter`, kept as the oracle)
+  leave the same objects byte for byte after every step, 2,509
+  comparisons over schemas, compressions, tails, empty files and a
+  stream's own options.
   Pure-C memory soak: `make -C core san` (ASan+UBSan) and
   `make -C core leaks` (0 leaks).
-- When the C core exists: byte-compatibility — C and Python produce
-  interchangeable artifacts; each finalizes the other's.
 
 ## Tests and tools
 
@@ -341,6 +348,7 @@ threshold is too big — fix the cadence, don't cap the tail.
 
 - Multi-file compaction/expiry policy (streaming-parquet's concern).
 - Go S3 sink (DirSink only so far; the interface is the same).
-- Python binding over the C core (the Python implementation stays
-  authoritative; the C core's first native host is the Go package,
-  proven cross-compatible by run_go_compat.py).
+- The Python reader on the C core. The writer is on it (`_core.py`);
+  `CheckpointReader` and `CheckpointFile` still parse the checkpoint
+  object themselves, checked against the core by run_c_compat.py and
+  run_go_compat.py.
