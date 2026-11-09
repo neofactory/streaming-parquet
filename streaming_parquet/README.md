@@ -85,8 +85,12 @@ tier or mode.
 - Crash loss: zero committed rows past the last checkpoint (the newest
   rows ride inside it). The checkpoint cadence is the loss window --
   seconds -- independent of row-group and chunk sizes.
-- A live reader's memory must reach back past the ticket's stored_row
-  (the store lags by at most a ship interval).
+- A view changes from the store to memory at a row the store has and
+  the ring still holds (see "The views"). Three quarters of the ring
+  must hold the unfinished row group and the rows written during the
+  store's lag. The default ring, two row groups, does that below about
+  3,000 rows per second; a view whose ring is too short says so
+  (`ring_note`) and names the `Memory(lookback=...)` to set.
 
 ## Assembly (= repair; one mechanism)
 
@@ -162,7 +166,9 @@ each time: O(n^2)); assemble once.
   base + file_row_number, virtualized. BUILT, both languages.
 - Each file also records sp_run, the run (the writer's start time,
   UTC to the microsecond) that wrote it; row numbers restart each run.
-- The seam in duckdb_all is the ticket's stored_row: files up to it,
+- The seam in duckdb_all is a row boundary the store has, above the
+  ring's oldest quarter: the start of an unfinished file, the end of
+  its finished row groups, or the ticket's stored_row. Files up to it,
   memory after it, the same run only.
 - write_table implies a checkpoint (the cheapest moment). A timed
   checkpoint(tail) covers the rows between writes. checkpoint_seconds
@@ -173,32 +179,50 @@ each time: O(n^2)); assemble once.
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
     a = streaming_parquet.connect("probe/voltages", store=STORE)
     view = a.duckdb_all(con)                 # register once
-    con.sql(f"SELECT ... FROM {view.name}")  # every query sees one ticket
+    con.sql(f"SELECT ... FROM {view.name}")  # every query sees one state
 
-`duckdb_all(con)` is one DuckDB view over three pieces, all named by one
-ticket: the finished files of the catalog version the ticket names
-(downloaded with boto3 at exactly that ETag and attached from a local
-copy; DuckDB reads the files' byte ranges from the store), the
-unfinished files at the checkpoint versions the ticket lists (read
-through the parquet_checkpoint extension, so the connection is opened
-with `allow_unsigned_extensions`), and memory: the reader's ring rows
-after the ticket's `stored_row`, same run only. `duckdb_archive(con)` is
-the files alone; `duckdb_live(con)` is memory alone.
+`duckdb_all(con)` is one DuckDB view over three pieces: the finished
+files of the catalog version the ticket names (downloaded with boto3 at
+exactly that ETag and attached from a local copy; DuckDB reads the
+files' byte ranges from the store), the unfinished files the ticket
+lists, each up to the seam (read through the parquet_checkpoint
+extension, so the connection is opened with
+`allow_unsigned_extensions`), and memory: the ring's rows after the
+seam, same run only. `duckdb_archive(con)` is the files alone;
+`duckdb_live(con)` is memory alone.
 
-The view's text names the catalog copy, the checkpoint versions and the
-seam, so a query never mixes two tickets. One background thread per view
-replaces the view when the ticket changes: at once for a live reader,
-which sees the revision on its connection; on the ticket's own schedule
-(its write time plus its beat) for a reader without one. A catalog
-version the store no longer holds means a newer ticket: the view reads
-it again. Every checkpoint version, a live file's and a finished
-file's, stays 10 minutes after it is superseded (by the next version, or
-by the ticket dropping the file); the step that uploads a later one
-deletes it, nothing on a timer. So a polling reader's view never names a
+**The seam.** To the extent that rows are in the ring, the view uses
+them. The seam is the oldest row boundary the store has that is above
+the ring's oldest quarter; the boundaries are the start of each
+unfinished file, the end of its finished row groups, and the ticket's
+`stored_row`. A view uses the newest three quarters of the ring. The
+oldest quarter is the time a running query has: a query keeps the seam
+it began with, and the row after that seam must still be in the ring
+when the query's scan gets there. A query that arrives too late fails
+and says so; it never answers with rows missing. With the default ring
+of two row groups the ring always holds the unfinished row group, so
+the view reads finished row groups from the store, each once, and never
+the rows a checkpoint adds. This is the same for a remote reader, whose
+ring is fed over Flight, and for the process that writes the stream.
+
+**When the view changes.** The view's text names the catalog copy, the
+checkpoint versions and the seam, so a query never mixes two states.
+One background thread per view replaces the text when it must change:
+the seam moved (about once for each row group), the catalog changed, or
+a checkpoint version it names has been replaced for half the time the
+store keeps one. A view with no ring follows every ticket. The thread
+learns of a ticket at once on a live reader, which sees the revision on
+its connection, and on the ticket's own schedule (its write time plus
+its beat) on a reader without one. A catalog version the store no
+longer holds means a newer ticket: the view reads it again. Every
+checkpoint version, a live file's and a finished file's, stays 10
+minutes after it is superseded (by the next version, or by the ticket
+dropping the file; the ticket's `keep_seconds`); the step that uploads
+a later one deletes it, nothing on a timer. So a view never names a
 deleted one. Memory is read a chunk at a time, zero copy, pinning only
 the chunk in hand, so a query holds nothing of the ring between chunks
-however long it runs, and the writer never waits. Without a live writer (no
-ticket, or a stale one) the views read the store's current catalog.
+however long it runs, and the writer never waits. Without a live writer
+(no ticket, or a stale one) the views read the store's current catalog.
 
 The archive is `<store>/streams/<name>` under the store the reader
 connected through; a direct-ticket connect passes `store=`. A Stream
@@ -239,8 +263,14 @@ store's data changes (`checkpoint_seconds`, `ship_seconds`,
 `beat_seconds`) and when to call the writer dead (`stale_after`), what
 the store holds of this run (`stored_row`, `stored_at`), the files still
 unfinished (`unfinished`: each the real path of its newest checkpoint
-version), the published catalog's `catalog_etag`, a `revision` counting
-this run's ticket writes, and the write time `ts`.
+version; `files`: the same with each file's `first_row` on the stream's
+row numbers, the rows of its finished row groups `final_rows`, and its
+`rows`, so a view can place its seam with no download), how long the
+store keeps a checkpoint version after a newer one (`keep_seconds`),
+the published catalog's `catalog_etag`, a `revision` counting this
+run's ticket writes, and the write time `ts`. The Go host's ticket
+says who writes the stream and when it was written, and none of the
+store's facts.
 
 The writer writes it right after each upload and each catalog upload,
 and at least once a beat; it deletes it on clean close. When a file
@@ -273,9 +303,9 @@ chain applies; the public bucket needs none.
 | `live_table()` on the writer's machine | local disk | everything up to the local checkpoint |
 | any parquet tool | the store | finished files |
 
-The views read only what the ticket names, so every seam is a stored
-object: a catalog version, a checkpoint version, the ticket's
-stored_row. No reader lists the store.
+The views read only what the ticket names: a catalog version, a
+checkpoint version, and a seam at a row number the ticket gives. No
+reader lists the store.
 
 ## The catalog
 

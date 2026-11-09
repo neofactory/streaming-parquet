@@ -338,7 +338,8 @@ def connect(name=None, store=None, memory=None, columns=None, ticket=None):
         def memory_chunks(lo, a=a):
             return a._require().iter_chunks(lo)
         a._source = TicketSource(resolved_name, feeder_store, revisions=feeder,
-                                 run=lambda: feeder._run, memory=memory_chunks)
+                                 run=lambda: feeder._run, memory=memory_chunks,
+                                 window=lambda a=a: a._require().window())
     with _lock:
         _feeders[id(feeder)] = feeder
         _attached[id(a)] = a

@@ -193,8 +193,14 @@ class Stream:
         changes and when a reader should call the writer dead, what the
         store holds of this run, and the files there still unfinished:
         each as the path of its newest checkpoint version (an object
-        written once and never changed; a superseded one stays 10 minutes,
-        so a reader holding a slightly old ticket can still open it)."""
+        written once and never changed; a superseded one stays
+        keep_seconds, 10 minutes, so a reader holding a slightly old
+        ticket can still open it). `files` says of each unfinished file
+        where it sits on the stream's row numbers (first_row), how many
+        of its rows are in finished row groups (final_rows) and how many
+        it has (rows): what a view needs to change from the store to
+        its ring at a row the ring still holds, with no download.
+        `unfinished` is the same paths alone."""
         from ._clock import now as _now
         t = self._ticket_state()
         t["revision"] = self._ticket_revision
@@ -227,7 +233,7 @@ class Stream:
             self.name, self._store,
             ticket=lambda: self._ticket if self._ticket_revision else None,
             revisions=self, run=lambda: self._run,
-            memory=self._data.iter_chunks)
+            memory=self._data.iter_chunks, window=self._data.window)
 
     def _write_ticket(self):
         """Write the ticket if what it says changed or a beat passed.
@@ -276,13 +282,19 @@ class Stream:
         """The ticket without its write time: what a change is judged by."""
         p = self._parquet
         if p is not None:
-            stored_row, stored_at, unfinished = p.store_state()
+            stored_row, stored_at, files = p.store_files()
             where = p.store_location()
-            unfinished = [f"{where}{c}" for c in unfinished]
+            files = [dict(f, checkpoint=f"{where}{f['checkpoint']}")
+                     for f in files]
             catalog_etag = p.catalog.etag if p.catalog is not None else None
+            keep_seconds = p.superseded_keep_s
         else:
-            stored_row, stored_at, unfinished = -1, None, []
+            stored_row, stored_at, files = -1, None, []
             catalog_etag = None
+            keep_seconds = None
+        # `unfinished`, the checkpoint paths alone, is what a reader from
+        # before `files` knows
+        unfinished = [f["checkpoint"] for f in files]
         return {"name": self.name, "host": _get_local_ip(),
                 "port": self._port, "run": self._run,
                 "beat_seconds": self._beat_seconds,
@@ -291,7 +303,9 @@ class Stream:
                 "ship_seconds": (self._ship_seconds
                                  if self._remote is not None else None),
                 "stored_row": stored_row, "stored_at": stored_at,
-                "unfinished": unfinished, "catalog_etag": catalog_etag}
+                "unfinished": unfinished, "files": files,
+                "keep_seconds": keep_seconds,
+                "catalog_etag": catalog_etag}
 
     # --- writing: the fast path -----------------------------------------------
 

@@ -2172,6 +2172,202 @@ s.close()
     assert r.returncode == 0 and r.stdout.strip() == "10", (r.returncode,
                                                            r.stdout, r.stderr[-800:])
 
+print("\n--- views and the ring ---")
+
+@test("the seam: the oldest row boundary the store has that is above the "
+      "ring's oldest quarter")
+def _():
+    from streaming_parquet._views import choose_seam, _ticket_files
+    one = [{"first_row": 500, "final_rows": 250, "rows": 480}]
+    full = (600, 999, 400)               # a full ring: rows 600 to 999
+    # above the oldest quarter: row 700 and up
+    assert choose_seam(990, one, None) == (990, False, None), "no ring"
+    assert choose_seam(990, one, (0, -1, 400)) == (990, True, None), "empty ring"
+    # the end of the file's finished row groups, row 749
+    assert choose_seam(990, one, full) == (749, True, None)
+    # that boundary inside the oldest quarter: the next one is stored_row
+    low = [{"first_row": 500, "final_rows": 150, "rows": 480}]
+    assert choose_seam(990, low, full) == (990, True, None)
+    # two files: the older file's finished rows end at 749, the newer
+    # file begins at 800; the oldest boundary above the quarter wins
+    two = one + [{"first_row": 800, "final_rows": 0, "rows": 190}]
+    assert choose_seam(990, two, full) == (749, True, None)
+    assert choose_seam(990, low + [two[1]], full) == (799, True, None)
+    # the store far behind: only stored_row is left, inside the quarter
+    assert choose_seam(650, [], full) == (650, True, 'tight')
+    # the ring begins after the store ends: full = too short, else late
+    assert choose_seam(500, [], full) == (500, False, 'short')
+    assert choose_seam(500, [], (600, 700, 400)) == (500, False, 'late')
+    # a ring that is not full has its free rows as time too: the whole
+    # unfinished file comes from the ring, nothing of it from the store
+    young = [{"first_row": 0, "final_rows": 0, "rows": 90}]
+    assert choose_seam(90, young, (0, 100, 400)) == (-1, True, None)
+    # a ticket from a writer before `files`: paths alone, stored_row only
+    old = _ticket_files({"unfinished": ["d/x.parquet.000003.ckpt"]})
+    assert old == [{"checkpoint": "d/x.parquet.000003.ckpt",
+                    "first_row": None, "final_rows": None, "rows": None}]
+    assert choose_seam(990, old, full) == (990, True, None)
+
+
+@test("the ticket says where each unfinished file is: its first row, the "
+      "rows of its finished row groups, its rows")
+def _():
+    import json as _json
+    flat = pa.schema([("n", pa.int64())])
+    with tempfile.TemporaryDirectory() as root:
+        tpath = os.path.join(root, "tickets", "v2test", "tfiles.json")
+
+        def ticket():
+            try:
+                with open(tpath) as f:
+                    return _json.load(f)
+            except (FileNotFoundError, ValueError):
+                return None
+        s = sp.create_stream("v2test/tfiles", flat, store=root,
+                             memory=Memory(lookback=400),
+                             archive=Archive(checkpoint_seconds=0.05,
+                                             row_group_rows=200))
+        try:
+            # ten rows at a time: a row group ends at exactly 200 rows (one
+            # append of 250 would be written as one row group of 250)
+            for k in range(0, 250, 10):
+                s.append(pa.record_batch([pa.array(range(k, k + 10))],
+                                         schema=flat))
+            wait_for(lambda: (ticket() or {}).get("stored_row") == 249,
+                     what="250 rows stored")
+            t = ticket()
+            assert t["keep_seconds"] == parquet_checkpoint.SUPERSEDED_KEEP_S, t
+            assert t["files"] == [{"checkpoint": t["unfinished"][0],
+                                   "first_row": 0, "final_rows": 200,
+                                   "rows": 250}], t
+            s.cut()
+            s.append(pa.record_batch([pa.array(range(250, 260))], schema=flat))
+            wait_for(lambda: (ticket() or {}).get("stored_row") == 259
+                     and [f["first_row"] for f in ticket()["files"]][-1:] == [250],
+                     what="the next file in the ticket, from row 250")
+            last = ticket()["files"][-1]
+            assert (last["final_rows"], last["rows"]) == (0, 10), last
+        finally:
+            s.close()
+
+
+@test("the all view takes from the ring what the ring holds: its seam moves "
+      "with the row group, not with the ticket, and every row is there once "
+      "while it moves")
+def _():
+    flat = pa.schema([F('n', pa.int64(), nullable=False)])
+    with tempfile.TemporaryDirectory() as tmp:
+        s = sp.create_stream("v2test/ringseam", flat, store=tmp,
+                             memory=Memory(lookback=400),
+                             archive=Archive(checkpoint_seconds=0.05,
+                                             row_group_rows=200))
+        try:
+            con = view_con()
+            v = s.duckdb_all(con)
+            first_revision = s.ticket_revision
+            seams = set()
+            written = 0
+            for _ in range(150):         # 1,500 rows: 7 row groups and a half
+                s.append(pa.record_batch(
+                    [pa.array(range(written, written + 10))], schema=flat))
+                written += 10
+                time.sleep(0.02)
+                cnt, dst, lo, hi = con.sql(
+                    f"SELECT count(*), count(DISTINCT n), min(n), max(n) "
+                    f"FROM {v.name}").fetchall()[0]
+                assert (cnt, dst, lo, hi) == (written, written, 0, written - 1), \
+                    (cnt, dst, lo, hi, written, v.seam)
+                seams.add(v.seam)
+            tickets = s.ticket_revision - first_revision
+            assert tickets >= 30, f"only {tickets} tickets: the test is too quick"
+            # a seam is the row before a file or the end of a row group,
+            # never a row a checkpoint added in the middle of one
+            assert all((x + 1) % 200 == 0 for x in seams), sorted(seams)
+            assert v.rebuilds <= tickets // 3, (
+                f"{v.rebuilds} view texts for {tickets} tickets")
+            assert v.ring_note is None, v.ring_note
+            v.close()
+        finally:
+            s.close()
+
+
+@test("a query that reaches the ring after its rows are gone fails and "
+      "says so; it does not answer with rows missing")
+def _():
+    flat = pa.schema([F('n', pa.int64(), nullable=False)])
+    with tempfile.TemporaryDirectory() as tmp:
+        s = sp.create_stream("v2test/ringgone", flat, store=tmp,
+                             memory=Memory(lookback=400),
+                             archive=Archive(checkpoint_seconds=0.05,
+                                             row_group_rows=200))
+        try:
+            con = view_con()
+            # 650 rows, ten at a time: three row groups of 200 and 50 rows
+            for k in range(0, 650, 10):
+                s.append(pa.record_batch([pa.array(range(k, k + 10))],
+                                         schema=flat))
+                time.sleep(0.01)         # a writer the archive keeps up with
+            v = s.duckdb_all(con)
+            wait_for(lambda: v.seam == 599,
+                     what="the seam at the end of the third row group")
+            assert con.sql(f"SELECT count(*) FROM {v.name}").fetchall()[0][0] == 650
+            # the view's text stays as it is (as for a query that began
+            # now) while the stream writes more than the ring holds
+            with v._lock:
+                for k in range(650, 1150, 10):
+                    s.append(pa.record_batch([pa.array(range(k, k + 10))],
+                                             schema=flat))
+                    time.sleep(0.01)
+                assert s.memory_state().rows == 400
+                try:
+                    got = con.sql(f"SELECT count(*) FROM {v.name}").fetchall()
+                    raise AssertionError(f"the query answered {got}")
+                except duckdb.Error as e:
+                    assert "the ring no longer holds row 600" in str(e), e
+                    assert "Memory(lookback" in str(e), e
+            # the view follows again, and every row is there
+
+            def counts():
+                try:
+                    return con.sql(f"SELECT count(*), count(DISTINCT n) "
+                                   f"FROM {v.name}").fetchall()[0]
+                except duckdb.Error:
+                    return None          # the text of before, for a moment
+            wait_for(lambda: counts() == (1150, 1150),
+                     what="the view current again")
+            v.close()
+        finally:
+            s.close()
+
+
+@test("a ring too short for the store's lag: the view says so, and names "
+      "the setting")
+def _():
+    flat = pa.schema([F('n', pa.int64(), nullable=False)])
+    with tempfile.TemporaryDirectory() as tmp:
+        s = sp.create_stream("v2test/ringshort", flat, store=tmp,
+                             memory=Memory(lookback=400),
+                             archive=Archive(checkpoint_seconds=0.05,
+                                             row_group_rows=200))
+        try:
+            con = view_con()
+            for k in range(0, 650, 10):
+                s.append(pa.record_batch([pa.array(range(k, k + 10))],
+                                         schema=flat))
+                time.sleep(0.01)         # a writer the archive keeps up with
+            v = s.duckdb_all(con)
+            wait_for(lambda: v.seam == 599,
+                     what="the seam at the end of the third row group")
+            with v._lock:
+                v._note_ring('short', 10)
+                assert "too short for the store's lag" in v.ring_note, v.ring_note
+                assert "Memory(lookback=" in v.ring_note, v.ring_note
+            wait_for(lambda: v.ring_note is None, what="the note cleared")
+            v.close()
+        finally:
+            s.close()
+
+
 print("\n--- diagnostics ---")
 
 @test("diag log: $STREAMING_PARQUET_DIAG_LOG moves it; default is the cwd")
