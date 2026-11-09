@@ -16,7 +16,7 @@ import (
 //	}
 //	w, _ := pqc.NewWriter("run.parquet", sink, 5<<20, true)
 //	pqc.WriteRows(w, rows)          // final row group + checkpoint
-//	pqc.CheckpointRows(w, pending)  // provisional tail rides
+//	pqc.CheckpointRows(w, pending)  // every row since WriteRows; the new ones are stored
 //	pqc.CloseTyped[Row](w)          // -> ordinary run.parquet
 
 // EncodeRows encodes rows as one complete mini parquet file.
@@ -44,17 +44,14 @@ func WriteRows[T any](w *Writer, rows []T) (int64, error) {
 	return w.AddGroupMini(mini)
 }
 
-// CheckpointRows publishes a checkpoint whose provisional tail is
-// `tail` (nil/empty = claim final rows only).
+// CheckpointRows publishes a checkpoint that covers the final rows and
+// `tail`: every row since the last WriteRows, in order (nil/empty =
+// claim the final rows only). Only the rows no object holds yet are
+// encoded and stored, or a merge the core asks for.
 func CheckpointRows[T any](w *Writer, tail []T) (uint64, error) {
-	if len(tail) == 0 {
-		return w.Checkpoint(nil)
-	}
-	mini, err := EncodeRows(tail)
-	if err != nil {
-		return 0, err
-	}
-	return w.Checkpoint(mini)
+	return w.CheckpointTail(uint64(len(tail)), func(offset, rows uint64) ([]byte, error) {
+		return EncodeRows(tail[offset : offset+rows])
+	})
 }
 
 // CloseTyped closes the writer; the type parameter supplies the

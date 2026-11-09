@@ -251,6 +251,25 @@ func (f *Server) copyPart(w http.ResponseWriter, r *http.Request, bucket, key st
 		f.fail(w, http.StatusBadRequest, "InvalidArgument", "partNumber")
 		return
 	}
+	if r.Header.Get("x-amz-copy-source") == "" {
+		// UploadPart: the part is the request's body
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			f.fail(w, http.StatusBadRequest, "IncompleteBody", err.Error())
+			return
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		parts, ok := f.uploads[id]
+		if !ok || f.upKeys[id] != bucket+"/"+key {
+			f.fail(w, http.StatusNotFound, "NoSuchUpload", id)
+			return
+		}
+		parts[int32(n)] = body
+		w.Header().Set("ETag", etag(body))
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	src, err := url.PathUnescape(strings.TrimPrefix(r.Header.Get("x-amz-copy-source"), "/"))
 	if err != nil || src == "" {
 		f.fail(w, http.StatusBadRequest, "InvalidArgument", "x-amz-copy-source")

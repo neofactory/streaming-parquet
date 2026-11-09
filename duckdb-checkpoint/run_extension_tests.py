@@ -329,8 +329,8 @@ def remote_objects_are_read_once():
         # not hold every version it ever saw.
         count = "SELECT count(*) FROM read_parquet('pqc://{}')"
         versions = [v2]
-        for k in range(9):
-            hw.checkpoint(make_rows(26040 + k * 10, 10 * (k + 1)))
+        for k in range(9):               # the tail grows: a new version each
+            hw.checkpoint(make_rows(26000, 40 + 10 * (k + 1)))
             versions.append(hw.ckpt_name)
             con.execute(count.format(server.url(hw.ckpt_name))).fetchall()
         server.take()

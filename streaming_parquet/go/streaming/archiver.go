@@ -335,6 +335,8 @@ func (a *archiver) flushRegion(committed int64) error {
 }
 
 func (a *archiver) checkpointTail(committed int64) error {
+	// the whole tail, pinned once: every row since the last row group
+	cursor := a.cursor
 	recs, cleanup, err := a.region(a.cursor, committed)
 	if err != nil {
 		return err
@@ -348,17 +350,47 @@ func (a *archiver) checkpointTail(committed int64) error {
 			return err
 		}
 	}
-	mini, err := a.encodeMini(recs)
-	if err != nil {
-		return err
+	if a.cursor != cursor {
+		// rows at the front of the tail were recycled (region said
+		// so): the objects stored of the tail hold rows it no longer
+		// has. Begin the tail again.
+		a.w.DropUnfinished()
 	}
-	if _, err := a.w.Checkpoint(mini); err != nil {
+	// The writer asks for the rows no object holds yet, or for a merge:
+	// rows [offset, offset+rows) of the tail.
+	_, err = a.w.CheckpointTail(uint64(committed-a.cursor), func(offset, rows uint64) ([]byte, error) {
+		span := sliceRecords(recs, int64(offset), int64(rows))
+		defer func() {
+			for _, r := range span {
+				r.Release()
+			}
+		}()
+		return a.encodeMini(span)
+	})
+	if err != nil {
 		return err
 	}
 	a.durable = committed
 	a.ckptMono = time.Now()
 	a.hasCkptCl = true
 	return nil
+}
+
+// sliceRecords returns rows [offset, offset+rows) of a list of record
+// batches, as slices the caller releases.
+func sliceRecords(recs []arrow.RecordBatch, offset, rows int64) []arrow.RecordBatch {
+	var out []arrow.RecordBatch
+	end := offset + rows
+	var pos int64
+	for _, rec := range recs {
+		n := rec.NumRows()
+		lo, hi := max64(offset-pos, 0), min64(end-pos, n)
+		if lo < hi {
+			out = append(out, rec.NewSlice(lo, hi))
+		}
+		pos += n
+	}
+	return out
 }
 
 // StartParquet begins a recording segment: rows committed from THIS
