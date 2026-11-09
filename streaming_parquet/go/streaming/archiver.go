@@ -136,6 +136,14 @@ func newArchiver(r *ring.Ring, name, run string, o ArchiveOptions) (*archiver, e
 // bootSweep finalizes checkpoints a crashed prior run left behind in
 // this stream's directory.
 // hasCheckpoint reports whether file name has any checkpoint version.
+// FileCutBytes: a file is cut when its row groups reach this many
+// bytes, whenever the host cut it last (the Python FILE_CUT_BYTES).
+// Every decision of the writer is taken by time or by bytes, whichever
+// comes first; the host cuts by time, and a fast stream reaches this
+// first. The reason is the footer: it has an entry for each row group
+// and each column, and it is written at every checkpoint.
+var FileCutBytes uint64 = 256_000_000
+
 func (a *archiver) hasCheckpoint(name string) bool {
 	vs, err := pqc.CkptVersions(a.sink, name)
 	return err != nil || len(vs) > 0 // an unlistable sink: assume taken
@@ -331,6 +339,11 @@ func (a *archiver) flushRegion(committed int64) error {
 	a.hasClock = false
 	a.ckptMono = time.Now()
 	a.hasCkptCl = true
+	if a.w.FileBytes() >= FileCutBytes {
+		// the file is large enough: the next row group begins a new
+		// one, with the same label
+		return a.rotate()
+	}
 	return nil
 }
 

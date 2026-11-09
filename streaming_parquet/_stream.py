@@ -52,6 +52,15 @@ def _get_local_ip():
 # cut(label=KEEP_LABEL): the next file keeps the current label.
 KEEP_LABEL = object()
 
+#: A file is cut when its row groups reach this many bytes, whenever the
+#: host cut it last. Every decision of the writer is taken by time or
+#: by bytes, whichever comes first; the host cuts by time (cut()), and
+#: a fast stream reaches this first. The reason is the footer: it has
+#: an entry for each row group and each column, and it is written at
+#: every checkpoint. At 10,000 rows a second a file left to grow for 3
+#: hours has 879 row groups and a footer of 4 MB.
+FILE_CUT_BYTES = 256_000_000
+
 
 class Stream:
     """A local publishing stream. Create via streaming_parquet.create_stream()."""
@@ -526,6 +535,17 @@ class Stream:
             except Exception as e:
                 self._archive_fail(f"parquet write failed: {e}")
                 return
+            size = parquet.file_bytes()
+            if size >= FILE_CUT_BYTES:
+                # the file is large enough: the next row group begins a
+                # new one, with the same label
+                try:
+                    parquet.rotate()
+                    _diag.info(f"[{self.name}] cut: the file reached "
+                               f"{size:,} bytes")
+                except Exception as e:
+                    self._archive_fail(f"cut at {size} bytes failed: {e}")
+                    return
             if self._remote is None:    # the first copy is the store
                 self._write_ticket()
         self._pool.submit("parquet", self.name, do_write)

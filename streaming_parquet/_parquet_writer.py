@@ -19,7 +19,7 @@ pending finalize. The boot sweep goes through the same path.
 
 import os
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from ._clock import now as _wall_time
 
@@ -70,12 +70,11 @@ class ParquetWriter:
     process via the `.ckpt` object (parquet_checkpoint.live_table).
     """
 
-    DEFAULT_ROTATION_INTERVAL = timedelta(hours=6)
     #: A mirror pass at or over this many seconds is logged with its
     #: per-file, per-phase breakdown at normal verbosity.
     SHIP_SLOW_S = 1.0
 
-    def __init__(self, stream_name, schema, run, base_dir=None, rotation_interval=None,
+    def __init__(self, stream_name, schema, run, base_dir=None,
                  compression="zstd", compression_level=None,
                  sink=None, remote=None,
                  use_dictionary=None, column_encoding=None):
@@ -109,7 +108,6 @@ class ParquetWriter:
         self._compression_level = compression_level
         self._use_dictionary = use_dictionary
         self._column_encoding = column_encoding
-        self._rotation_interval = rotation_interval or self.DEFAULT_ROTATION_INTERVAL
         # The layout, the same under a directory and under a bucket:
         # <root>/streams/<name>/<files>, the ticket at <root>/tickets/<name>.json.
         stream_dir = os.path.join("streams", stream_name)
@@ -484,6 +482,11 @@ class ParquetWriter:
         self._file_path = None
         self._file_opened_at = None
         self._file_opened_tw = None
+
+    def file_bytes(self):
+        """The bytes of the open file's final row groups; 0 with no
+        file open."""
+        return self._writer.bytes_written if self._writer is not None else 0
 
     def rotate(self):
         """Force rotation: finalize the current file and open a new one

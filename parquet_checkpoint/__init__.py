@@ -346,12 +346,19 @@ class CheckpointWriter:
             finalize(self.name, self.sink, keep_checkpoints=keep_checkpoints)
         self._closed = True
         self._rows_final = self._w.rows_final
+        self._bytes_final = self._w.logical_end
         self._w.free()
         return self.name
 
     @property
     def rows_written(self):
         return self._rows_final if self._closed else self._w.rows_final
+
+    @property
+    def bytes_written(self):
+        """The bytes of the file's final row groups so far: its size
+        without the footer."""
+        return self._bytes_final if self._closed else self._w.logical_end
 
     @property
     def rows_checkpointed(self):

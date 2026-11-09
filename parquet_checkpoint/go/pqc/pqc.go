@@ -365,6 +365,10 @@ func (w *Writer) RowsFinal() uint64        { return uint64(C.pqc_rows_final(w.w)
 func (w *Writer) RowsUnfinished() uint64   { return uint64(C.pqc_rows_unfinished(w.w)) }
 func (w *Writer) RowsCheckpointed() uint64 { return w.rowsCk }
 
+// FileBytes is the bytes of the file's final row groups so far: its
+// size without the footer.
+func (w *Writer) FileBytes() uint64 { return uint64(C.pqc_logical_end(w.w)) }
+
 // Close publishes a final checkpoint of the final rows (empty writers
 // get a valid empty file via an empty mini) and finalizes. The writer
 // is freed.
