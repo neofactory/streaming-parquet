@@ -114,14 +114,26 @@ class DirSink:
         return DirSink(os.path.join(self.root, prefix.strip('/')))
 
     def _p(self, name):
-        p = os.path.join(self.root, name)
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        return p
+        return os.path.join(self.root, name)
+
+    def _folder_for(self, path):
+        """Make the folder of `path`. Only a write makes one: a store
+        has no empty folders, and a question (exists, size, list) must
+        not leave one behind."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
 
     def put(self, name, data):
         p = self._p(name)
         tmp = p + '.tmp'
-        with open(tmp, 'wb') as f:
+        for attempt in (0, 1):
+            self._folder_for(p)
+            try:
+                f = open(tmp, 'wb')
+                break
+            except FileNotFoundError:
+                if attempt:             # a delete took the folder in between
+                    raise
+        with f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
@@ -142,6 +154,14 @@ class DirSink:
         p = self._p(name)
         if os.path.exists(p):
             os.remove(p)
+        # an object's folder goes with its last object (a file's
+        # <name>.chunks/): a store has no empty folders
+        folder = os.path.dirname(p)
+        if os.path.abspath(folder) != os.path.abspath(self.root):
+            try:
+                os.rmdir(folder)
+            except OSError:
+                pass                    # not empty, or gone already
 
     def list(self, prefix):
         out = []
@@ -160,6 +180,7 @@ class DirSink:
     def assemble(self, dest, sources):
         """Concatenate sources into dest. Local: no part rules."""
         p = self._p(dest)
+        self._folder_for(p)
         tmp = p + '.tmp'
         with open(tmp, 'wb') as f:
             for name, off, length in sources:
