@@ -337,6 +337,9 @@ become final (and leave the tail) at every `write_table`, so the tail
 never exceeds one row group. A growing tail means the host's row-group
 threshold is too big — fix the cadence, don't cap the tail.
 
+What this costs at each row rate, and the design that replaces the
+re-encoding: [what a checkpoint costs](../docs/checkpoint-cost.md).
+
 ## Not yet
 
 - Multi-file compaction/expiry policy (streaming-parquet's concern).
