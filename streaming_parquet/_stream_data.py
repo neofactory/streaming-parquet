@@ -91,17 +91,6 @@ class _StreamData:
                 f"seq {seq} not yet visible (playback clock)")
         return self.ring.read_row(seq)
 
-    def get_static_relation(self):
-        """Pinned record set over the visible window: every row the
-        ring holds. On a full ring the writer waits until the release
-        (arrow_ring.Ring.get_static_relation)."""
-        rs = self.ring.get_static_relation()
-        if self._playback_clock is not None:
-            visible_hi = self.newest_visible_seq() + 1
-            if visible_hi < rs.hi:
-                rs.clamp_hi(visible_hi)
-        return rs
-
     def pin(self, lo, hi):
         """Pinned record set over exactly [lo, hi), clamped to the
         visible window: the publish and archive paths' pin."""

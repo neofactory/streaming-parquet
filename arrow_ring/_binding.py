@@ -1,7 +1,7 @@
 """CFFI binding: the arrow_ring Python API over the C core.
 
 Same public surface as the retired pure-Python implementation (Ring,
-get_mutable_row/commit/read_row/get_relation, RecordSet, the two
+get_mutable_row/commit/read_row/pin, RecordSet, the two
 errors); the engine is core/libarrow_ring.dylib. Python's jobs here:
 schema metadata (leaf routing, handle classes via _schema/_row), value
 conversion at the boundary (datetime -> ticks, Decimal -> bytes,
@@ -79,7 +79,6 @@ uint64_t ar_var_data_address(const ArRing *ring, int32_t leaf,
                              int64_t elem_seq);
 int32_t ar_pool_segment_count(const ArRing *ring, int32_t leaf);
 int64_t ar_pool_oversized_count(const ArRing *ring, int32_t leaf);
-ArStatus ar_relation(ArRing *ring, ArRecordSet **out);
 ArStatus ar_pin(ArRing *ring, int64_t lo, int64_t hi, ArRecordSet **out);
 int64_t ar_recordset_lo(const ArRecordSet *rs);
 int64_t ar_recordset_hi(const ArRecordSet *rs);
@@ -293,26 +292,25 @@ class Ring:
                 f"seq {seq} recycled (oldest readable is {oldest})")
         return self._read_cls(self, seq)   # a Row's slot IS the seq
 
-    def get_static_relation(self):
-        """Pin every row the ring holds now, as one frozen record set
-        (see README). Yours to release — release(), detach(), or use as
-        a context manager. On a full ring this pin holds the row the
-        writer needs next: the writer waits until the release, and
-        raises PinStalledError, naming the pin, after its block time.
-        A reader that must not make the writer wait names newer rows
-        with pin(lo, hi)."""
+    def pin(self, lo, hi):
+        """Pin the rows [lo, hi) and no others: a frozen record set
+        for a caller that knows which rows it needs (the publish and
+        archive paths: the rows they send or write). The writer meets
+        this pin only after a whole ring of writes, and then the
+        holder is a leak; a pin on the oldest row of a full ring makes
+        the writer wait at once. lo below the oldest readable row is
+        raised to it (rec.lo > lo says rows were recycled); hi above
+        committed is lowered to it. Yours to release — release(),
+        detach(), or use as a context manager."""
         out = ffi.new("ArRecordSet **")
-        _check(lib.ar_relation(self._c, out))
-        return self._record_pin(out[0])
-
-    def _record_pin(self, rs):
-        """The RecordSet for a new C record set, noted with where it
-        was taken so that a stall names its holder."""
+        _check(lib.ar_pin(self._c, int(lo), int(hi), out))
+        rs = out[0]
         rec = RecordSet(self, rs, lib.ar_recordset_lo(rs),
                         lib.ar_recordset_hi(rs))
+        # Noted with where it was taken, so that a stall names its holder.
         now = time.monotonic()
         self._pins[id(rec)] = [rec.lo, rec.hi, now, False,
-                               traceback.extract_stack(limit=10)[:-2]]
+                               traceback.extract_stack(limit=9)[:-1]]
         # A detached pin's end is not observable here (it dies with its
         # table's buffers); keep detached entries 30 s, so that a stall
         # still names a pin detached a moment ago.
@@ -321,19 +319,6 @@ class Ring:
                 if p[3] and now - p[2] > 30.0:
                     del self._pins[k]
         return rec
-
-    def pin(self, lo, hi):
-        """Pin the rows [lo, hi) and no others: a record set for a
-        caller that knows which rows it needs (the publish and archive
-        paths: the rows they send or write). The writer meets this
-        pin only after a whole ring of writes, and then the holder is
-        a leak. lo below the oldest readable row is
-        raised to it (rec.lo > lo says rows were recycled); hi above
-        committed is lowered to it. Yours to release — release(),
-        detach(), or use as a context manager."""
-        out = ffi.new("ArRecordSet **")
-        _check(lib.ar_pin(self._c, int(lo), int(hi), out))
-        return self._record_pin(out[0])
 
     def _pins_report(self):
         """The live pins, oldest first, with where each was taken: the

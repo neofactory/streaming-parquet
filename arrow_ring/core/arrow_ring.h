@@ -13,7 +13,7 @@
  *
  * Threading contract: ONE writer thread per ring (ar_row_*, ar_set_*,
  * ar_commit, ar_append_*). Any number of reader threads (ar_get_*,
- * ar_relation, record sets). Pins are internally synchronized.
+ * ar_pin, record sets). Pins are internally synchronized.
  *
  * Error contract: every fallible call returns ArStatus. Non-AR_OK
  * leaves a detailed, loud message in ar_last_error(ring). There are
@@ -278,22 +278,17 @@ int64_t  ar_pool_oversized_count(const ArRing *ring, int32_t leaf);
 
 /* ---- read side: record sets (pinned, immutable, zero-copy) -------------- */
 
-/* Pin a record set over every committed row the ring holds. The pin is
- * the guarantee: a set that is held never becomes invalid. On a full
- * ring it holds the row the writer needs next, so the writer waits
- * until the release (AR_ERR_PIN_STALLED at ar_row_begin after its
- * block_ms). A reader that must not make the writer wait names newer
- * rows with ar_pin. Referenced var-width segments are held too. An
- * empty window yields an empty set. */
-ArStatus ar_relation(ArRing *ring, ArRecordSet **out);
-
 /* Pin a record set over the rows the caller names, [lo, hi), and no
- * others. The writer meets this pin only when it is a whole ring past
- * the pin's first row (AR_ERR_PIN_STALLED names the range). lo below
- * the oldest readable row is raised to it (the set's lo says so: rows
- * recycled); hi above committed is lowered to it. The publish and
- * archive paths pin this way: the rows they send or write, usually a
- * few. AR_ERR_INVALID when hi < lo. */
+ * others. The pin is the guarantee: a set that is held never becomes
+ * invalid, and the var-width segments it references are held too. The
+ * writer meets this pin only when it is a whole ring past the pin's
+ * first row (AR_ERR_PIN_STALLED names the range): a pin on the oldest
+ * row of a full ring makes the writer wait at once. lo below the
+ * oldest readable row is raised to it (the set's lo says so: rows
+ * recycled); hi above committed is lowered to it; an empty range
+ * yields an empty set that pins nothing. The publish and archive
+ * paths pin the rows they send or write, usually a few.
+ * AR_ERR_INVALID when hi < lo. */
 ArStatus ar_pin(ArRing *ring, int64_t lo, int64_t hi, ArRecordSet **out);
 
 int64_t ar_recordset_lo (const ArRecordSet *rs);  /* first seq          */

@@ -509,26 +509,11 @@ type RecordSet struct {
 	done bool
 }
 
-// StaticRelation pins a record set over every committed row the ring
-// holds. Release (or Detach) it. On a full ring it holds the row the
-// writer needs next: the writer waits until the release, and stalls
-// loudly after its block time. A reader that must not make the writer
-// wait names newer rows with Pin.
-func (r *Ring) StaticRelation() (*RecordSet, error) {
-	var rs *C.ArRecordSet
-	st := C.ar_relation(r.c, &rs)
-	if st != C.AR_OK {
-		return nil, r.err(st)
-	}
-	return &RecordSet{c: rs, ring: r,
-		Lo: int64(C.ar_recordset_lo(rs)),
-		Hi: int64(C.ar_recordset_hi(rs))}, nil
-}
-
 // Pin pins the rows [lo, hi) and no others: the publish and archive
-// paths' record set, the rows they send or write. The writer meets
-// this pin only after a whole ring of writes, and then the holder is a
-// leak. lo below the oldest readable row is raised to it
+// paths' record set, the rows they send or write. Release (or Detach)
+// it. The writer meets this pin only after a whole ring of writes, and
+// then the holder is a leak; a pin on the oldest row of a full ring
+// makes the writer wait at once. lo below the oldest readable row is raised to it
 // (rs.Lo > lo: rows recycled); hi above committed is lowered to it.
 func (r *Ring) Pin(lo, hi int64) (*RecordSet, error) {
 	var rs *C.ArRecordSet

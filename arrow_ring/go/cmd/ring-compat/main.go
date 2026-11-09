@@ -71,7 +71,7 @@ func main() {
 		if _, err := r.Commit(); err != nil {
 			die(err)
 		}
-		rs, err := r.StaticRelation()
+		rs, err := r.Pin(0, r.NewestSeq()+1)
 		if err != nil {
 			die(err)
 		}

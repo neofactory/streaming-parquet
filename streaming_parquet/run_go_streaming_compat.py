@@ -173,7 +173,7 @@ def _():
                 break
             time.sleep(0.05)
         assert a._newest_seq >= 1499, (a.state, a._newest_seq)
-        with a._ring.get_static_relation() as rs:
+        with a._ring.pin(0, a._ring.newest_seq + 1) as rs:   # every row
             t = rs.table
             lo = t.column('n').to_pylist()[0]
             for i, n in enumerate(t.column('n').to_pylist()):
