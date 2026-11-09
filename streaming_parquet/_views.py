@@ -380,16 +380,23 @@ class StoreView:
                     f"read_parquet({quoted}, file_row_number=true) "
                     f"WHERE file_row_number <= {int(last_row)}")
         if use_ring:
-            gone = (f"{self.name}: the ring no longer holds row "
-                    f"{int(seam) + 1}. This query began with the rows up "
-                    f"to {int(seam)} from the store and reached the ring "
-                    f"after the stream had written more rows than the ring "
-                    f"keeps for a running query. Run it again; for longer "
-                    f"queries connect with a larger Memory(lookback=...).")
+            # The view reads the store up to the seam and the ring after
+            # it. If the ring begins past the row after the seam, rows
+            # are in neither: the query fails, it does not answer short.
+            what = (f"{self.name}: the ring does not hold row "
+                    f"{int(seam) + 1}; it begins at row ")
+            why = (". This query read the rows up to "
+                   f"{int(seam)} from the store. Either it reached the ring "
+                   "after the stream had written more rows than the ring "
+                   "keeps for a running query, or this reader connected a "
+                   "moment ago and the store has not reached its first row "
+                   "yet. Run it again; for longer queries connect with a "
+                   "larger Memory(lookback=...).")
             pieces.append(
                 f'SELECT * EXCLUDE (_seq, _first) FROM "{self._mem_name}" '
                 f'WHERE _seq > {int(seam)} AND CASE WHEN _first > '
-                f"{int(seam) + 1} THEN error('" + gone.replace("'", "''")
+                f"{int(seam) + 1} THEN error('" + what.replace("'", "''")
+                + "' || _first || '" + why.replace("'", "''")
                 + "') ELSE true END")
         if not pieces:
             if self._schema is None:

@@ -2323,7 +2323,8 @@ def _():
                     got = con.sql(f"SELECT count(*) FROM {v.name}").fetchall()
                     raise AssertionError(f"the query answered {got}")
                 except duckdb.Error as e:
-                    assert "the ring no longer holds row 600" in str(e), e
+                    assert ("the ring does not hold row 600; it begins "
+                            "at row 750") in str(e), e
                     assert "Memory(lookback" in str(e), e
             # the view follows again, and every row is there
 
