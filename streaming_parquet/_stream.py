@@ -30,7 +30,7 @@ import pyarrow as pa
 import parquet_checkpoint
 
 from ._diag import _diag, console_print
-from ._options import Memory, Archive, ArchiveState, MirrorState, MemoryState
+from ._options import MemoryOptions, ParquetOptions, ArchiveState, MirrorState, MemoryState
 from ._stream_data import _StreamData
 from ._worker_pool import get_pool
 from . import _tickets
@@ -72,20 +72,20 @@ class Stream:
     HEARTBEAT_MAX_WAIT_S = 60.0
 
     def __init__(self, name, schema, flight_server, port, run,
-                 memory=None, archive=None, store=None, writer=None,
+                 memory=None, parquet=None, store=None, writer=None,
                  owner=None):
         """`run`: this writer's start time (_clock.run_start()), the same
         value the writer records in its files. `writer`: the
         ParquetWriter the caller built for this stream's store and
         spool, or None for a stream that keeps no files. `owner`: the
         held ownership (_owner.claim), released at close."""
-        memory = memory or Memory()
+        memory = memory or MemoryOptions()
         self.name = name
         self.schema = schema
         self._memory = memory
-        self._archive = archive
+        self._archive = parquet
         self._store = store
-        row_group_rows = archive.row_group_rows if archive else None
+        row_group_rows = parquet.row_group_rows if parquet else None
         ring_rows, row_group_rows = _ring_sizes(name, memory.lookback,
                                                 row_group_rows)
         self._data = _StreamData(name, schema, capacity=ring_rows,
@@ -105,7 +105,7 @@ class Stream:
         # writer's thread, the pool and a host thread may call them.
         self._lock = threading.Lock()
 
-        a = archive or Archive()
+        a = parquet or ParquetOptions()
         self._parquet = writer              # None: no files, ever
         self._recording = writer is not None
         # The archive's standing: the first copy's last failure, and rows
@@ -626,7 +626,7 @@ class Stream:
         stays live throughout."""
         if self._parquet is None:
             raise ValueError(f"stream {self.name!r} has no archive: created "
-                             f"with archive=None")
+                             f"with parquet=None")
         with self._lock:
             self._pq_cursor = self._ring.newest_seq + 1
             self._pq_durable = self._pq_cursor

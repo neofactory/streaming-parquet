@@ -31,7 +31,7 @@ type Stream struct {
 type StreamOptions struct {
 	RingRows int64 // ring rows; see ringSizes for the default
 	Parquet  bool  // recording gate at creation (StartParquet later works too)
-	Archive  ArchiveOptions
+	Archive  ParquetOptions
 }
 
 func (t *Telemetry) CreateStream(name string, schema *arrow.Schema,

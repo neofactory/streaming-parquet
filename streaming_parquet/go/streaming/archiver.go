@@ -51,7 +51,8 @@ type archiver struct {
 	hasCkptCl  bool
 }
 
-type ArchiveOptions struct {
+// ParquetOptions says how a stream's rows are written to parquet.
+type ParquetOptions struct {
 	BaseDir           string   // parquet lands in <BaseDir>/parquet
 	Sink              pqc.Sink // where chunks, the checkpoint and finished files live; nil = a directory sink under BaseDir
 	RowGroupRows      int64    // rows per row group; see ringSizes for the default
@@ -60,6 +61,12 @@ type ArchiveOptions struct {
 	Compression       string   // "zstd" (default, level 9) | "snappy" | "none"
 	Dictionary        []string // top-level columns to dictionary-encode; default none
 }
+
+// ArchiveOptions is the old name of ParquetOptions.
+//
+// Deprecated: use ParquetOptions. Removed on or after 2027-02-11
+// (docs/deprecations.md).
+type ArchiveOptions = ParquetOptions
 
 // defaultRowGroupRows is DuckDB's row group, 60 of its 2,048-row
 // vectors: DuckDB, the archive's main reader, reads row groups in
@@ -91,7 +98,7 @@ func ringSizes(name string, ringRows, rowGroupRows int64) (int64, int64, error) 
 }
 
 // newArchiver takes o.RowGroupRows as settled by ringSizes.
-func newArchiver(r *ring.Ring, name, run string, o ArchiveOptions) (*archiver, error) {
+func newArchiver(r *ring.Ring, name, run string, o ParquetOptions) (*archiver, error) {
 	// The layout, the same under a directory and under a bucket:
 	// <root>/streams/<name>/<files>, the ticket at <root>/tickets/<name>.json.
 	var sink pqc.Sink

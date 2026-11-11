@@ -2,9 +2,13 @@
 
 Options, given once at create_stream / attach:
 
-    Memory(lookback, maximum, segment_bytes)
-    Archive(checkpoint_seconds, row_group_rows, row_group_seconds,
-            ship_seconds, parquet)
+    MemoryOptions(lookback, maximum, segment_bytes)
+    ParquetOptions(checkpoint_seconds, row_group_rows, row_group_seconds,
+                   ship_seconds, compression, catalog_copy_seconds)
+
+A name that ends in Options is given; a name that ends in State is read
+back. Memory and Archive are the old names of the two options (see
+_deprecations).
 
 Results, read whenever a host wants them:
 
@@ -20,9 +24,11 @@ AttributeError at the call site, not a KeyError somewhere later.
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from ._deprecations import old_name
+
 
 @dataclass(frozen=True)
-class Memory:
+class MemoryOptions:
     """How much a stream keeps in memory.
 
     lookback: rows the ring holds (on this core a row count; the V2B
@@ -39,20 +45,20 @@ class Memory:
 
 
 @dataclass(frozen=True)
-class Archive:
+class ParquetOptions:
     """How a stream's rows are written to parquet. Where is the store
     and the spool, given to create_stream; this is the tuning.
 
     checkpoint_seconds: the tail-checkpoint cadence; crash loss is at
             most this many seconds. None = durability per row group.
     row_group_rows: rows per parquet row group. None = DuckDB's
-            122,880. Also sizes the ring at two row groups when Memory
+            122,880. Also sizes the ring at two row groups when MemoryOptions
             gives no lookback.
     row_group_seconds: also end a row group after this long. None =
             size-bound only.
     ship_seconds: cadence of the pass that moves the spool's files to a
             bucket store.
-    parquet: dict forwarded to the parquet writer (compression,
+    compression: dict forwarded to the parquet writer (compression,
             compression_level, use_dictionary, column_encoding).
     catalog_copy_seconds: the interval of the catalog's dated copies,
             catalog.<YYYYMMDD-HHMMSS>.ducklake beside it, each made only
@@ -62,8 +68,27 @@ class Archive:
     row_group_rows: Optional[int] = None
     row_group_seconds: Optional[float] = None
     ship_seconds: float = 5.0
-    parquet: dict = field(default_factory=dict)
+    compression: dict = field(default_factory=dict)
     catalog_copy_seconds: Optional[float] = 86400.0
+
+
+def Memory(*args, **kwargs):
+    """The old name of MemoryOptions."""
+    old_name("Memory")
+    return MemoryOptions(*args, **kwargs)
+
+
+def Archive(*args, **kwargs):
+    """The old name of ParquetOptions. Its `parquet` field is
+    ParquetOptions' `compression`."""
+    old_name("Archive")
+    if "parquet" in kwargs:
+        old_name("Archive(parquet=...)")
+        if "compression" in kwargs:
+            raise TypeError("Archive: parquet and compression are one "
+                            "field under two names; give compression")
+        kwargs["compression"] = kwargs.pop("parquet")
+    return ParquetOptions(*args, **kwargs)
 
 
 @dataclass(frozen=True)

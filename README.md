@@ -49,7 +49,8 @@ needs no build.
 - `<pkg>/run_*.py` — standalone suites: unit, stress, cross-language
   parity
 - `docs/` — documents that cross the packages:
-  [what a checkpoint costs](docs/checkpoint-cost.md)
+  [what a checkpoint costs](docs/checkpoint-cost.md),
+  [old names and when they stop](docs/deprecations.md)
 
 ## Open question: native implementations
 

@@ -109,7 +109,7 @@ def _():
 @test("Python publisher -> Go attach + Go archives parquet while attached")
 def _():
     with tempfile.TemporaryDirectory() as tmp:
-        s = sp.create_stream('x/pypub', SCHEMA, store=ROOT, memory=sp.Memory(lookback=8000))
+        s = sp.create_stream('x/pypub', SCHEMA, store=ROOT, memory=sp.MemoryOptions(lookback=8000))
         child = subprocess.Popen(
             [BIN, 'attach', ROOT, 'x/pypub', '2500', tmp, 'XLNG'],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -197,7 +197,7 @@ def _():
 @test("type matrix Python -> Go: the same values verified by Go getters")
 def _():
     s = sp.create_stream('x/rich-py', RICH, store=ROOT,
-                                memory=sp.Memory(lookback=20000))
+                                memory=sp.MemoryOptions(lookback=20000))
     child = subprocess.Popen(
         [BIN, 'attach-rich', ROOT, 'x/rich-py', '1200'],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

@@ -96,7 +96,7 @@ tier or mode.
   must hold the unfinished row group and the rows written during the
   store's lag. The default ring, two row groups, does that below about
   3,000 rows per second; a view whose ring is too short says so
-  (`ring_note`) and names the `Memory(lookback=...)` to set.
+  (`ring_note`) and names the `MemoryOptions(lookback=...)` to set.
 
 ## The margins
 
@@ -360,7 +360,7 @@ against the files in the store, so a crash, a leftover or files from
 before the catalog all come out the same way. A long pass reports its
 progress; a stream's close stops it between two files. Dated copies,
 `catalog.<YYYYMMDD-HHMMSS>.ducklake`, are made at
-`Archive(catalog_copy_seconds)` (a day) only when the catalog changed.
+`ParquetOptions(catalog_copy_seconds)` (a day) only when the catalog changed.
 DuckDB reads the store with boto3's credentials (an assumed role
 included). The files are the source of truth; the catalog can be
 rebuilt from their footers.
@@ -383,11 +383,11 @@ Everything here is in the parquet spec; any reader of these files must
 read BYTE_STREAM_SPLIT, which DuckDB has since 2023 and pyarrow since
 2.0. zstd 9 costs more CPU per written byte than snappy.
 
-`Archive(parquet={...})` lays a stream's options over the defaults,
+`ParquetOptions(compression={...})` lays a stream's options over the defaults,
 Python: `use_dictionary` (the columns to dictionary-encode, which then
 drop their default encoding), `column_encoding` ({column path:
 encoding}), `compression`, `compression_level` (9 applies to zstd only).
-Go: `ArchiveOptions.Dictionary`, `Compression`.
+Go: `ParquetOptions.Dictionary`, `Compression`.
 
 ## Ownership
 
@@ -405,7 +405,7 @@ prefix) or a whole directory, whose contents are the layout. A bucket
 store is written through the spool, the local write-behind copy at
 `/var/tmp/streaming-parquet/<user>/` unless `spool=` says where, or
 `spool=None` for the bucket as the only copy; a directory store is
-written straight into. The Go host's `ArchiveOptions.Sink` is the same
+written straight into. The Go host's `ParquetOptions.Sink` is the same
 first-copy idea. Severity follows the shape: the first copy failing
 means rows are durable nowhere but the ring, and `archive_state()`
 says so (`failing`, the last error, `lost_rows` for rows recycled
@@ -458,16 +458,18 @@ one of the reader verbs, and it all just works.
 $STREAMING_PARQUET_DIAG_LOG    # diag log file, opened at import;
                                # default telemetry-diag.log in the cwd
 STORE = "s3://my-bucket"    # a whole bucket, or a whole directory; no prefix
-create_stream(name, schema, store=STORE, spool=DEFAULT_SPOOL, memory=Memory(...), archive=Archive(...))
+create_stream(name, schema, store=STORE, spool=DEFAULT_SPOOL, memory=MemoryOptions(...), parquet=ParquetOptions(...))
     # name: the stream's whole path under the store (files at streams/<name>/,
     #       ticket at tickets/<name>.json)
     # spool: the local write-behind copy a bucket store writes through;
     #        default /var/tmp/streaming-parquet/<user>/, None for none
-    # Memory(lookback, maximum, segment_bytes): rows on this core
-    # Archive(checkpoint_seconds, row_group_rows, row_group_seconds, ship_seconds,
-    #         catalog_copy_seconds, parquet): tuning; None = memory only
+    # MemoryOptions(lookback, maximum, segment_bytes): rows on this core
+    # ParquetOptions(checkpoint_seconds, row_group_rows, row_group_seconds, ship_seconds,
+    #         catalog_copy_seconds, compression): tuning; None = memory only
+    # Memory, Archive, archive= and Archive(parquet=) are old names that
+    # still work: docs/deprecations.md
 create_playback_stream(name, parquet_path, timestamp_column, latency_s, memory)
-connect(name | ticket, store=STORE, memory=Memory(...), columns)
+connect(name | ticket, store=STORE, memory=MemoryOptions(...), columns)
 list_streams(store=STORE)
 cut(label) / start_parquet(label) / stop_parquet()     # every local stream
 streams ; close()
@@ -505,8 +507,8 @@ import pyarrow as pa
 import streaming_parquet as sp
 
 s = sp.create_stream(name, pa.schema([...]), store="s3://my-bucket",
-                     memory=sp.Memory(lookback=200_000),
-                     archive=sp.Archive(checkpoint_seconds=15, ship_seconds=15))
+                     memory=sp.MemoryOptions(lookback=200_000),
+                     parquet=sp.ParquetOptions(checkpoint_seconds=15, ship_seconds=15))
 row = s.get_mutable_row()            # the ring vocabulary
 row.servo.pos = 100                  # struct leaves; strings; lists
 s.commit()                           # visible at once; the pool does the rest
@@ -559,12 +561,12 @@ because the parquet path consumes a ring and does not care whose.
 tel, _ := streaming.Init(streaming.Config{Root: "/data/streams"})
 s, _ := tel.CreateStream("press/fieldbus", schema,
         streaming.StreamOptions{
-            Archive: streaming.ArchiveOptions{BaseDir: dir,
+            Archive: streaming.ParquetOptions{BaseDir: dir,
                 CheckpointSeconds: 2}})
-// The ring holds two row groups: RingRows and ArchiveOptions.RowGroupRows
+// The ring holds two row groups: RingRows and ParquetOptions.RowGroupRows
 // default to 245,760 and DuckDB's 122,880; give one and the other
 // follows; a ring under two row groups is refused.
-// Archive on S3 instead: ArchiveOptions{Sink: pqc.NewS3Sink(s3client,
+// Archive on S3 instead: ParquetOptions{Sink: pqc.NewS3Sink(s3client,
 // bucket, prefix), CheckpointSeconds: 2} — chunks are the 5 MiB part
 // minimum, the checkpoint is the durable tail between them.
 // write via s.Ring() (RowBegin/Set*/Commit, wire maps);
@@ -575,7 +577,7 @@ r, _ := a.WaitRing(5 * time.Second)   // local ring fed by Flight
 a.StartParquet("cal-run")             // symmetric archival
 ```
 
-`ArchiveOptions.Sink` is the root the archive lives under (a bucket,
+`ParquetOptions.Sink` is the root the archive lives under (a bucket,
 or nil for a directory at BaseDir); the stream places its files at
 `streams/<name>/` inside it (`Sink.Sub`), and the ticket's archive
 field is that location (`Sink.URI`). A caller that used to pass the

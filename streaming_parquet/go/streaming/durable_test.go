@@ -26,7 +26,7 @@ func TestDurableFollowsTheCheckpoint(t *testing.T) {
 	}
 	s, err := tel.CreateStream("t/durable", testSchema(),
 		StreamOptions{RingRows: 2000, Parquet: true,
-			Archive: ArchiveOptions{BaseDir: t.TempDir(), CheckpointSeconds: 0.05}})
+			Archive: ParquetOptions{BaseDir: t.TempDir(), CheckpointSeconds: 0.05}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,12 +79,12 @@ func TestRingHoldsTwoRowGroups(t *testing.T) {
 	}
 	defer tel.Close()
 	_, err = tel.CreateStream("t/small", testSchema(), StreamOptions{RingRows: 1999,
-		Archive: ArchiveOptions{BaseDir: t.TempDir(), RowGroupRows: 1000}})
+		Archive: ParquetOptions{BaseDir: t.TempDir(), RowGroupRows: 1000}})
 	if err == nil || !strings.Contains(err.Error(), "less than two row groups") {
 		t.Fatalf("CreateStream: %v, want the ring refused", err)
 	}
 	if _, err := tel.Attach("t/small", AttachOptions{RingRows: 1999,
-		Archive: ArchiveOptions{RowGroupRows: 1000}}); err == nil {
+		Archive: ParquetOptions{RowGroupRows: 1000}}); err == nil {
 		t.Fatal("Attach accepted a ring under two row groups")
 	}
 }
@@ -99,7 +99,7 @@ func TestCheckpointSkipsWhenNothingNew(t *testing.T) {
 	defer tel.Close()
 	dir := t.TempDir()
 	s, err := tel.CreateStream("t/idle", testSchema(), StreamOptions{RingRows: 2000, Parquet: true,
-		Archive: ArchiveOptions{BaseDir: dir, CheckpointSeconds: 0.05}})
+		Archive: ParquetOptions{BaseDir: dir, CheckpointSeconds: 0.05}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestFileIsCutByBytes(t *testing.T) {
 	dir := t.TempDir()
 	s, err := tel.CreateStream("t/bytecut", testSchema(),
 		StreamOptions{RingRows: 400, Parquet: true,
-			Archive: ArchiveOptions{BaseDir: dir, RowGroupRows: 200, Compression: "none"}})
+			Archive: ParquetOptions{BaseDir: dir, RowGroupRows: 200, Compression: "none"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +212,7 @@ func TestTicketSaysWhenItIsStale(t *testing.T) {
 	}
 	defer tel.Close()
 	s, err := tel.CreateStream("t/stale", testSchema(), StreamOptions{RingRows: 2000,
-		Archive: ArchiveOptions{BaseDir: t.TempDir()}})
+		Archive: ParquetOptions{BaseDir: t.TempDir()}})
 	if err != nil {
 		t.Fatal(err)
 	}

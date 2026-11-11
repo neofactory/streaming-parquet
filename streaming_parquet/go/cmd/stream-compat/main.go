@@ -94,7 +94,7 @@ func main() {
 		hold, _ := strconv.ParseFloat(os.Args[5], 64)
 		s, err := tel.CreateStream(name, schemaRich(),
 			streaming.StreamOptions{RingRows: int64(rows) * 2,
-				Archive: streaming.ArchiveOptions{BaseDir: os.TempDir()}})
+				Archive: streaming.ParquetOptions{BaseDir: os.TempDir()}})
 		if err != nil {
 			die(err)
 		}
@@ -211,7 +211,7 @@ func main() {
 		hold, _ := strconv.ParseFloat(os.Args[5], 64)
 		s, err := tel.CreateStream(name, schemaNX(),
 			streaming.StreamOptions{RingRows: int64(rows) * 2,
-				Archive: streaming.ArchiveOptions{BaseDir: os.TempDir()}})
+				Archive: streaming.ParquetOptions{BaseDir: os.TempDir()}})
 		if err != nil {
 			die(err)
 		}
@@ -283,7 +283,7 @@ func main() {
 		hold, _ := strconv.ParseFloat(os.Args[5], 64)
 		s, err := tel.CreateStream(name, schema(),
 			streaming.StreamOptions{RingRows: int64(rows) * 2,
-				Archive: streaming.ArchiveOptions{
+				Archive: streaming.ParquetOptions{
 					BaseDir: os.TempDir()}})
 		if err != nil {
 			die(err)
@@ -320,7 +320,7 @@ func main() {
 			pqdir, label = os.Args[5], os.Args[6]
 		}
 		a, err := tel.Attach(name, streaming.AttachOptions{
-			Archive: streaming.ArchiveOptions{BaseDir: pqdir,
+			Archive: streaming.ParquetOptions{BaseDir: pqdir,
 				RowGroupRows: 500, CheckpointSeconds: 0.1}})
 		if err != nil {
 			die(err)

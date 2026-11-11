@@ -32,7 +32,7 @@ type Attached struct {
 	mu      sync.Mutex
 	ring    *ring.Ring
 	arch    *archiver
-	archOpt ArchiveOptions
+	archOpt ParquetOptions
 	armed   atomic.Bool // StartParquet requested (possibly pre-schema)
 	label   string
 
@@ -47,7 +47,7 @@ type AttachOptions struct {
 	RingRows int64    // local ring rows; see ringSizes for the default
 	Columns  []string // subset subscription; nil = all
 	Ticket   *Ticket  // dial directly, skipping root discovery
-	Archive  ArchiveOptions
+	Archive  ParquetOptions
 }
 
 // Attach opens the read face. Remote: a feeder goroutine waits for a

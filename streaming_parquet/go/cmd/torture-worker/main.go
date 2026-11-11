@@ -123,9 +123,9 @@ func main() {
 func runPub(tel *streaming.Telemetry, name, kind string, rate int,
 	rng *rand.Rand, archdir string, deadline time.Time,
 	stop chan os.Signal) {
-	arch := streaming.ArchiveOptions{BaseDir: os.TempDir()}
+	arch := streaming.ParquetOptions{BaseDir: os.TempDir()}
 	if archdir != "-" {
-		arch = streaming.ArchiveOptions{BaseDir: archdir,
+		arch = streaming.ParquetOptions{BaseDir: archdir,
 			RowGroupSeconds: 3, CheckpointSeconds: 0.7,
 			RowGroupRows: int64(rate) * 3}
 	}
@@ -219,9 +219,9 @@ done:
 func runSub(tel *streaming.Telemetry, name, kind string, rate int,
 	rng *rand.Rand, archdir string, deadline time.Time,
 	stop chan os.Signal) {
-	arch := streaming.ArchiveOptions{BaseDir: os.TempDir()}
+	arch := streaming.ParquetOptions{BaseDir: os.TempDir()}
 	if archdir != "-" {
-		arch = streaming.ArchiveOptions{BaseDir: archdir,
+		arch = streaming.ParquetOptions{BaseDir: archdir,
 			RowGroupSeconds: 3, CheckpointSeconds: 0.7,
 			RowGroupRows: int64(rate) * 3}
 	}
