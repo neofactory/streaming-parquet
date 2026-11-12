@@ -2605,6 +2605,26 @@ def _():
         assert off.parquet_options is None
 
 
+@test("module start_parquet with options starts every stream, with those options")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        on = sp.create_stream("v2test/all-on", SCHEMA, store=tmp,
+                              memory=MemoryOptions(lookback=500),
+                              parquet=ParquetOptions())
+        off = sp.create_stream("v2test/all-off", SCHEMA, store=tmp,
+                               memory=MemoryOptions(lookback=500))
+        given = ParquetOptions(checkpoint_seconds=3.0)
+        sp.start_parquet("M", options=given)
+        fill(on, 5)
+        fill(off, 5)
+        wait_for(lambda: on.parquet_options == given and off.parquet_options == given,
+                 what="both streams holding the given options")
+        sp.close()
+        for name in ("v2test/all-on", "v2test/all-off"):
+            got = files_rows(os.path.join(tmp, "streams", name))
+            assert list(got.values()) == [list(range(5))], (name, got)
+
+
 @test("new options change the ticket's beat")
 def _():
     with tempfile.TemporaryDirectory() as tmp:

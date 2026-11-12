@@ -474,7 +474,7 @@ create_stream(name, schema, store=STORE, spool=DEFAULT_SPOOL, memory=MemoryOptio
 create_playback_stream(name, parquet_path, timestamp_column, latency_s, memory)
 connect(name | ticket, store=STORE, memory=MemoryOptions(...), columns)
 list_streams(store=STORE)
-cut(label) / start_parquet(label, options) / stop_parquet()   # every local stream that has parquet options
+cut(label) / start_parquet(label, options) / stop_parquet()   # the local streams
 streams ; close()
 
 Stream (writing): get_mutable_row(block_s) commit()
@@ -572,8 +572,9 @@ file was open are in no file. `options` replaces the stream's options
 whole, from that file on; without it the stream uses the options it has,
 or the defaults. `stop_parquet()` ends the file and keeps the options.
 The ring is sized at creation, so a later row group it cannot hold is
-refused. The module's `start_parquet` acts on every local stream that
-has options and leaves the others alone.
+refused. The module's `start_parquet` with options acts on every local
+stream; without options it acts on the streams that have some and
+leaves the others alone.
 
 ## Go host (go/streaming)
 

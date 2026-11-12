@@ -424,16 +424,17 @@ def cut(label=KEEP_LABEL):
 
 
 def start_parquet(label=None, options=None):
-    """Start a new file on every local stream that has parquet options:
-    each opens a fresh file with `label` in its name, holding the rows
-    committed from this moment. `options` (a ParquetOptions) replaces
-    each such stream's options. A stream created with parquet=None and
-    never started is left alone: start it by itself, Stream.start_parquet.
-    Readers are unaffected."""
+    """Start a new file on the local streams: each opens a fresh file
+    with `label` in its name, holding the rows committed from this
+    moment. Readers are unaffected.
+
+    With `options` (a ParquetOptions): every local stream, and each gets
+    those options. Without: the streams that have parquet options; a
+    stream that has none wants no files and is left alone."""
     with _lock:
         stream_list = list(_streams.values())
     for stream in stream_list:
-        if stream.parquet_options is not None:
+        if options is not None or stream.parquet_options is not None:
             stream.start_parquet(label=label, options=options)
 
 
