@@ -19,3 +19,4 @@ fuzz_standln
 build/
 dist/
 .venv/
+fuzz_bin

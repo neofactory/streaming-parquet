@@ -146,12 +146,43 @@ def stale_after(ticket):
     (parquet_checkpoint.dead_after). A ticket that does not say gets
     the rule for a writer with no beat."""
     promised = ticket.get("stale_after")
-    if promised is None:
-        return parquet_checkpoint.dead_after()
-    return float(promised)
+    answer = (parquet_checkpoint.dead_after() if promised is None
+              else float(promised))
+    if CHECK_CORE:
+        from . import _core
+        core = _core.ticket_stale_after(ticket, parquet_checkpoint.dead_after())
+        if core != answer:
+            raise AssertionError(f"the core's stale_after is {core}, this "
+                                 f"module's {answer}, for {ticket}")
+        core_checks[0] += 1
+    return answer
+
+
+#: Side by side with the stream core (core/sp.c). While this is set, every
+#: ticket this module writes and every stale_after it answers is also
+#: done by the core, and a difference raises. The suite sets it; it goes
+#: when the core's ticket is the only one. [compared, differences]
+CHECK_CORE = bool(os.environ.get("STREAMING_PARQUET_CHECK_CORE"))
+core_checks = [0]
+
+
+def _check_core_ticket(ticket):
+    """The core writes and reads this ticket as this module does."""
+    from . import _core
+    written = json.loads(_core.ticket_text(ticket))
+    if written != ticket:
+        raise AssertionError(f"the core writes this ticket differently:\n"
+                             f"  python {ticket}\n  core   {written}")
+    read = _core.ticket_from_text(json.dumps(ticket))
+    if read != ticket:
+        raise AssertionError(f"the core reads this ticket differently:\n"
+                             f"  python {ticket}\n  core   {read}")
+    core_checks[0] += 1
 
 
 def put_ticket(store, name, ticket):
+    if CHECK_CORE:
+        _check_core_ticket(ticket)
     _store_for(store).put(name, ticket)
 
 

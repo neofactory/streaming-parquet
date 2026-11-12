@@ -23,6 +23,7 @@ import pyarrow.parquet as pq
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+os.environ["STREAMING_PARQUET_CHECK_CORE"] = "1"   # the core beside this code
 import streaming_parquet as sp
 import parquet_checkpoint  # noqa: E402 (path set above)
 
@@ -2817,6 +2818,36 @@ def _():
     want = {old: (new, _deprecations.DEPRECATED_ON, _deprecations.REMOVED_AFTER)
             for old, new in _deprecations.OLD_NAMES.items()}
     assert rows == want, (rows, want)
+
+
+print("\n--- the stream core, side by side ---")
+
+@test("the core wrote and read every ticket of this suite as the Python code did")
+def _():
+    assert sp._tickets.CHECK_CORE
+    n = sp._tickets.core_checks[0]
+    assert n > 200, f"only {n} comparisons with the core were made"
+    print(f"        {n} comparisons, no difference", flush=True)
+
+
+@test("the core refuses a ticket with a member of the wrong kind, naming it")
+def _():
+    from streaming_parquet import _core
+    for text, reason in (('{"port": "8815"}', "port is not a number"),
+                         ('{"name": 5}', "name is not text"),
+                         ('[1]', "not a JSON object"),
+                         ('{"files": [{"rows": 1}]}', "no checkpoint")):
+        try:
+            _core.ticket_from_text(text)
+        except _core.TicketError as e:
+            assert reason in str(e), (text, e)
+        else:
+            raise AssertionError(f"{text} was read")
+    old = _core.ticket_from_text('{"name": "a", "host": "h", "port": 1, '
+                                 '"ts": 5.0, "archive": "s3://b/x", "new": [1]}')
+    assert old["archive"] == "s3://b/x" and old["run"] is None
+    assert _core.ticket_is_stale(old, 35.0, 30.0)
+    assert not _core.ticket_is_stale(old, 34.9, 30.0)
 
 
 # ---------------------------------------------------------------------------
