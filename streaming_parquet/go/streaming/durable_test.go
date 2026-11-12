@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/parquet/file"
+	"github.com/neofactory/streaming-parquet/arrow_ring/go/ring"
 	"github.com/neofactory/streaming-parquet/parquet_checkpoint/go/pqc"
 )
 
@@ -434,5 +435,55 @@ func TestPublishedOrInternal(t *testing.T) {
 	writeRows(t, s, 10, 5) // the stream itself goes on
 	if got := s.Ring().NewestSeq(); got != 14 {
 		t.Fatalf("newest seq %d, want 14", got)
+	}
+}
+
+// Commit pins the rows of a write that is due. A writer that comes a
+// whole ring around to rows not yet written waits at that pin, and no
+// row is lost; when the store works again every row is written.
+func TestWriterWaitsForRowsNotYetWritten(t *testing.T) {
+	tel, err := Init(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tel.Close()
+	dir := t.TempDir()
+	s, err := tel.CreateStream("t/wait", testSchema(), StreamOptions{RingRows: 400,
+		Parquet: &ParquetOptions{BaseDir: dir, RowGroupRows: 200}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	folder := filepath.Join(dir, "streams", "t", "wait")
+	if err := os.Chmod(folder, 0o500); err != nil { // the store fails
+		t.Fatal(err)
+	}
+	defer os.Chmod(folder, 0o700)
+	writeRows(t, s, 0, 200)   // one row group due: pinned, its write fails
+	writeRows(t, s, 200, 200) // a second: the ring is full of unwritten rows
+	waitUntil(t, "the fault", func() bool { return s.ArchiveState().Failing })
+	_, err = s.Ring().RowBegin(50 * time.Millisecond)
+	if !ring.IsPinStalled(err) {
+		t.Fatalf("a row into a ring of unwritten rows: %v, want the writer to wait at the pin", err)
+	}
+	if st := s.ArchiveState(); st.LostRows != 0 || s.Durable() != 0 {
+		t.Fatalf("while the store fails: %+v, durable %d", st, s.Durable())
+	}
+	if err := os.Chmod(folder, 0o700); err != nil { // the store works again
+		t.Fatal(err)
+	}
+	waitUntil(t, "every row written", func() bool { return s.Durable() == 400 })
+	writeRows(t, s, 400, 10) // and the writer goes on
+	if st := s.ArchiveState(); st.Failing || st.LostRows != 0 {
+		t.Fatalf("after the store recovered: %+v", st)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rows := 0
+	for _, got := range fileRows(t, folder) {
+		rows += len(got)
+	}
+	if rows != 410 {
+		t.Fatalf("the files hold %d rows, want 410", rows)
 	}
 }

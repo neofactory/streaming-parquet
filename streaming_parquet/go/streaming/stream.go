@@ -28,13 +28,18 @@ type Stream struct {
 	ringRows int64
 	run      string // the writer's start time; the ticket's run, every file's sp_run
 
-	// The parquet path. The work goroutine and the calls a host makes
-	// (StartParquet, StopParquet, Close) all take mu.
+	// The parquet path, under two locks. mu is cheap: it covers the plan
+	// (which rows are due, their pins, the queue of writes owed) and is
+	// never held across I/O, so Commit takes it. io is held across a
+	// write. A call that needs both (StartParquet, StopParquet, Close)
+	// takes io first, then mu.
 	mu       sync.Mutex
+	io       sync.Mutex
 	arch     *archiver       // nil until a StartParquet
 	parquet  *ParquetOptions // the options the files are written with; nil = none yet
 	failing  bool            // the last write failed
 	errText  string
+	file     string       // the file open right now, "" when none is
 	location atomic.Value // string: where the files land, "" before any
 	durable  atomic.Int64 // first seq not yet in a file or a checkpoint
 
@@ -117,22 +122,39 @@ func (e *DupStreamError) Error() string {
 func (s *Stream) Ring() *ring.Ring { return s.ring }
 
 // Commit freezes the rows written since the last Commit and returns how
-// many. Readers see them at once. Nothing slow runs here: the stream's
-// goroutine writes the parquet files. Call it also after a bulk append
-// on the ring, which commits by itself: it wakes the readers and the
-// goroutine.
+// many. Readers see them at once. If a row group or a checkpoint is due,
+// Commit pins its rows and hands them to the stream's goroutine, which
+// writes them: nothing slow runs here. Call it also after a bulk append
+// on the ring, which commits by itself.
 func (s *Stream) Commit() (int64, error) {
 	n, err := s.ring.Commit()
 	s.tel.flight.notify(s.Name)
-	select {
-	case s.wake <- struct{}{}:
-	default: // a wake is already waiting
-	}
+	s.plan()
 	return n, err
 }
 
-// work is the stream's goroutine: woken by a commit, or by the time a
-// checkpoint or a row group is due, it advances the parquet files.
+// plan hands the goroutine the rows of a write that is due, pinned.
+func (s *Stream) plan() {
+	s.mu.Lock()
+	owed := false
+	if s.arch != nil {
+		if err := s.arch.plan(); err != nil {
+			s.fault(err)
+		}
+		owed = len(s.arch.queue) > 0
+	}
+	s.mu.Unlock()
+	if owed {
+		select {
+		case s.wake <- struct{}{}:
+		default: // a wake is already waiting
+		}
+	}
+}
+
+// work is the stream's goroutine: it writes what Commit hands it. With
+// no commit it wakes when a checkpoint or a row group is due by time,
+// and to try again a write that failed.
 func (s *Stream) work() {
 	defer s.workDone.Done()
 	timer := time.NewTimer(s.workWait())
@@ -143,8 +165,10 @@ func (s *Stream) work() {
 			return
 		case <-s.wake:
 		case <-timer.C:
+			s.tel.flight.notify(s.Name) // rows committed on the ring directly
+			s.plan()
 		}
-		s.step()
+		s.write()
 		if !timer.Stop() {
 			select {
 			case <-timer.C:
@@ -157,8 +181,7 @@ func (s *Stream) work() {
 
 // workWait is how long the goroutine sleeps with no commit: half the
 // shortest time-driven cadence of the files, and at most the second a
-// waiting Flight reader waits (waitFor), so rows committed on the ring
-// directly are picked up as soon as a reader would ask again.
+// waiting Flight reader waits (waitFor).
 func (s *Stream) workWait() time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -178,31 +201,58 @@ func (s *Stream) workWait() time.Duration {
 	return wait
 }
 
-func (s *Stream) step() {
-	s.tel.flight.notify(s.Name)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.arch != nil {
-		s.note(s.arch.step())
+// write does the writes owed, oldest first, until none is left or one
+// fails. A write that fails stays at the head, its rows pinned, and is
+// tried again at the next wake.
+func (s *Stream) write() {
+	s.io.Lock()
+	defer s.io.Unlock()
+	for {
+		s.mu.Lock()
+		arch := s.arch
+		var w *work
+		if arch != nil && len(arch.queue) > 0 {
+			w = arch.queue[0]
+		}
+		s.mu.Unlock()
+		if w == nil {
+			return
+		}
+		err := arch.write(w)
+		s.mu.Lock()
+		if err == nil {
+			arch.pop()
+		}
+		s.wrote(err)
+		s.mu.Unlock()
+		if err != nil {
+			return
+		}
 	}
 }
 
-// note records the outcome of a write on the parquet path. Caller holds mu.
-func (s *Stream) note(err error) {
+// wrote records the outcome of a write. Caller holds io and mu.
+func (s *Stream) wrote(err error) {
 	if s.arch != nil {
 		s.durable.Store(s.arch.durable)
+		s.file = s.arch.fileName
 	}
 	if err != nil {
-		if !s.failing {
-			fmt.Fprintf(os.Stderr, "[%s] archive failing: %v\n", s.Name, err)
-		}
-		s.failing, s.errText = true, err.Error()
+		s.fault(err)
 		return
 	}
 	if s.failing {
 		fmt.Fprintf(os.Stderr, "[%s] archive recovered\n", s.Name)
 		s.failing, s.errText = false, ""
 	}
+}
+
+// fault records a failure on the parquet path. Caller holds mu.
+func (s *Stream) fault(err error) {
+	if !s.failing {
+		fmt.Fprintf(os.Stderr, "[%s] archive failing: %v\n", s.Name, err)
+	}
+	s.failing, s.errText = true, err.Error()
 }
 
 // ArchiveState is the standing of a stream's parquet files. A failing
@@ -223,9 +273,9 @@ func (s *Stream) ArchiveState() ArchiveState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st := ArchiveState{Failing: s.failing, Error: s.errText,
-		Location: s.location.Load().(string)}
+		Location: s.location.Load().(string), File: s.file}
 	if s.arch != nil {
-		st.LostRows, st.File = s.arch.lost, s.arch.fileName
+		st.LostRows = s.arch.lost
 	}
 	return st
 }
@@ -327,6 +377,8 @@ func (s *Stream) heartbeat(stop chan struct{}) {
 // them here, because they say where the files go. A row group the ring
 // cannot hold is refused: the ring was sized at CreateStream.
 func (s *Stream) StartParquet(label string, o *ParquetOptions) error {
+	s.io.Lock()
+	defer s.io.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if o == nil {
@@ -336,7 +388,7 @@ func (s *Stream) StartParquet(label string, o *ParquetOptions) error {
 		}
 		if s.arch != nil {
 			err := s.arch.start(label)
-			s.durable.Store(s.arch.durable)
+			s.wrote(err)
 			return err
 		}
 		o = s.parquet
@@ -363,7 +415,7 @@ func (s *Stream) StartParquet(label string, o *ParquetOptions) error {
 	s.arch, s.parquet = arch, &opts
 	s.location.Store(arch.location)
 	err = arch.start(label)
-	s.durable.Store(arch.durable)
+	s.wrote(err)
 	return err
 }
 
@@ -382,13 +434,15 @@ func (s *Stream) ParquetOptions() *ParquetOptions {
 // StopParquet ends the open file, with every row committed up to now in
 // it. The stream keeps its options for the next StartParquet.
 func (s *Stream) StopParquet() error {
+	s.io.Lock()
+	defer s.io.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.arch == nil {
 		return nil
 	}
 	err := s.arch.stop()
-	s.durable.Store(s.arch.durable)
+	s.wrote(err)
 	return err
 }
 
@@ -418,17 +472,16 @@ func (s *Stream) Close() error {
 	s.workDone.Wait()
 	s.tel.flight.notify(s.Name)
 
+	s.io.Lock()
 	s.mu.Lock()
 	var err error
 	if s.arch != nil {
-		if s.arch.recording {
-			err = s.arch.stop()
-		} else {
-			err = s.arch.rotate()
-		}
-		s.durable.Store(s.arch.durable)
+		err = s.arch.stop() // the rows still owed, then the file is finished
+		s.wrote(err)
+		s.arch.abandon() // a store that is failing: the pins go with the ring
 	}
 	s.mu.Unlock()
+	s.io.Unlock()
 
 	s.pubMu.Lock()
 	s.unpublish()
