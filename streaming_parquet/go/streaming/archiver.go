@@ -21,9 +21,8 @@ import (
 // from the ring and writes them through a pqc.Writer (chunks + THE
 // checkpoint; crash-durable, live-readable, finalized on rotate).
 //
-// Driven by its owner's loop: the Stream's Publish() or the Attached
-// feeder after each ingest. All methods are called from that one
-// goroutine.
+// Driven by its owner: the Stream's work goroutine or the Attached
+// feeder after each ingest. The owner's mutex is held for every call.
 type archiver struct {
 	ring      *ring.Ring
 	schema    *arrow.Schema
@@ -33,6 +32,7 @@ type archiver struct {
 	sink      pqc.Sink
 	recording bool
 	label     string
+	lost      int64 // rows the ring reused before they were written
 
 	rowGroupRows    int64
 	rowGroupSeconds float64
@@ -240,6 +240,7 @@ func (a *archiver) region(lo, hi int64) ([]arrow.RecordBatch, func(), error) {
 		// what survives (same policy as the Python module)
 		fmt.Fprintf(os.Stderr, "[%s] ARCHIVE LOSS: rows [%d,%d) recycled "+
 			"before parquet flush\n", a.name, lo, rs.Lo)
+		a.lost += rs.Lo - lo
 		lo = rs.Lo
 		a.cursor = lo
 	}
@@ -287,7 +288,8 @@ func min64(a, b int64) int64 {
 }
 
 // step advances the archiver: flush a row group when due, else a tail
-// checkpoint when due. Call from the owner's loop after commits.
+// checkpoint when due. The owner calls it after commits and when a
+// time is due.
 func (a *archiver) step() error {
 	if !a.recording {
 		return nil

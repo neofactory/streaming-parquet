@@ -578,7 +578,7 @@ leaves the others alone.
 
 ## Go host (go/streaming)
 
-The Go host is on the OLD API (Init/Root/Attach, Publish) and has none
+The Go host is on the OLD API (Init/Root/Attach) and has none
 of the store, catalog, ticket revision or ownership work; it writes
 versioned checkpoints and reads 8- or 16-byte side data. Bringing it
 up, or replacing it with the C core of V2B, is an open issue. One
@@ -603,9 +603,14 @@ s, _ := tel.CreateStream("press/fieldbus", schema,
 // bucket, prefix), CheckpointSeconds: 2} — chunks are the 5 MiB part
 // minimum, the checkpoint is the durable tail between them.
 // write via s.Ring() (RowBegin/Set*/Commit, wire maps);
-// s.Publish() from your loop; s.StartParquet("job-19", nil) is a mark:
-// a new file from this row on. Give options there to replace the
-// stream's, or to start files on a stream created with none.
+// s.Commit() after your rows: readers see them at once, and the
+// stream's goroutine writes the files. A write fault shows in
+// s.ArchiveState(); s.Durable() is the first row not yet in a file.
+// s.StartParquet("job-19", nil) is a mark: a new file from this row on.
+// Give options there to replace the stream's, or to start files on a
+// stream created with none.
+// StreamOptions{Internal: true} makes a stream no other process finds
+// or reads; s.Publish() and s.Unpublish() change it later.
 
 a, _ := tel.Attach("probe/voltages", streaming.AttachOptions{
         Parquet: &streaming.ParquetOptions{BaseDir: dir}})

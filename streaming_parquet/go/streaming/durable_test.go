@@ -14,7 +14,8 @@ import (
 
 // Durable: the first seq not yet in the archive. A consumer that must
 // acknowledge its input only once it is durable compares a row's seq
-// against it after Publish; the checkpoint cadence moves it.
+// against it; the checkpoint cadence moves it, with no call from the
+// producer.
 func TestDurableFollowsTheCheckpoint(t *testing.T) {
 	tel, err := Init(Config{FlightAddr: "127.0.0.1:0"})
 	if err != nil {
@@ -38,13 +39,8 @@ func TestDurableFollowsTheCheckpoint(t *testing.T) {
 	if got := s.Durable(); got != 0 {
 		t.Fatalf("right after commit: durable %d, want 0", got)
 	}
-	deadline := time.Now().Add(3 * time.Second)
-	for s.Durable() < 10 && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-		if _, err := s.Publish(); err != nil {
-			t.Fatal(err)
-		}
-	}
+	// no call from here: the stream's goroutine writes the checkpoint
+	waitUntil(t, "the checkpoint", func() bool { return s.Durable() >= 10 })
 	if got := s.Durable(); got != 10 {
 		t.Fatalf("after the checkpoint: durable %d, want 10", got)
 	}
@@ -104,13 +100,8 @@ func TestCheckpointSkipsWhenNothingNew(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeRows(t, s, 0, 10)
-	deadline := time.Now().Add(3 * time.Second)
-	for s.Durable() < 10 && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-		if _, err := s.Publish(); err != nil {
-			t.Fatal(err)
-		}
-	}
+	// no call from here: the stream's goroutine writes the checkpoint
+	waitUntil(t, "the checkpoint", func() bool { return s.Durable() >= 10 })
 	ckpt := func() time.Time {
 		m, err := filepath.Glob(filepath.Join(dir, "streams", "t", "idle", "*.ckpt"))
 		if err != nil || len(m) != 1 {
@@ -125,9 +116,6 @@ func TestCheckpointSkipsWhenNothingNew(t *testing.T) {
 	before := ckpt()
 	for i := 0; i < 10; i++ { // ten intervals with nothing new
 		time.Sleep(60 * time.Millisecond)
-		if _, err := s.Publish(); err != nil {
-			t.Fatal(err)
-		}
 	}
 	if after := ckpt(); !after.Equal(before) {
 		t.Fatalf("an idle stream rewrote its checkpoint (%v -> %v)", before, after)
@@ -154,9 +142,9 @@ func TestFileIsCutByBytes(t *testing.T) {
 	}
 	for k := 0; k < 12; k++ { // 12 row groups of 200 rows
 		writeRows(t, s, k*200, 200)
-		if _, err := s.Publish(); err != nil {
-			t.Fatal(err)
-		}
+		// a ring of two row groups: let each group be written
+		want := int64(k+1) * 200
+		waitUntil(t, "the row group", func() bool { return s.Durable() >= want })
 	}
 	if err := s.StopParquet(); err != nil {
 		t.Fatal(err)
@@ -357,5 +345,94 @@ func TestStartParquetOnAStreamCreatedWithNone(t *testing.T) {
 		if len(rows) != 15 || rows[0] != 25 || rows[14] != 39 {
 			t.Fatalf("%s holds %v, want [25, 40)", name, rows)
 		}
+	}
+}
+
+// A write fault shows in ArchiveState, not as the result of a call, and
+// clears when a write works again.
+func TestArchiveStateShowsAWriteFault(t *testing.T) {
+	tel, err := Init(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tel.Close()
+	dir := t.TempDir()
+	s, err := tel.CreateStream("t/fault", testSchema(), StreamOptions{RingRows: 2000,
+		Parquet: &ParquetOptions{BaseDir: dir, CheckpointSeconds: 0.05}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := s.ArchiveState(); st.Failing || st.Location == "" {
+		t.Fatalf("a new stream: %+v", st)
+	}
+	folder := filepath.Join(dir, "streams", "t", "fault")
+	if err := os.Chmod(folder, 0o500); err != nil { // no new file can be made
+		t.Fatal(err)
+	}
+	writeRows(t, s, 0, 10)
+	waitUntil(t, "the fault", func() bool { return s.ArchiveState().Failing })
+	if st := s.ArchiveState(); st.Error == "" || s.Durable() != 0 {
+		t.Fatalf("failing: %+v, durable %d", st, s.Durable())
+	}
+	if err := os.Chmod(folder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "the recovery", func() bool {
+		return !s.ArchiveState().Failing && s.Durable() == 10
+	})
+}
+
+// An internal stream has no ticket and is not served; Publish and
+// Unpublish change a running stream.
+func TestPublishedOrInternal(t *testing.T) {
+	root := t.TempDir()
+	tel, err := Init(Config{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tel.Close()
+	s, err := tel.CreateStream("t/int", testSchema(),
+		StreamOptions{RingRows: 400, Internal: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := func() bool {
+		names, _ := tel.ListStreams()
+		for _, n := range names {
+			if n == "t/int" {
+				return true
+			}
+		}
+		return false
+	}
+	served := func() bool {
+		tel.flight.mu.Lock()
+		defer tel.flight.mu.Unlock()
+		return tel.flight.streams["t/int"] != nil
+	}
+	writeRows(t, s, 0, 10)
+	if s.Published() || listed() || served() {
+		t.Fatalf("an internal stream: published %v, ticket %v, served %v",
+			s.Published(), listed(), served())
+	}
+	s.Publish()
+	waitUntil(t, "the ticket", listed)
+	if !s.Published() || !served() {
+		t.Fatal("after Publish the stream is not served")
+	}
+	a, err := tel.Attach("t/int", AttachOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	waitUntil(t, "a reader", func() bool { return a.State() == "streaming" })
+	s.Unpublish()
+	if s.Published() || listed() || served() {
+		t.Fatalf("after Unpublish: published %v, ticket %v, served %v",
+			s.Published(), listed(), served())
+	}
+	writeRows(t, s, 10, 5) // the stream itself goes on
+	if got := s.Ring().NewestSeq(); got != 14 {
+		t.Fatalf("newest seq %d, want 14", got)
 	}
 }

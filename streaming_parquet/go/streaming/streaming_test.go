@@ -34,11 +34,20 @@ func writeRows(t *testing.T, s *Stream, start, count int) {
 		r.SetF64(x, float64(i)*0.5)
 		r.SetString(sl, fmt.Sprintf("row-%d", i))
 	}
-	if _, err := r.Commit(); err != nil {
+	if _, err := s.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Publish(); err != nil {
-		t.Fatal(err)
+}
+
+// waitUntil polls cond for up to three seconds.
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

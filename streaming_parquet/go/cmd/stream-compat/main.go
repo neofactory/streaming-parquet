@@ -132,10 +132,7 @@ func main() {
 				r.SetList(gl, elems, i%3)
 				i++
 			}
-			if _, err := r.Commit(); err != nil {
-				die(err)
-			}
-			if _, err := s.Publish(); err != nil {
+			if _, err := s.Commit(); err != nil {
 				die(err)
 			}
 			time.Sleep(20 * time.Millisecond)
@@ -226,10 +223,7 @@ func main() {
 				r.SetF64(xl, float64(i)*0.5)
 				i++
 			}
-			if _, err := r.Commit(); err != nil {
-				die(err)
-			}
-			if _, err := s.Publish(); err != nil {
+			if _, err := s.Commit(); err != nil {
 				die(err)
 			}
 			time.Sleep(20 * time.Millisecond)
@@ -299,10 +293,7 @@ func main() {
 				r.SetString(sl, fmt.Sprintf("row-%d", i))
 				i++
 			}
-			if _, err := r.Commit(); err != nil {
-				die(err)
-			}
-			if _, err := s.Publish(); err != nil {
+			if _, err := s.Commit(); err != nil {
 				die(err)
 			}
 			time.Sleep(20 * time.Millisecond)

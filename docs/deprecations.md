@@ -29,6 +29,9 @@ the compiler names the line.
 | `StreamOptions{Archive: ...}` then `StartParquet(label)` | `StartParquet(label, &ParquetOptions{...})` | 2026-11-12 |
 | `Stream.StartParquet(label)` | `Stream.StartParquet(label, nil)` | 2026-11-12 |
 | `AttachOptions{Archive: ArchiveOptions{...}}` | `AttachOptions{Parquet: &ParquetOptions{...}}` | 2026-11-12 |
+| `s.Ring().Commit()` then `s.Publish()` | `s.Commit()`; the stream's goroutine writes the files | 2026-11-12 |
+| the error returned by `s.Publish()` | `s.ArchiveState().Failing` and `.Error` | 2026-11-12 |
+| `s.Publish()`, the step after a commit | removed; `s.Publish()` now makes an internal stream findable and readable | 2026-11-12 |
 
 ## The rule for names
 

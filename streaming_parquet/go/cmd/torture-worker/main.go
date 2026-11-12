@@ -173,12 +173,12 @@ func runPub(tel *streaming.Telemetry, name, kind string, rate int,
 			}
 			n++
 		}
-		if _, err := r.Commit(); err != nil {
+		if _, err := s.Commit(); err != nil {
 			die(err)
 		}
-		if _, err := s.Publish(); err != nil {
+		if as := s.ArchiveState(); as.Failing {
 			st.Errors++
-			st.Note = err.Error()
+			st.Note = as.Error
 		}
 		st.Rows = n
 		if archdir != "-" && time.Now().After(nextChurn) {
