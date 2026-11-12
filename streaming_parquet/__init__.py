@@ -14,12 +14,14 @@ calls one of the reader verbs, and it all just works.
     # ---- writing ------------------------------------------------------
     s = sp.create_stream(name, arrow_schema, store=STORE,   # spool= for the local copy's place
             memory=sp.MemoryOptions(lookback=rows),
-            parquet=sp.ParquetOptions(checkpoint_seconds=15, ship_seconds=15, compression={...}))   # None = memory only
+            parquet=sp.ParquetOptions(checkpoint_seconds=15, ship_seconds=15, compression={...}),   # None = no files until start_parquet
+            publish=True)                                   # False = internal: this process only
     row = s.get_mutable_row(); row.x = 1.0; s.commit()      # one row
     s.append(table_or_batch_or_dict)                        # many rows
     m = s.wire_map(entries); s.from_wire(m, frame); s.commit()
     s.cut(label=...)                     # end the file; next file carries label
     s.start_parquet(label, options), s.stop_parquet()   # parquet on and off, stream live
+    s.publish(), s.unpublish()           # found and read by other processes, or internal
     s.archive_state(), s.mirror_state(), s.memory_state()
     s.close()
 
@@ -98,7 +100,7 @@ def _ensure_flight_server():
 
 
 def create_stream(name, schema, store=None, spool=DEFAULT_SPOOL,
-                  memory=None, parquet=None, *, archive=None):
+                  memory=None, parquet=None, *, archive=None, publish=True):
     """Create a stream this process writes.
 
     name:    the stream's whole path under the store
@@ -125,6 +127,16 @@ def create_stream(name, schema, store=None, spool=DEFAULT_SPOOL,
              catalog_copy_seconds): the tuning. None = no files until
              a start_parquet.
     archive: the old name of `parquet` (docs/deprecations.md).
+    publish: True = other processes can find the stream (its ticket in
+             the store) and read it (the Flight server). False = an
+             internal stream: no ticket, not served; code in this
+             process reads it with connect(name). Stream.publish() and
+             Stream.unpublish() change it later.
+
+    One writer per stream: a stream that is published, or that writes
+    parquet, holds the stream's writer lock from then until it closes.
+    An internal stream with no parquet holds none, so several processes
+    can each have one of the same name.
 
     Returns a Stream. commit() on it triggers the library's worker
     threads; nothing slow runs on the caller's thread.
@@ -163,7 +175,12 @@ def create_stream(name, schema, store=None, spool=DEFAULT_SPOOL,
     else:
         lock_dir = spool if spool is not None else DEFAULT_SPOOL
     from ._stream import _get_local_ip
-    owner = _owner.claim(name, lock_dir, store, _get_local_ip(), port, run)
+
+    def claim():
+        return _owner.claim(name, lock_dir, store, _get_local_ip(), port, run)
+
+    owner = claim() if publish or parquet is not None else None
+
     def make_writer(options):
         """The stream's ParquetWriter, started: built here at creation,
         or by the first start_parquet of a stream created with none."""
@@ -192,11 +209,13 @@ def create_stream(name, schema, store=None, spool=DEFAULT_SPOOL,
             stream = Stream(name, schema, server, port, run, memory=memory,
                             parquet=parquet, store=store, writer=writer,
                             owner=owner, make_writer=make_writer,
-                            nowhere=nowhere)
-            server.register_stream(name, schema, stream)  # readers pull from it
+                            nowhere=nowhere, publish=publish, claim=claim)
+            if publish:
+                server.register_stream(name, schema, stream)  # readers pull from it
             _streams[name] = stream
     except BaseException:
-        owner.release()
+        if owner is not None:
+            owner.release()
         raise
     return stream
 

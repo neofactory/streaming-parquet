@@ -2619,6 +2619,115 @@ def _():
         assert sp._tickets.get_ticket(tmp, "v2test/beat")["checkpoint_seconds"] == 1.0
 
 
+print("\n--- published or internal ---")
+
+
+@test("an internal stream has no ticket and is not served; this process reads it by name")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        s = sp.create_stream("v2test/int", SCHEMA, store=tmp, publish=False,
+                             memory=MemoryOptions(lookback=500))
+        assert not s.published
+        fill(s, 10)
+        time.sleep(0.3)                  # a heartbeat or two
+        assert sp._tickets.get_ticket(tmp, "v2test/int") is None
+        assert "v2test/int" not in sp.list_streams(tmp)
+        # this process reads it
+        a = sp.connect("v2test/int")
+        assert a.state == "streaming" and a._newest_seq == 9
+        # another process, even one that knows the host and port, does not
+        direct = {"name": "v2test/int", "host": "127.0.0.1", "port": s._port,
+                  "run": s._run}
+        b = sp.connect(ticket=direct, memory=MemoryOptions(lookback=500))
+        time.sleep(1.0)
+        assert b.state != "streaming", b.state
+        b.close()
+
+
+@test("publish() and unpublish() change a running stream")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        s = sp.create_stream("v2test/pub", SCHEMA, store=tmp, publish=False,
+                             memory=MemoryOptions(lookback=500))
+        fill(s, 10)
+        s.publish()
+        assert s.published
+        wait_for(lambda: sp._tickets.get_ticket(tmp, "v2test/pub") is not None,
+                 what="the ticket after publish()")
+        b = sp.connect(ticket=sp._tickets.get_ticket(tmp, "v2test/pub"),
+                       memory=MemoryOptions(lookback=500))
+        wait_for(lambda: b.state == "streaming",
+                 what="a reader over Flight after publish()")
+        fill(s, 5, start=10)
+        wait_for(lambda: b._newest_seq == 14, what="rows over Flight")
+        s.unpublish()
+        assert not s.published
+        assert sp._tickets.get_ticket(tmp, "v2test/pub") is None
+        time.sleep(0.5)                  # heartbeats: none writes it back
+        assert sp._tickets.get_ticket(tmp, "v2test/pub") is None
+        wait_for(lambda: b.state != "streaming", what="the reader losing the stream")
+        b.close()
+        # still readable here, and still writable
+        fill(s, 5, start=15)
+        assert sp.connect("v2test/pub")._newest_seq == 19
+
+
+@test("an internal stream writes parquet and its own views read the files, with no ticket in the store")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        s = sp.create_stream("v2test/intpq", SCHEMA, store=tmp, publish=False,
+                             memory=MemoryOptions(lookback=500))
+        s.start_parquet("DBG", options=ParquetOptions(row_group_rows=50))
+        fill(s, 120)
+        con = view_con()
+        rel = s.duckdb_all(con)
+        wait_for(lambda: con.sql(f"SELECT count(*) FROM {rel.name}").fetchall()[0][0] == 120,
+                 what="all rows through the stream's own view")
+        rel.close()
+        assert sp._tickets.get_ticket(tmp, "v2test/intpq") is None
+        s.close()
+        folder = os.path.join(tmp, "streams", "v2test/intpq")
+        assert sum(len(v) for v in files_rows(folder).values()) == 120
+
+
+@test("two processes can have an internal stream of one name; the second to write parquet is refused")
+def _():
+    import subprocess
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    child = (
+        "import sys, pyarrow as pa, streaming_parquet as sp\n"
+        "s = sp.create_stream('v2test/shared', pa.schema([('tv', pa.float64())]),\n"
+        "                     store=sys.argv[1], publish=False)\n"
+        "print('CREATED', flush=True); sys.stdin.readline()\n"
+        "s.start_parquet('C')\n"
+        "print('STARTED', flush=True); sys.stdin.readline()\n")
+    with tempfile.TemporaryDirectory() as tmp:
+        env = dict(os.environ, PYTHONPATH=repo,
+                   STREAMING_PARQUET_DIAG_LOG=os.path.join(tmp, "child.log"))
+        proc = subprocess.Popen([sys.executable, "-c", child, tmp], env=env,
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                text=True)
+        try:
+            assert proc.stdout.readline().strip() == "CREATED"
+            # the same internal name here: no lock, so no refusal
+            s = sp.create_stream("v2test/shared", SCHEMA, store=tmp, publish=False,
+                                 memory=MemoryOptions(lookback=500))
+            proc.stdin.write("\n"); proc.stdin.flush()
+            assert proc.stdout.readline().strip() == "STARTED"
+            for call in (s.start_parquet, s.publish):
+                try:
+                    call()
+                except RuntimeError as e:
+                    assert "another process on this server" in str(e), e
+                else:
+                    raise AssertionError(f"{call.__name__} took a stream "
+                                         f"another process writes")
+            assert not s.published and s.parquet_options is None
+        finally:
+            proc.kill()
+            proc.wait()
+
+
 print("\n--- old names ---")
 
 @test("the old names Memory, Archive, parquet= and archive= still work")

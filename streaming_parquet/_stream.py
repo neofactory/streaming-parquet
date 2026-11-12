@@ -73,7 +73,8 @@ class Stream:
 
     def __init__(self, name, schema, flight_server, port, run,
                  memory=None, parquet=None, store=None, writer=None,
-                 owner=None, make_writer=None, nowhere=None):
+                 owner=None, make_writer=None, nowhere=None, publish=True,
+                 claim=None):
         """`run`: this writer's start time (_clock.run_start()), the same
         value the writer records in its files. `writer`: the
         ParquetWriter the caller built for this stream's store and
@@ -81,7 +82,11 @@ class Stream:
         `make_writer(options)`: builds that writer later, for the first
         start_parquet of such a stream; `nowhere`: why it cannot (no
         store and no spool), or None. `owner`: the held ownership
-        (_owner.claim), released at close."""
+        (_owner.claim), released at close; None on an internal stream
+        that writes no parquet, and `claim()` takes it when the stream
+        is published or starts a file. `publish`: other processes can
+        find and read the stream; create_stream has registered it with
+        the Flight server."""
         memory = memory or MemoryOptions()
         self.name = name
         self.schema = schema
@@ -106,6 +111,9 @@ class Stream:
         # livelocking on the regression; the files record it as sp_run.
         self._run = run
         self._owner = owner
+        self._claim = claim
+        self._own_lock = threading.Lock()
+        self._published = publish
         # One lock over the cursors and flags that commit's _publish,
         # the push task, start_parquet and stop_parquet all touch: the
         # writer's thread, the pool and a host thread may call them.
@@ -161,7 +169,11 @@ class Stream:
         # The heartbeat thread: the ticket beat, and the time-due work on
         # a stream committing nothing (the tail checkpoint, the mirror
         # retry). Always runs; the ticket part only with a root.
-        if self._ticket_root is not None:
+        if not publish:
+            console_print(f"[streaming-parquet] {self.name}: internal "
+                          f"stream -- no ticket, not served to other "
+                          f"processes")
+        elif self._ticket_root is not None:
             console_print(f"[streaming-parquet] Ticket heartbeat starting: "
                           f"{self._ticket_root}/tickets/{self.name} "
                           f"(on each change of the stored data, at least "
@@ -295,8 +307,12 @@ class Stream:
                 return True
             ticket = dict(state, revision=self._ticket_revision + 1,
                           ts=_now())
+            # An internal stream keeps its ticket in memory only: its
+            # own views follow it there, and no other process is told.
+            published = self._published
             try:
-                _tickets.put_ticket(self._ticket_root, self.name, ticket)
+                if published:
+                    _tickets.put_ticket(self._ticket_root, self.name, ticket)
             except Exception as e:
                 if not self._ticket_failing:
                     self._ticket_failing = True
@@ -313,7 +329,7 @@ class Stream:
             if self._ticket_failing:
                 self._ticket_failing = False
                 _diag.info(f"[{self.name}] ticket write recovered")
-        if first:
+        if first and published:
             console_print(f"[streaming-parquet] First ticket published: "
                           f"{self._ticket_root}/tickets/{self.name} -> "
                           f"{ticket}")
@@ -349,6 +365,54 @@ class Stream:
                 "unfinished": unfinished, "files": files,
                 "keep_seconds": keep_seconds,
                 "catalog_etag": catalog_etag}
+
+    # --- published or internal ------------------------------------------------
+
+    def _own(self):
+        """Hold the stream's writer lock: taken the first time the
+        stream is published or starts a file, held until close. Raises,
+        naming the holder, when another writer has it."""
+        with self._own_lock:
+            if self._owner is None and self._claim is not None:
+                self._owner = self._claim()
+
+    @property
+    def published(self):
+        """True when other processes can find and read the stream."""
+        return self._published
+
+    def publish(self):
+        """Let other processes find the stream (its ticket in the store)
+        and read it (the Flight server). Takes the stream's writer lock;
+        raises, naming the holder, when another writer has it."""
+        if self._closed:
+            raise ValueError(f"stream {self.name!r} is closed")
+        self._own()
+        with self._ticket_lock:
+            if self._published:
+                return
+            self._flight_server.register_stream(self.name, self.schema, self)
+            self._published = True
+            self._ticket_last_state = None      # the next write goes to the store
+        _diag.info(f"[{self.name}] published")
+        self._write_ticket()
+
+    def unpublish(self):
+        """Make the stream internal: its ticket is deleted and the Flight
+        server stops serving it. A connected reader sees what it sees
+        when a writer closes. Code in this process still reads it."""
+        with self._ticket_lock:
+            if not self._published:
+                return
+            self._published = False
+            if self._ticket_root is not None:
+                try:
+                    _tickets.delete_ticket(self._ticket_root, self.name)
+                except Exception as e:
+                    _diag.error(f"[{self.name}] ticket delete failed on "
+                                f"unpublish: {e}")
+        self._flight_server.unregister_stream(self.name)
+        _diag.info(f"[{self.name}] unpublished")
 
     # --- writing: the fast path -----------------------------------------------
 
@@ -683,6 +747,7 @@ class Stream:
         _ring_sizes(self.name, self._ring_rows, options.row_group_rows)
         if self._parquet is None and self._nowhere is not None:
             raise ValueError(self._nowhere)
+        self._own()                     # one writer of this stream's files
         self._publish()
         committed = self._ring.newest_seq + 1
         rel = table = None
@@ -878,7 +943,8 @@ class Stream:
             try:
                 with self._ticket_lock:     # no write after this one
                     self._ticket_deleted = True
-                    _tickets.delete_ticket(self._ticket_root, self.name)
+                    if self._published:
+                        _tickets.delete_ticket(self._ticket_root, self.name)
             except Exception as e:
                 _diag.error(f"[{self.name}] ticket delete failed on "
                             f"close: {e}")

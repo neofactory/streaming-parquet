@@ -458,7 +458,7 @@ one of the reader verbs, and it all just works.
 $STREAMING_PARQUET_DIAG_LOG    # diag log file, opened at import;
                                # default telemetry-diag.log in the cwd
 STORE = "s3://my-bucket"    # a whole bucket, or a whole directory; no prefix
-create_stream(name, schema, store=STORE, spool=DEFAULT_SPOOL, memory=MemoryOptions(...), parquet=ParquetOptions(...))
+create_stream(name, schema, store=STORE, spool=DEFAULT_SPOOL, memory=MemoryOptions(...), parquet=ParquetOptions(...), publish=True)
     # name: the stream's whole path under the store (files at streams/<name>/,
     #       ticket at tickets/<name>.json)
     # spool: the local write-behind copy a bucket store writes through;
@@ -467,6 +467,8 @@ create_stream(name, schema, store=STORE, spool=DEFAULT_SPOOL, memory=MemoryOptio
     # ParquetOptions(checkpoint_seconds, row_group_rows, row_group_seconds, ship_seconds,
     #         catalog_copy_seconds, compression): tuning; None = no files
     #         until a start_parquet
+    # publish: False = an internal stream: no ticket, not served to other
+    #         processes; this process reads it with connect(name)
     # Memory, Archive, archive= and Archive(parquet=) are old names that
     # still work: docs/deprecations.md
 create_playback_stream(name, parquet_path, timestamp_column, latency_s, memory)
@@ -479,7 +481,7 @@ Stream (writing): get_mutable_row(block_s) commit()
                   append(batch | table | dict)
                   wire_map(entries) from_wire(wmap, frame)
                   cut(label) start_parquet(label, options) stop_parquet()
-                  parquet_options
+                  parquet_options  publish() unpublish() published
                   archive_state() mirror_state() memory_state() close()
 
 reading (a stream we write and one we connect to, alike):
@@ -543,6 +545,22 @@ does its step), `flush_parquet` (now `cut`), `write_dict` /
 timeline relation, `get_hot_relation` / `get_dynamic_relation` (now the
 three `duckdb_*` views), the sequence calls and `ring` on a reader, the
 `archive` field in the ticket.
+
+**Published or internal.** A published stream (the default) has a
+ticket in the store, so other processes find it, and the Flight server
+serves it, so they read it. An internal stream (`publish=False`) has
+neither: only code in its own process reads it, with `connect(name)` or
+the `Stream` object. It can still write parquet, and its own views read
+those files. `publish()` and `unpublish()` change a running stream; a
+reader connected at an `unpublish()` sees what it sees when a writer
+closes. In `connect(name)` a stream this process writes is found first,
+so a local name wins over the same name in the store.
+
+**One writer per stream.** A stream takes its writer lock the first time
+it is published or starts a file, and holds it until it closes. An
+internal stream with no parquet holds none, so several processes can
+each have one of the same name; the second to publish it or to write
+parquet is refused, with the holder named.
 
 **Parquet on and off.** A stream writes files when it has parquet
 options. Give them at `create_stream(parquet=...)` and it writes from its
