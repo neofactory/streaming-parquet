@@ -19,7 +19,7 @@ calls one of the reader verbs, and it all just works.
     s.append(table_or_batch_or_dict)                        # many rows
     m = s.wire_map(entries); s.from_wire(m, frame); s.commit()
     s.cut(label=...)                     # end the file; next file carries label
-    s.start_parquet(label), s.stop_parquet()   # archive on and off, stream live
+    s.start_parquet(label, options), s.stop_parquet()   # parquet on and off, stream live
     s.archive_state(), s.mirror_state(), s.memory_state()
     s.close()
 
@@ -122,8 +122,8 @@ def create_stream(name, schema, store=None, spool=DEFAULT_SPOOL,
              the defaults: a ring of two parquet row groups.
     parquet: ParquetOptions(checkpoint_seconds, row_group_rows,
              row_group_seconds, ship_seconds, compression,
-             catalog_copy_seconds): the tuning. None = memory only, no
-             files.
+             catalog_copy_seconds): the tuning. None = no files until
+             a start_parquet.
     archive: the old name of `parquet` (docs/deprecations.md).
 
     Returns a Stream. commit() on it triggers the library's worker
@@ -164,27 +164,35 @@ def create_stream(name, schema, store=None, spool=DEFAULT_SPOOL,
         lock_dir = spool if spool is not None else DEFAULT_SPOOL
     from ._stream import _get_local_ip
     owner = _owner.claim(name, lock_dir, store, _get_local_ip(), port, run)
+    def make_writer(options):
+        """The stream's ParquetWriter, started: built here at creation,
+        or by the first start_parquet of a stream created with none."""
+        writer = _writer_for(name, schema, store, spool, options, run)
+        if kind in ("s3", "dir"):
+            # the catalog of the stream's finished files, in the store
+            folder = _tickets.archive_dir(store, name)
+            folder = folder if folder.endswith("/") else folder + "/"
+            writer.catalog = _catalog.Catalog(
+                name, folder,
+                os.path.join(lock_dir, "streams", name, "catalog.work.ducklake"),
+                retry_s=options.ship_seconds,
+                copy_s=options.catalog_copy_seconds)
+            writer.catalog.on_listed = writer.cataloged
+        writer.start()
+        return writer
+
+    # nowhere to write files: start_parquet says so at the call
+    nowhere = (f"stream {name!r} has no store and no spool: nowhere to "
+               f"write parquet") if store is None and spool is None else None
     try:
-        writer = None
-        if parquet is not None:
-            writer = _writer_for(name, schema, store, spool, parquet, run)
-            if kind in ("s3", "dir"):
-                # the catalog of the stream's finished files, in the store
-                folder = _tickets.archive_dir(store, name)
-                folder = folder if folder.endswith("/") else folder + "/"
-                writer.catalog = _catalog.Catalog(
-                    name, folder,
-                    os.path.join(lock_dir, "streams", name, "catalog.work.ducklake"),
-                    retry_s=parquet.ship_seconds,
-                    copy_s=parquet.catalog_copy_seconds)
-                writer.catalog.on_listed = writer.cataloged
-            writer.start()
+        writer = make_writer(parquet) if parquet is not None else None
         with _lock:
             if name in _streams:
                 raise ValueError(f"Stream '{name}' already exists")
             stream = Stream(name, schema, server, port, run, memory=memory,
                             parquet=parquet, store=store, writer=writer,
-                            owner=owner)
+                            owner=owner, make_writer=make_writer,
+                            nowhere=nowhere)
             server.register_stream(name, schema, stream)  # readers pull from it
             _streams[name] = stream
     except BaseException:
@@ -396,14 +404,18 @@ def cut(label=KEEP_LABEL):
         stream.cut(label)
 
 
-def start_parquet(label=None):
-    """Begin archiving on every local stream: each opens a fresh file
-    with `label` in its name, covering rows committed from this moment.
-    Readers are unaffected -- gating is the archive's only."""
+def start_parquet(label=None, options=None):
+    """Start a new file on every local stream that has parquet options:
+    each opens a fresh file with `label` in its name, holding the rows
+    committed from this moment. `options` (a ParquetOptions) replaces
+    each such stream's options. A stream created with parquet=None and
+    never started is left alone: start it by itself, Stream.start_parquet.
+    Readers are unaffected."""
     with _lock:
         stream_list = list(_streams.values())
     for stream in stream_list:
-        stream.start_parquet(label=label)
+        if stream.parquet_options is not None:
+            stream.start_parquet(label=label, options=options)
 
 
 def stop_parquet():

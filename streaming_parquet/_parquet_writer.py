@@ -162,6 +162,16 @@ class ParquetWriter:
         # previous episode.
         self._next_open_tw = _wall_time()
 
+    def set_compression(self, compression="zstd", compression_level=None,
+                        use_dictionary=None, column_encoding=None):
+        """The compression and encodings of the files opened from now
+        on: the same four settings as the constructor's, each at its
+        default when not given. The open file keeps its own."""
+        self._compression = compression
+        self._compression_level = compression_level
+        self._use_dictionary = use_dictionary
+        self._column_encoding = column_encoding
+
     def start(self):
         """The boot sweep, once the catalog is attached (create_stream)."""
         self._boot_sweep()

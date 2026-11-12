@@ -73,12 +73,15 @@ class Stream:
 
     def __init__(self, name, schema, flight_server, port, run,
                  memory=None, parquet=None, store=None, writer=None,
-                 owner=None):
+                 owner=None, make_writer=None, nowhere=None):
         """`run`: this writer's start time (_clock.run_start()), the same
         value the writer records in its files. `writer`: the
         ParquetWriter the caller built for this stream's store and
-        spool, or None for a stream that keeps no files. `owner`: the
-        held ownership (_owner.claim), released at close."""
+        spool, or None for a stream created with no parquet options.
+        `make_writer(options)`: builds that writer later, for the first
+        start_parquet of such a stream; `nowhere`: why it cannot (no
+        store and no spool), or None. `owner`: the held ownership
+        (_owner.claim), released at close."""
         memory = memory or MemoryOptions()
         self.name = name
         self.schema = schema
@@ -88,6 +91,9 @@ class Stream:
         row_group_rows = parquet.row_group_rows if parquet else None
         ring_rows, row_group_rows = _ring_sizes(name, memory.lookback,
                                                 row_group_rows)
+        self._ring_rows = ring_rows
+        self._make_writer = make_writer
+        self._nowhere = nowhere
         self._data = _StreamData(name, schema, capacity=ring_rows,
                                  segment_bytes=memory.segment_bytes)
         self._ring = self._data.ring
@@ -106,7 +112,7 @@ class Stream:
         self._lock = threading.Lock()
 
         a = parquet or ParquetOptions()
-        self._parquet = writer              # None: no files, ever
+        self._parquet = writer              # None: no file was ever started
         self._recording = writer is not None
         # The archive's standing: the first copy's last failure, and rows
         # the archive never got (recycled before their flush). A failing
@@ -138,18 +144,7 @@ class Stream:
         self._checkpoint_seconds = a.checkpoint_seconds
         self._ckpt_mono = None          # last durability point
 
-        # The ticket's beat: the longest gap between ticket writes, the
-        # cadence at which the store's data changes -- the ship interval
-        # for a bucket behind a spool, else the checkpoint interval (the
-        # ship interval when there is none). The heartbeat writes the
-        # ticket when the stored state changes, and at least once a beat.
-        if self._remote is None and a.checkpoint_seconds is not None:
-            self._beat_seconds = a.checkpoint_seconds
-        else:
-            self._beat_seconds = a.ship_seconds
-        # When a reader may call this writer dead: the one rule (three
-        # beats, at least 30 seconds), written into the ticket.
-        self._stale_after = parquet_checkpoint.dead_after(self._beat_seconds)
+        self._set_beat()
 
         self._pool = get_pool()
         self._closed = False
@@ -195,6 +190,45 @@ class Stream:
         self._heartbeat = threading.Thread(target=self._heartbeat_loop,
                                            daemon=True)
         self._heartbeat.start()
+
+    def _set_beat(self):
+        """The ticket's beat: the longest gap between ticket writes, the
+        cadence at which the store's data changes -- the ship interval
+        for a bucket behind a spool, else the checkpoint interval (the
+        ship interval when there is none). The heartbeat writes the
+        ticket when the stored state changes, and at least once a beat.
+        With it, when a reader may call this writer dead: the one rule
+        (three beats, at least 30 seconds), written into the ticket."""
+        if self._remote is None and self._checkpoint_seconds is not None:
+            self._beat_seconds = self._checkpoint_seconds
+        else:
+            self._beat_seconds = self._ship_seconds
+        self._stale_after = parquet_checkpoint.dead_after(self._beat_seconds)
+
+    def _set_parquet_options(self, options):
+        """The stream's parquet options from the next file on. The pool's
+        parquet lane calls it, between two files. The ring was sized at
+        creation: start_parquet refused a row group it cannot hold."""
+        with self._lock:
+            self._archive = options
+            self._row_group_rows = _ring_sizes(
+                self.name, self._ring_rows, options.row_group_rows)[1]
+            self._row_group_seconds = options.row_group_seconds
+            self._checkpoint_seconds = options.checkpoint_seconds
+            self._ship_seconds = options.ship_seconds
+            self._ckpt_mono = None
+            self._set_beat()
+        self._parquet.set_compression(**(options.compression or {}))
+        if self._parquet.catalog is not None:
+            self._parquet.catalog.set_cadence(options.ship_seconds,
+                                              options.catalog_copy_seconds)
+
+    @property
+    def parquet_options(self):
+        """The ParquetOptions this stream writes its files with: given at
+        creation or to a start_parquet. None when it was given none and
+        no file was ever started."""
+        return self._archive
 
     @property
     def _ticket(self):
@@ -526,9 +560,12 @@ class Stream:
                              committed - self._pq_cursor)
         if region.num_rows == 0:
             return
-        parquet = self._parquet
-
         def do_write(t=region, fs=self._pq_cursor):
+            # read when it runs: a first start_parquet builds the writer
+            # on this lane, ahead of this task
+            parquet = self._parquet
+            if parquet is None:         # that start failed, and said so
+                return
             try:
                 parquet.write_table(t, first_seq=fs)
                 self._archive_ok()
@@ -584,9 +621,10 @@ class Stream:
                              committed - self._pq_cursor)
         if region.num_rows == 0:
             return
-        parquet = self._parquet
-
         def do_ckpt(t=region, fs=self._pq_cursor):
+            parquet = self._parquet
+            if parquet is None:
+                return
             try:
                 parquet.checkpoint(t, first_seq=fs)
                 self._archive_ok()
@@ -610,7 +648,7 @@ class Stream:
         start: cut(label=program); its end: cut(label=None)). Triggers
         the pool like commit does; returns at once."""
         self._publish()
-        if not self._recording or self._parquet is None:
+        if not self._recording:
             return
         committed = self._ring.newest_seq + 1
         rel = self._data.pin(self._pq_cursor, committed)
@@ -620,37 +658,71 @@ class Stream:
                 self._flush_parquet_region(rel, table, committed)
         self._pool.submit("parquet", self.name, self._do_cut, label)
 
-    def start_parquet(self, label=None):
-        """Begin archiving: the next file opens with `label` in its
-        name and covers rows committed from THIS moment. The stream
-        stays live throughout."""
-        if self._parquet is None:
-            raise ValueError(f"stream {self.name!r} has no archive: created "
-                             f"with parquet=None")
+    def start_parquet(self, label=None, options=None):
+        """Start a new file now. It carries `label` in its name and
+        holds the rows committed from THIS moment: the call is a mark in
+        the stream. Rows committed before it are not put into the new
+        file. If a file is open, it ends at the mark, with every row
+        committed before the mark in it. If no file was open (the
+        stream was created with parquet=None, or stopped), the rows
+        committed while it was off are in no file.
+
+        options: a ParquetOptions for the files from this one on. It
+            replaces the stream's options whole. None = the options the
+            stream has, or the defaults when it never had any. A row
+            group the ring cannot hold is refused: the ring was sized at
+            creation.
+
+        The stream stays live throughout. Returns at once: the pool
+        ends the old file and builds what the new one needs."""
+        if options is not None and not isinstance(options, ParquetOptions):
+            raise TypeError(f"start_parquet: options must be a "
+                            f"ParquetOptions, got {type(options).__name__}")
+        if options is None:
+            options = self._archive or ParquetOptions()
+        _ring_sizes(self.name, self._ring_rows, options.row_group_rows)
+        if self._parquet is None and self._nowhere is not None:
+            raise ValueError(self._nowhere)
+        self._publish()
+        committed = self._ring.newest_seq + 1
+        rel = table = None
+        if self._recording:
+            rel = self._data.pin(self._pq_cursor, committed)
+            table = rel.detach()
+        # One hold of the lock for the mark and the task: no write of a
+        # row after the mark can reach the lane ahead of the task that
+        # ends the old file and makes the new one ready.
         with self._lock:
-            self._pq_cursor = self._ring.newest_seq + 1
-            self._pq_durable = self._pq_cursor
-            self._pq_open_mono = None
-        self._pool.submit("parquet", self.name, self._do_start_parquet, label)
+            if self._recording and rel is not None:
+                # the open file ends at the mark: what cut does
+                if committed > self._pq_cursor:
+                    self._flush_parquet_region(rel, table, committed)
+            else:
+                self._pq_cursor = self._ring.newest_seq + 1
+                self._pq_durable = self._pq_cursor
+                self._pq_open_mono = None
+                self._recording = True
+            self._pool.submit("parquet", self.name, self._do_start_parquet,
+                              label, options)
 
     def stop_parquet(self):
-        """End archiving: flush the pending region, close the file.
-        Rows still flow to readers and to memory."""
-        if self._parquet is None:
-            return
+        """End the open file, with every row committed up to now in it.
+        Rows still flow to readers and to memory. The stream keeps its
+        options for the next start_parquet."""
         with self._lock:
             recording = self._recording
             self._recording = False
-        if recording:
-            committed = self._ring.newest_seq + 1
-            rel = self._data.pin(self._pq_cursor, committed)
-            table = rel.detach()
-            with self._lock:
-                if committed > self._pq_cursor:
-                    self._recording = True   # the flush needs it on
-                    self._flush_parquet_region(rel, table, committed)
-                    self._recording = False
-        self._pool.submit("parquet", self.name, self._do_stop_parquet)
+        if not recording:
+            return
+        committed = self._ring.newest_seq + 1
+        rel = self._data.pin(self._pq_cursor, committed)
+        table = rel.detach()
+        with self._lock:
+            if committed > self._pq_cursor:
+                self._recording = True   # the flush needs it on
+                self._flush_parquet_region(rel, table, committed)
+                self._recording = False
+            self._pool.submit("parquet", self.name, self._do_stop_parquet)
 
     # --- reading: a Stream reads the same way an Attached does -------------
 
@@ -692,7 +764,7 @@ class Stream:
         t0 = time.monotonic()
         self._publish()
         step("publish", t0)
-        if self._recording and self._parquet is not None:
+        if self._recording:
             t0 = time.monotonic()
             self.cut()
             step("cut", t0)
@@ -700,12 +772,11 @@ class Stream:
 
         # Drain this stream's parquet queue: a sentinel task + event.
         done = threading.Event()
-        parquet = self._parquet
 
         def do_close():
             try:
-                if parquet is not None:
-                    parquet.close()
+                if self._parquet is not None:
+                    self._parquet.close()
             except Exception as e:
                 self._archive_fail(f"parquet.close failed: {e}")
             finally:
@@ -819,19 +890,32 @@ class Stream:
 
     # --- Internal: parquet task implementations ----------------------------
 
-    def _do_start_parquet(self, label):
+    def _do_start_parquet(self, label, options):
         try:
-            self._parquet.rotate()
+            if self._parquet is None:
+                # the first start of a stream created with no options
+                writer = self._make_writer(options)
+                writer.on_ticket = self._write_ticket
+                with self._lock:
+                    self._parquet = writer
+                    self._remote = writer._remote
+            else:
+                self._parquet.rotate()
+            self._set_parquet_options(options)
             self._parquet.set_label(label)
-            with self._lock:
-                self._recording = True
-            _diag.info(f"[{self.name}] start_parquet label={label!r}")
+            _diag.info(f"[{self.name}] start_parquet label={label!r} "
+                       f"{options}")
         except Exception as e:
             self._archive_fail(f"start_parquet failed: {e}")
+            with self._lock:
+                self._recording = False
+            return
+        self._write_ticket()            # the beat may have changed
 
     def _do_stop_parquet(self):
         try:
-            self._parquet.close()
+            if self._parquet is not None:
+                self._parquet.close()
             _diag.info(f"[{self.name}] stop_parquet")
         except Exception as e:
             self._archive_fail(f"stop_parquet failed: {e}")

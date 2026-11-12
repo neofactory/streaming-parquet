@@ -2464,6 +2464,161 @@ def _():
         assert not os.path.exists(default)
 
 
+print("\n--- parquet on and off at any time ---")
+
+
+def files_rows(folder):
+    """{file name: its 'mark' column... the tv values} of the finished
+    parquet files in a stream's folder."""
+    out = {}
+    if os.path.isdir(folder):
+        for f in sorted(os.listdir(folder)):
+            if f.endswith(".parquet"):
+                out[f] = [int(v) for v in
+                          pq.read_table(os.path.join(folder, f)).column("tv").to_pylist()]
+    return out
+
+
+@test("start_parquet on a recording stream is a mark: the open file ends there, no row is lost")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        s = sp.create_stream("v2test/mark", SCHEMA, store=tmp,
+                             memory=MemoryOptions(lookback=500),
+                             parquet=ParquetOptions())
+        fill(s, 25)
+        s.start_parquet("B")
+        fill(s, 15, start=25)
+        s.close()
+        got = files_rows(os.path.join(tmp, "streams", "v2test/mark"))
+        assert len(got) == 2, got
+        second = [f for f in got if f.endswith("-B.parquet")][0]
+        first = [f for f in got if f != second][0]
+        assert got[first] == list(range(25)), got
+        assert got[second] == list(range(25, 40)), got
+
+
+@test("a stream created with parquet=None writes no file until start_parquet, then only the later rows")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        s = sp.create_stream("v2test/late", SCHEMA, store=tmp,
+                             memory=MemoryOptions(lookback=500))
+        assert s.parquet_options is None
+        assert s.archive_state().location is None
+        fill(s, 25)
+        folder = os.path.join(tmp, "streams", "v2test/late")
+        assert files_rows(folder) == {}
+        s.start_parquet("DBG")
+        fill(s, 15, start=25)
+        s.stop_parquet()
+        wait_for(lambda: list(files_rows(folder).values()) == [list(range(25, 40))],
+                 what="the file with the rows after the mark")
+        assert s.parquet_options == ParquetOptions()
+        assert s.archive_state().location is not None
+        fill(s, 5, start=40)             # off again: these rows are in no file
+        s.close()
+        assert list(files_rows(folder).values()) == [list(range(25, 40))]
+
+
+@test("start_parquet(options=...) replaces the stream's options whole, from that file on")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        s = sp.create_stream("v2test/opts", SCHEMA, store=tmp,
+                             memory=MemoryOptions(lookback=500),
+                             parquet=ParquetOptions(checkpoint_seconds=7.0))
+        fill(s, 10)
+        snappy = ParquetOptions(compression={"compression": "snappy"})
+        s.start_parquet("S", options=snappy)
+        fill(s, 10, start=10)
+        s.start_parquet("Z", options=ParquetOptions())
+        fill(s, 10, start=20)
+        s.close()
+        folder = os.path.join(tmp, "streams", "v2test/opts")
+
+        def codec(tag):
+            f = [f for f in os.listdir(folder)
+                 if f.endswith(".parquet") and (f"-{tag}" in f if tag else "-" not in f[16:])][0]
+            return pq.ParquetFile(os.path.join(folder, f)).metadata.row_group(0).column(0).compression
+        assert codec("S") == "SNAPPY", codec("S")
+        assert codec("Z") == "ZSTD", codec("Z")
+        # whole replacement: checkpoint_seconds went back to its default
+        assert s.parquet_options == ParquetOptions()
+        assert s._checkpoint_seconds is None
+
+
+@test("start_parquet refuses a row group the ring cannot hold")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        s = sp.create_stream("v2test/toobig", SCHEMA, store=tmp,
+                             memory=MemoryOptions(lookback=500))
+        try:
+            s.start_parquet(options=ParquetOptions(row_group_rows=400))
+        except ValueError as e:
+            assert "less than two" in str(e), e
+        else:
+            raise AssertionError("a row group of 400 in a ring of 500 was accepted")
+        assert s.parquet_options is None
+
+
+@test("start_parquet then stop_parquet at once: the rows between are in the file, the stream is off")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        s = sp.create_stream("v2test/quick", SCHEMA, store=tmp,
+                             memory=MemoryOptions(lookback=500))
+        fill(s, 5)
+        s.start_parquet("Q")
+        fill(s, 5, start=5)
+        s.stop_parquet()
+        fill(s, 5, start=10)
+        folder = os.path.join(tmp, "streams", "v2test/quick")
+        wait_for(lambda: list(files_rows(folder).values()) == [list(range(5, 10))],
+                 what="the file with the five rows between start and stop")
+        s.close()
+        assert list(files_rows(folder).values()) == [list(range(5, 10))]
+
+
+@test("start_parquet with no store and no spool is refused at the call")
+def _():
+    s = sp.create_stream("v2test/nowhere", SCHEMA, spool=None,
+                         memory=MemoryOptions(lookback=500))
+    try:
+        s.start_parquet()
+    except ValueError as e:
+        assert "nowhere to write parquet" in str(e), e
+    else:
+        raise AssertionError("accepted")
+
+
+@test("module start_parquet leaves a stream with no parquet options alone")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        on = sp.create_stream("v2test/mod-on", SCHEMA, store=tmp,
+                              memory=MemoryOptions(lookback=500),
+                              parquet=ParquetOptions())
+        off = sp.create_stream("v2test/mod-off", SCHEMA, store=tmp,
+                               memory=MemoryOptions(lookback=500))
+        sp.start_parquet("M")
+        fill(on, 5)
+        fill(off, 5)
+        sp.close()
+        assert list(files_rows(os.path.join(tmp, "streams", "v2test/mod-on")).values()) == [list(range(5))]
+        assert files_rows(os.path.join(tmp, "streams", "v2test/mod-off")) == {}
+        assert off.parquet_options is None
+
+
+@test("new options change the ticket's beat")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        s = sp.create_stream("v2test/beat", SCHEMA, store=tmp,
+                             memory=MemoryOptions(lookback=500))
+        wait_for(lambda: sp._tickets.get_ticket(tmp, "v2test/beat") is not None,
+                 what="the first ticket")
+        assert sp._tickets.get_ticket(tmp, "v2test/beat")["beat_seconds"] == 5.0
+        s.start_parquet(options=ParquetOptions(checkpoint_seconds=1.0))
+        wait_for(lambda: sp._tickets.get_ticket(tmp, "v2test/beat")["beat_seconds"] == 1.0,
+                 what="the ticket with the new beat")
+        assert sp._tickets.get_ticket(tmp, "v2test/beat")["checkpoint_seconds"] == 1.0
+
+
 print("\n--- old names ---")
 
 @test("the old names Memory, Archive, parquet= and archive= still work")
