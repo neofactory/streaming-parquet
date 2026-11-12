@@ -465,19 +465,21 @@ create_stream(name, schema, store=STORE, spool=DEFAULT_SPOOL, memory=MemoryOptio
     #        default /var/tmp/streaming-parquet/<user>/, None for none
     # MemoryOptions(lookback, maximum, segment_bytes): rows on this core
     # ParquetOptions(checkpoint_seconds, row_group_rows, row_group_seconds, ship_seconds,
-    #         catalog_copy_seconds, compression): tuning; None = memory only
+    #         catalog_copy_seconds, compression): tuning; None = no files
+    #         until a start_parquet
     # Memory, Archive, archive= and Archive(parquet=) are old names that
     # still work: docs/deprecations.md
 create_playback_stream(name, parquet_path, timestamp_column, latency_s, memory)
 connect(name | ticket, store=STORE, memory=MemoryOptions(...), columns)
 list_streams(store=STORE)
-cut(label) / start_parquet(label) / stop_parquet()     # every local stream
+cut(label) / start_parquet(label, options) / stop_parquet()   # every local stream that has parquet options
 streams ; close()
 
 Stream (writing): get_mutable_row(block_s) commit()
                   append(batch | table | dict)
                   wire_map(entries) from_wire(wmap, frame)
-                  cut(label) start_parquet(label) stop_parquet()
+                  cut(label) start_parquet(label, options) stop_parquet()
+                  parquet_options
                   archive_state() mirror_state() memory_state() close()
 
 reading (a stream we write and one we connect to, alike):
@@ -515,7 +517,7 @@ s.commit()                           # visible at once; the pool does the rest
 s.append(batch)                      # many rows, one C call, then the same
 s.cut(label="O0019")                 # end the file; the next carries the label and
                                      # is named by its first row's commit time
-s.start_parquet("O0019"); s.stop_parquet()   # archive on and off, stream live
+s.start_parquet("O0019"); s.stop_parquet()   # parquet on and off, stream live
 
 a = sp.connect(name, store=...)      # local: the publisher's ring, zero
                                      # copies. Remote: a ring fed by Flight.
@@ -540,8 +542,20 @@ does its step), `flush_parquet` (now `cut`), `write_dict` /
 `append_batch` / `append_table` (now `append`), `to_wire`, the static
 timeline relation, `get_hot_relation` / `get_dynamic_relation` (now the
 three `duckdb_*` views), the sequence calls and `ring` on a reader, the
-`archive` field in the ticket. `start_parquet` records rows committed
-after the call.
+`archive` field in the ticket.
+
+**Parquet on and off.** A stream writes files when it has parquet
+options. Give them at `create_stream(parquet=...)` and it writes from its
+first row; give none and it writes no file until a `start_parquet`.
+`start_parquet(label, options)` is a mark in the stream: a new file
+starts and holds the rows committed after the call. A file that is open
+ends at the mark, with every earlier row in it. Rows committed while no
+file was open are in no file. `options` replaces the stream's options
+whole, from that file on; without it the stream uses the options it has,
+or the defaults. `stop_parquet()` ends the file and keeps the options.
+The ring is sized at creation, so a later row group it cannot hold is
+refused. The module's `start_parquet` acts on every local stream that
+has options and leaves the others alone.
 
 ## Go host (go/streaming)
 
@@ -561,8 +575,8 @@ because the parquet path consumes a ring and does not care whose.
 tel, _ := streaming.Init(streaming.Config{Root: "/data/streams"})
 s, _ := tel.CreateStream("press/fieldbus", schema,
         streaming.StreamOptions{
-            Archive: streaming.ParquetOptions{BaseDir: dir,
-                CheckpointSeconds: 2}})
+            Parquet: &streaming.ParquetOptions{BaseDir: dir,
+                CheckpointSeconds: 2}})   // nil = no files until a StartParquet
 // The ring holds two row groups: RingRows and ParquetOptions.RowGroupRows
 // default to 245,760 and DuckDB's 122,880; give one and the other
 // follows; a ring under two row groups is refused.
@@ -570,9 +584,12 @@ s, _ := tel.CreateStream("press/fieldbus", schema,
 // bucket, prefix), CheckpointSeconds: 2} — chunks are the 5 MiB part
 // minimum, the checkpoint is the durable tail between them.
 // write via s.Ring() (RowBegin/Set*/Commit, wire maps);
-// s.Publish() from your loop; s.StartParquet("job-19")
+// s.Publish() from your loop; s.StartParquet("job-19", nil) is a mark:
+// a new file from this row on. Give options there to replace the
+// stream's, or to start files on a stream created with none.
 
-a, _ := tel.Attach("probe/voltages", streaming.AttachOptions{})
+a, _ := tel.Attach("probe/voltages", streaming.AttachOptions{
+        Parquet: &streaming.ParquetOptions{BaseDir: dir}})
 r, _ := a.WaitRing(5 * time.Second)   // local ring fed by Flight
 a.StartParquet("cal-run")             // symmetric archival
 ```

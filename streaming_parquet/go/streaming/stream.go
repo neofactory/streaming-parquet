@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -18,43 +19,48 @@ import (
 type Stream struct {
 	Name string
 
-	tel          *Telemetry
-	ring         *ring.Ring
-	arch         *archiver
-	run          string // the writer's start time; the ticket's run, every file's sp_run
-	published    int64  // committed rows as of the last Publish
-	stopHB       chan struct{}
-	hbDone       sync.WaitGroup
-	closed       bool
+	tel       *Telemetry
+	ring      *ring.Ring
+	arch      *archiver       // nil until a StartParquet
+	parquet   *ParquetOptions // the options the files are written with; nil = none yet
+	ringRows  int64
+	location  atomic.Value // string: where the files land, "" before any
+	run       string       // the writer's start time; the ticket's run, every file's sp_run
+	published int64        // committed rows as of the last Publish
+	stopHB    chan struct{}
+	hbDone    sync.WaitGroup
+	closed    bool
 }
 
+// StreamOptions are given once, at CreateStream.
+//
+// Parquet says how the stream's rows are written to parquet, and with
+// its BaseDir or Sink where. With it, the stream writes files from its
+// first row. Nil means no files until a StartParquet that gives options.
 type StreamOptions struct {
 	RingRows int64 // ring rows; see ringSizes for the default
-	Parquet  bool  // recording gate at creation (StartParquet later works too)
-	Archive  ParquetOptions
+	Parquet  *ParquetOptions
 }
 
 func (t *Telemetry) CreateStream(name string, schema *arrow.Schema,
 	o StreamOptions) (*Stream, error) {
-	ringRows, groupRows, err := ringSizes(name, o.RingRows, o.Archive.RowGroupRows)
+	var givenGroupRows int64
+	if o.Parquet != nil {
+		givenGroupRows = o.Parquet.RowGroupRows
+	}
+	ringRows, _, err := ringSizes(name, o.RingRows, givenGroupRows)
 	if err != nil {
 		return nil, err
 	}
-	o.Archive.RowGroupRows = groupRows
 	r, err := ring.NewRing(schema, ringRows, nil)
 	if err != nil {
 		return nil, err
 	}
-	run := runStart()
-	arch, err := newArchiver(r, name, run, o.Archive)
-	if err != nil {
-		r.Close()
-		return nil, err
-	}
-	s := &Stream{Name: name, tel: t, ring: r, arch: arch,
-		run: run, stopHB: make(chan struct{})}
-	if o.Parquet {
-		if err := arch.start(""); err != nil {
+	s := &Stream{Name: name, tel: t, ring: r, ringRows: ringRows,
+		run: runStart(), stopHB: make(chan struct{})}
+	s.location.Store("")
+	if o.Parquet != nil {
+		if err := s.StartParquet("", o.Parquet); err != nil {
 			r.Close()
 			return nil, err
 		}
@@ -99,7 +105,7 @@ func (s *Stream) heartbeat() {
 			Name: s.Name, Host: localIP(), Port: s.tel.flight.port,
 			Ts:         float64(time.Now().UnixNano()) / 1e9,
 			Run:        s.run,
-			Archive:    s.arch.location,
+			Archive:    s.location.Load().(string),
 			StaleAfter: pqc.DeadAfter(heartbeatInterval).Seconds()})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[%s] ticket publish error: %v\n",
@@ -129,22 +135,86 @@ func (s *Stream) Publish() (int64, error) {
 		s.published = committed
 		s.tel.flight.notify(s.Name)
 	}
+	if s.arch == nil {
+		return fresh, nil
+	}
 	return fresh, s.arch.step()
 }
 
-// StartParquet begins a recording segment covering rows committed
-// from this moment; label lands in the filename.
-func (s *Stream) StartParquet(label string) error { return s.arch.start(label) }
+// StartParquet starts a new file now. It carries label in its name and
+// holds the rows committed from this moment: the call is a mark in the
+// stream. Rows committed before it are not put into the new file. If a
+// file is open, it ends at the mark, with every row committed before
+// the mark in it. If none was open, the rows committed while the stream
+// was off are in no file.
+//
+// o replaces the stream's parquet options whole, from this file on. Nil
+// means the options the stream has; a stream that never had any needs
+// them here, because they say where the files go. A row group the ring
+// cannot hold is refused: the ring was sized at CreateStream.
+func (s *Stream) StartParquet(label string, o *ParquetOptions) error {
+	if o == nil {
+		if s.parquet == nil {
+			return fmt.Errorf("stream %s: StartParquet needs ParquetOptions: "+
+				"the stream has none, and they say where the files go", s.Name)
+		}
+		if s.arch != nil {
+			return s.arch.start(label)
+		}
+		o = s.parquet
+	}
+	opts := *o
+	_, groupRows, err := ringSizes(s.Name, s.ringRows, opts.RowGroupRows)
+	if err != nil {
+		return err
+	}
+	opts.RowGroupRows = groupRows
+	if s.arch != nil {
+		// new options: the open file ends at the mark with the old ones
+		if err := s.arch.stop(); err != nil {
+			return err
+		}
+	}
+	arch, err := newArchiver(s.ring, s.Name, s.run, opts)
+	if err != nil {
+		return err
+	}
+	s.arch, s.parquet = arch, &opts
+	s.location.Store(arch.location)
+	return arch.start(label)
+}
 
-// StopParquet flushes the pending region and finalizes the file.
-func (s *Stream) StopParquet() error { return s.arch.stop() }
+// ParquetOptions answers the options the stream writes its files with:
+// given at CreateStream or to a StartParquet. Nil when it has none.
+func (s *Stream) ParquetOptions() *ParquetOptions {
+	if s.parquet == nil {
+		return nil
+	}
+	o := *s.parquet
+	return &o
+}
+
+// StopParquet ends the open file, with every row committed up to now in
+// it. The stream keeps its options for the next StartParquet.
+func (s *Stream) StopParquet() error {
+	if s.arch == nil {
+		return nil
+	}
+	return s.arch.stop()
+}
 
 // Durable answers the first seq not yet in the archive: every row below
 // it is in a written chunk or the checkpoint, so a producer that must
 // acknowledge its input only once it is durable — a queue consumer —
 // compares the row's seq against this after Publish. Meaningful while
-// recording; equal to the recording's first seq before anything landed.
-func (s *Stream) Durable() int64 { return s.arch.durable }
+// recording; equal to the recording's first seq before anything landed,
+// and 0 on a stream that never wrote a file.
+func (s *Stream) Durable() int64 {
+	if s.arch == nil {
+		return 0
+	}
+	return s.arch.durable
+}
 
 // Close publishes the final rows, stops the heartbeat, clears the
 // ticket, finalizes any open parquet file, and frees the ring.
@@ -157,10 +227,12 @@ func (s *Stream) Close() error {
 		return err
 	}
 	var err error
-	if s.arch.recording {
-		err = s.arch.stop()
-	} else {
-		err = s.arch.rotate()
+	if s.arch != nil {
+		if s.arch.recording {
+			err = s.arch.stop()
+		} else {
+			err = s.arch.rotate()
+		}
 	}
 	if s.tel.tickets != nil {
 		close(s.stopHB)

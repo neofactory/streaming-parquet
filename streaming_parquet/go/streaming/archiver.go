@@ -415,16 +415,23 @@ func sliceRecords(recs []arrow.RecordBatch, offset, rows int64) []arrow.RecordBa
 	return out
 }
 
-// StartParquet begins a recording segment: rows committed from THIS
-// moment land in a fresh file labeled `label`.
+// start is the mark of a new file: rows committed from THIS moment land
+// in a fresh file labeled `label`. A file that is open ends here, with
+// every row committed before the mark in it.
 func (a *archiver) start(label string) error {
+	committed := a.ring.NewestSeq() + 1
+	if a.recording && committed > a.cursor {
+		if err := a.flushRegion(committed); err != nil {
+			return err
+		}
+	}
 	if err := a.rotate(); err != nil {
 		return err
 	}
 	a.label = label
 	a.recording = true
-	a.cursor = a.ring.NewestSeq() + 1
-	a.durable = a.cursor
+	a.cursor = committed
+	a.durable = committed
 	a.hasClock = false
 	a.hasCkptCl = false
 	return nil

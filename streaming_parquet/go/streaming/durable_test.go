@@ -25,8 +25,8 @@ func TestDurableFollowsTheCheckpoint(t *testing.T) {
 		t.Fatal("a configured Flight address did not bind")
 	}
 	s, err := tel.CreateStream("t/durable", testSchema(),
-		StreamOptions{RingRows: 2000, Parquet: true,
-			Archive: ParquetOptions{BaseDir: t.TempDir(), CheckpointSeconds: 0.05}})
+		StreamOptions{RingRows: 2000,
+			Parquet: &ParquetOptions{BaseDir: t.TempDir(), CheckpointSeconds: 0.05}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,12 +79,12 @@ func TestRingHoldsTwoRowGroups(t *testing.T) {
 	}
 	defer tel.Close()
 	_, err = tel.CreateStream("t/small", testSchema(), StreamOptions{RingRows: 1999,
-		Archive: ParquetOptions{BaseDir: t.TempDir(), RowGroupRows: 1000}})
+		Parquet: &ParquetOptions{BaseDir: t.TempDir(), RowGroupRows: 1000}})
 	if err == nil || !strings.Contains(err.Error(), "less than two row groups") {
 		t.Fatalf("CreateStream: %v, want the ring refused", err)
 	}
 	if _, err := tel.Attach("t/small", AttachOptions{RingRows: 1999,
-		Archive: ParquetOptions{RowGroupRows: 1000}}); err == nil {
+		Parquet: &ParquetOptions{RowGroupRows: 1000}}); err == nil {
 		t.Fatal("Attach accepted a ring under two row groups")
 	}
 }
@@ -98,8 +98,8 @@ func TestCheckpointSkipsWhenNothingNew(t *testing.T) {
 	}
 	defer tel.Close()
 	dir := t.TempDir()
-	s, err := tel.CreateStream("t/idle", testSchema(), StreamOptions{RingRows: 2000, Parquet: true,
-		Archive: ParquetOptions{BaseDir: dir, CheckpointSeconds: 0.05}})
+	s, err := tel.CreateStream("t/idle", testSchema(), StreamOptions{RingRows: 2000,
+		Parquet: &ParquetOptions{BaseDir: dir, CheckpointSeconds: 0.05}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,8 +147,8 @@ func TestFileIsCutByBytes(t *testing.T) {
 	defer tel.Close()
 	dir := t.TempDir()
 	s, err := tel.CreateStream("t/bytecut", testSchema(),
-		StreamOptions{RingRows: 400, Parquet: true,
-			Archive: ParquetOptions{BaseDir: dir, RowGroupRows: 200, Compression: "none"}})
+		StreamOptions{RingRows: 400,
+			Parquet: &ParquetOptions{BaseDir: dir, RowGroupRows: 200, Compression: "none"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,8 +211,7 @@ func TestTicketSaysWhenItIsStale(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tel.Close()
-	s, err := tel.CreateStream("t/stale", testSchema(), StreamOptions{RingRows: 2000,
-		Archive: ParquetOptions{BaseDir: t.TempDir()}})
+	s, err := tel.CreateStream("t/stale", testSchema(), StreamOptions{RingRows: 2000})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,5 +237,125 @@ func TestTicketSaysWhenItIsStale(t *testing.T) {
 	}
 	if got := pqc.DeadAfter(5 * time.Second); got != 30*time.Second {
 		t.Fatalf("a 5 s beat: dead after %v, want 30 s", got)
+	}
+}
+
+// fileRows reads the n column of every finished parquet file in dir,
+// keyed by file name.
+func fileRows(t *testing.T, dir string) map[string][]int64 {
+	t.Helper()
+	out := map[string][]int64{}
+	names, _ := filepath.Glob(filepath.Join(dir, "*.parquet"))
+	for _, name := range names {
+		data, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := file.NewParquetReader(bytes.NewReader(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var rows []int64
+		for g := 0; g < r.NumRowGroups(); g++ {
+			col, err := r.RowGroup(g).Column(0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cr := col.(*file.Int64ColumnChunkReader)
+			buf := make([]int64, r.RowGroup(g).NumRows())
+			got, _, err := cr.ReadBatch(int64(len(buf)), buf, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rows = append(rows, buf[:got]...)
+		}
+		r.Close()
+		out[filepath.Base(name)] = rows
+	}
+	return out
+}
+
+// StartParquet on a recording stream is a mark: the open file ends
+// there with every earlier row in it, and the new file holds the rows
+// committed after.
+func TestStartParquetIsAMark(t *testing.T) {
+	tel, err := Init(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tel.Close()
+	dir := t.TempDir()
+	s, err := tel.CreateStream("t/mark", testSchema(), StreamOptions{RingRows: 400,
+		Parquet: &ParquetOptions{BaseDir: dir}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRows(t, s, 0, 25)
+	if err := s.StartParquet("B", nil); err != nil {
+		t.Fatal(err)
+	}
+	writeRows(t, s, 25, 15)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got := fileRows(t, filepath.Join(dir, "streams", "t", "mark"))
+	if len(got) != 2 {
+		t.Fatalf("files: %v, want two", got)
+	}
+	for name, rows := range got {
+		lo, hi := int64(0), int64(25)
+		if strings.HasSuffix(name, "-B.parquet") {
+			lo, hi = 25, 40
+		}
+		if int64(len(rows)) != hi-lo || rows[0] != lo || rows[len(rows)-1] != hi-1 {
+			t.Fatalf("%s holds %v, want [%d, %d)", name, rows, lo, hi)
+		}
+	}
+}
+
+// A stream created with no parquet options writes no file until a
+// StartParquet gives them, and then only the rows committed after.
+func TestStartParquetOnAStreamCreatedWithNone(t *testing.T) {
+	tel, err := Init(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tel.Close()
+	dir := t.TempDir()
+	s, err := tel.CreateStream("t/late", testSchema(), StreamOptions{RingRows: 400})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.ParquetOptions() != nil {
+		t.Fatal("a stream created with none has parquet options")
+	}
+	writeRows(t, s, 0, 25)
+	if err := s.StartParquet("X", nil); err == nil ||
+		!strings.Contains(err.Error(), "needs ParquetOptions") {
+		t.Fatalf("StartParquet with no options: %v, want it refused", err)
+	}
+	if err := s.StartParquet("X", &ParquetOptions{BaseDir: dir, RowGroupRows: 300}); err == nil ||
+		!strings.Contains(err.Error(), "less than two row groups") {
+		t.Fatalf("a row group of 300 in a ring of 400: %v, want it refused", err)
+	}
+	if err := s.StartParquet("DBG", &ParquetOptions{BaseDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	writeRows(t, s, 25, 15)
+	if err := s.StopParquet(); err != nil {
+		t.Fatal(err)
+	}
+	writeRows(t, s, 40, 5) // off again: in no file
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got := fileRows(t, filepath.Join(dir, "streams", "t", "late"))
+	if len(got) != 1 {
+		t.Fatalf("files: %v, want one", got)
+	}
+	for name, rows := range got {
+		if len(rows) != 15 || rows[0] != 25 || rows[14] != 39 {
+			t.Fatalf("%s holds %v, want [25, 40)", name, rows)
+		}
 	}
 }

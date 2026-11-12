@@ -17,6 +17,19 @@ old name carries a `// Deprecated:` comment, which editors and
 | `create_stream(archive=...)` | `create_stream(parquet=...)` | Python | 2026-11-11 | 2027-02-11 |
 | `ArchiveOptions` | `ParquetOptions` | Go | 2026-11-11 | 2027-02-11 |
 
+## Changes with no old name
+
+Go cannot keep an old field beside a new one of the same name, so these
+changed in one step. Code that used the old form does not compile, and
+the compiler names the line.
+
+| Old form | New form | Changed |
+|---|---|---|
+| `StreamOptions{Parquet: true, Archive: ArchiveOptions{...}}` | `StreamOptions{Parquet: &ParquetOptions{...}}` | 2026-11-12 |
+| `StreamOptions{Archive: ...}` then `StartParquet(label)` | `StartParquet(label, &ParquetOptions{...})` | 2026-11-12 |
+| `Stream.StartParquet(label)` | `Stream.StartParquet(label, nil)` | 2026-11-12 |
+| `AttachOptions{Archive: ArchiveOptions{...}}` | `AttachOptions{Parquet: &ParquetOptions{...}}` | 2026-11-12 |
+
 ## The rule for names
 
 A name that ends in `Options` is something you give: `MemoryOptions`,

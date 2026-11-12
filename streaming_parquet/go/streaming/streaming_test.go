@@ -51,14 +51,12 @@ func TestLoopbackAttach(t *testing.T) {
 	}
 	defer tel.Close()
 	s, err := tel.CreateStream("t/loop", testSchema(),
-		StreamOptions{RingRows: 1000,
-			Archive: ParquetOptions{BaseDir: t.TempDir()}})
+		StreamOptions{RingRows: 1000})
 	if err != nil {
 		t.Fatal(err)
 	}
 	a, err := tel.Attach("t/loop", AttachOptions{
-		Ticket:  &Ticket{Name: "t/loop", Host: "127.0.0.1", Port: tel.FlightPort()},
-		Archive: ParquetOptions{BaseDir: t.TempDir()},
+		Ticket: &Ticket{Name: "t/loop", Host: "127.0.0.1", Port: tel.FlightPort()},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -108,16 +106,15 @@ func TestAttachedArchivesParquet(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tel.Close()
-	pubDir, subDir := t.TempDir(), t.TempDir()
+	subDir := t.TempDir()
 	s, err := tel.CreateStream("t/arch", testSchema(),
-		StreamOptions{RingRows: 2000,
-			Archive: ParquetOptions{BaseDir: pubDir}})
+		StreamOptions{RingRows: 2000})
 	if err != nil {
 		t.Fatal(err)
 	}
 	a, err := tel.Attach("t/arch", AttachOptions{
 		Ticket: &Ticket{Name: "t/arch", Host: "127.0.0.1", Port: tel.FlightPort()},
-		Archive: ParquetOptions{BaseDir: subDir, RowGroupRows: 200,
+		Parquet: &ParquetOptions{BaseDir: subDir, RowGroupRows: 200,
 			CheckpointSeconds: 0.05},
 	})
 	if err != nil {
