@@ -289,6 +289,11 @@ class Catalog:
 
     # ---- what the stream calls -------------------------------------------
 
+    def set_cadence(self, retry_s, copy_s):
+        """The retry wait and the dated copies' interval, from now on."""
+        self._retry_s = retry_s
+        self._copy_s = copy_s
+
     def stop(self):
         """The stream is closing: a running pass stops after its current
         file, and a queued one does not start. Nothing is published; the

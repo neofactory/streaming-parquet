@@ -13,18 +13,20 @@ calls one of the reader verbs, and it all just works.
 
     # ---- writing ------------------------------------------------------
     s = sp.create_stream(name, arrow_schema, store=STORE,   # spool= for the local copy's place
-            memory=sp.Memory(lookback=rows),
-            archive=sp.Archive(checkpoint_seconds=15, ship_seconds=15, parquet={...}))   # None = memory only
+            memory=sp.MemoryOptions(lookback=rows),
+            parquet=sp.ParquetOptions(checkpoint_seconds=15, ship_seconds=15, compression={...}),   # None = no files until start_parquet
+            publish=True)                                   # False = internal: this process only
     row = s.get_mutable_row(); row.x = 1.0; s.commit()      # one row
     s.append(table_or_batch_or_dict)                        # many rows
     m = s.wire_map(entries); s.from_wire(m, frame); s.commit()
     s.cut(label=...)                     # end the file; next file carries label
-    s.start_parquet(label), s.stop_parquet()   # archive on and off, stream live
+    s.start_parquet(label, options), s.stop_parquet()   # parquet on and off, stream live
+    s.publish(), s.unpublish()           # found and read by other processes, or internal
     s.archive_state(), s.mirror_state(), s.memory_state()
     s.close()
 
     # ---- reading (a Stream reads the same way) -----------------------
-    a = sp.connect(name, store=STORE, memory=sp.Memory(lookback=rows))
+    a = sp.connect(name, store=STORE, memory=sp.MemoryOptions(lookback=rows))
     a.newest_row()                       # one row: row.tv, row.x ...
     for row in a.cursor(): ...           # the rows this reader has not seen
     a.cursor().arrow_table()             #   the same rows as one table
@@ -59,8 +61,10 @@ from . import _stall
 from . import _tickets
 from ._tickets import DEFAULT_PUBLIC_STORE, DEFAULT_SPOOL  # noqa: F401 -- public API
 from ._parquet_writer import ParquetWriter
-from ._options import (Memory, Archive, ArchiveState, MirrorState,  # noqa: F401
-                       MemoryState, View)
+from ._options import (MemoryOptions, ParquetOptions, ArchiveState,  # noqa: F401
+                       MirrorState, MemoryState, View)
+from ._options import Memory, Archive  # noqa: F401 -- old names, see _deprecations
+from ._deprecations import old_name as _old_name
 from ._stream import Stream, DEFAULT_ROW_GROUP_ROWS, KEEP_LABEL  # noqa: F401 -- public API
 from ._attach import Attached, Cursor, _Feeder  # noqa: F401
 from ._flight_server import start_flight_server
@@ -96,7 +100,7 @@ def _ensure_flight_server():
 
 
 def create_stream(name, schema, store=None, spool=DEFAULT_SPOOL,
-                  memory=None, archive=None):
+                  memory=None, parquet=None, *, archive=None, publish=True):
     """Create a stream this process writes.
 
     name:    the stream's whole path under the store
@@ -116,11 +120,23 @@ def create_stream(name, schema, store=None, spool=DEFAULT_SPOOL,
              /var/tmp/streaming-parquet/<user>/. None = no local copy,
              the bucket is the first copy. Ignored for a directory
              store, which is written straight into.
-    memory:  Memory(lookback, maximum, segment_bytes). None =
+    memory:  MemoryOptions(lookback, maximum, segment_bytes). None =
              the defaults: a ring of two parquet row groups.
-    archive: Archive(checkpoint_seconds, row_group_rows,
-             row_group_seconds, ship_seconds, parquet): the tuning.
-             None = memory only, no files.
+    parquet: ParquetOptions(checkpoint_seconds, row_group_rows,
+             row_group_seconds, ship_seconds, compression,
+             catalog_copy_seconds): the tuning. None = no files until
+             a start_parquet.
+    archive: the old name of `parquet` (docs/deprecations.md).
+    publish: True = other processes can find the stream (its ticket in
+             the store) and read it (the Flight server). False = an
+             internal stream: no ticket, not served; code in this
+             process reads it with connect(name). Stream.publish() and
+             Stream.unpublish() change it later.
+
+    One writer per stream: a stream that is published, or that writes
+    parquet, holds the stream's writer lock from then until it closes.
+    An internal stream with no parquet holds none, so several processes
+    can each have one of the same name.
 
     Returns a Stream. commit() on it triggers the library's worker
     threads; nothing slow runs on the caller's thread.
@@ -128,12 +144,18 @@ def create_stream(name, schema, store=None, spool=DEFAULT_SPOOL,
     if not isinstance(schema, pa.Schema):
         raise TypeError(f"create_stream: schema must be a pyarrow.Schema, "
                         f"got {type(schema).__name__}")
-    if memory is not None and not isinstance(memory, Memory):
-        raise TypeError(f"create_stream: memory must be a Memory, got "
-                        f"{type(memory).__name__}")
-    if archive is not None and not isinstance(archive, Archive):
-        raise TypeError(f"create_stream: archive must be an Archive, got "
-                        f"{type(archive).__name__}")
+    if memory is not None and not isinstance(memory, MemoryOptions):
+        raise TypeError(f"create_stream: memory must be a MemoryOptions, "
+                        f"got {type(memory).__name__}")
+    if archive is not None:
+        _old_name("create_stream(archive=...)")
+        if parquet is not None:
+            raise TypeError("create_stream: archive is the old name of "
+                            "parquet; give parquet only")
+        parquet = archive
+    if parquet is not None and not isinstance(parquet, ParquetOptions):
+        raise TypeError(f"create_stream: parquet must be a ParquetOptions, "
+                        f"got {type(parquet).__name__}")
     if store is None:
         store = _tickets.resolve_store(for_write=True)
     if store is not None:
@@ -153,37 +175,52 @@ def create_stream(name, schema, store=None, spool=DEFAULT_SPOOL,
     else:
         lock_dir = spool if spool is not None else DEFAULT_SPOOL
     from ._stream import _get_local_ip
-    owner = _owner.claim(name, lock_dir, store, _get_local_ip(), port, run)
+
+    def claim():
+        return _owner.claim(name, lock_dir, store, _get_local_ip(), port, run)
+
+    owner = claim() if publish or parquet is not None else None
+
+    def make_writer(options):
+        """The stream's ParquetWriter, started: built here at creation,
+        or by the first start_parquet of a stream created with none."""
+        writer = _writer_for(name, schema, store, spool, options, run)
+        if kind in ("s3", "dir"):
+            # the catalog of the stream's finished files, in the store
+            folder = _tickets.archive_dir(store, name)
+            folder = folder if folder.endswith("/") else folder + "/"
+            writer.catalog = _catalog.Catalog(
+                name, folder,
+                os.path.join(lock_dir, "streams", name, "catalog.work.ducklake"),
+                retry_s=options.ship_seconds,
+                copy_s=options.catalog_copy_seconds)
+            writer.catalog.on_listed = writer.cataloged
+        writer.start()
+        return writer
+
+    # nowhere to write files: start_parquet says so at the call
+    nowhere = (f"stream {name!r} has no store and no spool: nowhere to "
+               f"write parquet") if store is None and spool is None else None
     try:
-        writer = None
-        if archive is not None:
-            writer = _writer_for(name, schema, store, spool, archive, run)
-            if kind in ("s3", "dir"):
-                # the catalog of the stream's finished files, in the store
-                folder = _tickets.archive_dir(store, name)
-                folder = folder if folder.endswith("/") else folder + "/"
-                writer.catalog = _catalog.Catalog(
-                    name, folder,
-                    os.path.join(lock_dir, "streams", name, "catalog.work.ducklake"),
-                    retry_s=archive.ship_seconds,
-                    copy_s=archive.catalog_copy_seconds)
-                writer.catalog.on_listed = writer.cataloged
-            writer.start()
+        writer = make_writer(parquet) if parquet is not None else None
         with _lock:
             if name in _streams:
                 raise ValueError(f"Stream '{name}' already exists")
             stream = Stream(name, schema, server, port, run, memory=memory,
-                            archive=archive, store=store, writer=writer,
-                            owner=owner)
-            server.register_stream(name, schema, stream)  # readers pull from it
+                            parquet=parquet, store=store, writer=writer,
+                            owner=owner, make_writer=make_writer,
+                            nowhere=nowhere, publish=publish, claim=claim)
+            if publish:
+                server.register_stream(name, schema, stream)  # readers pull from it
             _streams[name] = stream
     except BaseException:
-        owner.release()
+        if owner is not None:
+            owner.release()
         raise
     return stream
 
 
-def _writer_for(name, schema, store, spool, archive, run):
+def _writer_for(name, schema, store, spool, parquet, run):
     """The ParquetWriter for a stream's store and spool.
 
     bucket store, spool given: first copy in the spool, mirrored to the
@@ -193,7 +230,7 @@ def _writer_for(name, schema, store, spool, archive, run):
     no store: the spool is the only copy
     """
     import parquet_checkpoint
-    opts = dict(archive.parquet or {})
+    opts = dict(parquet.compression or {})
     kind, where = (None, None) if store is None else _tickets.parse_store(store)
     if kind == "dir":
         return ParquetWriter(name, schema, run, base_dir=where, **opts)
@@ -243,10 +280,10 @@ def create_playback_stream(name, parquet_path, *,
 
     table = pq.read_table(parquet_path)
     if memory is None:
-        memory = Memory(lookback=max(1, table.num_rows))
+        memory = MemoryOptions(lookback=max(1, table.num_rows))
 
     stream = create_stream(name, table.schema, store=store, memory=memory,
-                           archive=None)
+                           parquet=None)
 
     # Mark as playback BEFORE the load so no reader ever sees unclamped
     # rows. clock defaults to the wall clock; pass a replay-aware
@@ -290,8 +327,8 @@ def connect(name=None, store=None, memory=None, columns=None, ticket=None):
     """
     if name is None and ticket is None:
         raise ValueError("connect() requires name or ticket")
-    if memory is not None and not isinstance(memory, Memory):
-        raise TypeError(f"connect: memory must be a Memory, got "
+    if memory is not None and not isinstance(memory, MemoryOptions):
+        raise TypeError(f"connect: memory must be a MemoryOptions, got "
                         f"{type(memory).__name__}")
 
     if name is not None and "://" in name and "/streams/" in name:
@@ -326,7 +363,7 @@ def connect(name=None, store=None, memory=None, columns=None, ticket=None):
         resolved_name = name
         feeder_store = store if store is not None else _tickets.resolve_store()
 
-    memory = memory or Memory()
+    memory = memory or MemoryOptions()
     feeder = _Feeder(resolved_name, ticket=ticket, store=feeder_store,
                      capacity=(memory.lookback if memory.lookback is not None
                                else 2 * DEFAULT_ROW_GROUP_ROWS),
@@ -386,14 +423,19 @@ def cut(label=KEEP_LABEL):
         stream.cut(label)
 
 
-def start_parquet(label=None):
-    """Begin archiving on every local stream: each opens a fresh file
-    with `label` in its name, covering rows committed from this moment.
-    Readers are unaffected -- gating is the archive's only."""
+def start_parquet(label=None, options=None):
+    """Start a new file on the local streams: each opens a fresh file
+    with `label` in its name, holding the rows committed from this
+    moment. Readers are unaffected.
+
+    With `options` (a ParquetOptions): every local stream, and each gets
+    those options. Without: the streams that have parquet options; a
+    stream that has none wants no files and is left alone."""
     with _lock:
         stream_list = list(_streams.values())
     for stream in stream_list:
-        stream.start_parquet(label=label)
+        if options is not None or stream.parquet_options is not None:
+            stream.start_parquet(label=label, options=options)
 
 
 def stop_parquet():

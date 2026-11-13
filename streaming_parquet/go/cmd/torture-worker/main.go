@@ -123,20 +123,17 @@ func main() {
 func runPub(tel *streaming.Telemetry, name, kind string, rate int,
 	rng *rand.Rand, archdir string, deadline time.Time,
 	stop chan os.Signal) {
-	arch := streaming.ArchiveOptions{BaseDir: os.TempDir()}
-	if archdir != "-" {
-		arch = streaming.ArchiveOptions{BaseDir: archdir,
-			RowGroupSeconds: 3, CheckpointSeconds: 0.7,
-			RowGroupRows: int64(rate) * 3}
-	}
 	s, err := tel.CreateStream(name, schemaFor(kind),
-		streaming.StreamOptions{RingRows: int64(rate) * 6, Archive: arch})
+		streaming.StreamOptions{RingRows: int64(rate) * 6})
 	if err != nil {
 		die(err)
 	}
 	session := 0
 	if archdir != "-" {
-		if err := s.StartParquet(fmt.Sprintf("s%03d", session)); err != nil {
+		if err := s.StartParquet(fmt.Sprintf("s%03d", session),
+			&streaming.ParquetOptions{BaseDir: archdir,
+				RowGroupSeconds: 3, CheckpointSeconds: 0.7,
+				RowGroupRows: int64(rate) * 3}); err != nil {
 			die(err)
 		}
 	}
@@ -176,12 +173,12 @@ func runPub(tel *streaming.Telemetry, name, kind string, rate int,
 			}
 			n++
 		}
-		if _, err := r.Commit(); err != nil {
+		if _, err := s.Commit(); err != nil {
 			die(err)
 		}
-		if _, err := s.Publish(); err != nil {
+		if as := s.ArchiveState(); as.Failing {
 			st.Errors++
-			st.Note = err.Error()
+			st.Note = as.Error
 		}
 		st.Rows = n
 		if archdir != "-" && time.Now().After(nextChurn) {
@@ -191,7 +188,7 @@ func runPub(tel *streaming.Telemetry, name, kind string, rate int,
 			}
 			st.Files++
 			session++
-			if err := s.StartParquet(fmt.Sprintf("s%03d", session)); err != nil {
+			if err := s.StartParquet(fmt.Sprintf("s%03d", session), nil); err != nil {
 				die(err)
 			}
 			nextChurn = time.Now().Add(
@@ -219,14 +216,14 @@ done:
 func runSub(tel *streaming.Telemetry, name, kind string, rate int,
 	rng *rand.Rand, archdir string, deadline time.Time,
 	stop chan os.Signal) {
-	arch := streaming.ArchiveOptions{BaseDir: os.TempDir()}
+	var parquet *streaming.ParquetOptions
 	if archdir != "-" {
-		arch = streaming.ArchiveOptions{BaseDir: archdir,
+		parquet = &streaming.ParquetOptions{BaseDir: archdir,
 			RowGroupSeconds: 3, CheckpointSeconds: 0.7,
 			RowGroupRows: int64(rate) * 3}
 	}
 	a, err := tel.Attach(name, streaming.AttachOptions{
-		RingRows: int64(rate) * 6, Archive: arch})
+		RingRows: int64(rate) * 6, Parquet: parquet})
 	if err != nil {
 		die(err)
 	}

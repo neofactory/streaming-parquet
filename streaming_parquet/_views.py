@@ -391,7 +391,7 @@ class StoreView:
                    "keeps for a running query, or this reader connected a "
                    "moment ago and the store has not reached its first row "
                    "yet. Run it again; for longer queries connect with a "
-                   "larger Memory(lookback=...).")
+                   "larger MemoryOptions(lookback=...).")
             pieces.append(
                 f'SELECT * EXCLUDE (_seq, _first) FROM "{self._mem_name}" '
                 f'WHERE _seq > {int(seam)} AND CASE WHEN _first > '
@@ -466,13 +466,13 @@ class StoreView:
                         f"store ends at row {stored}: the ring is too short "
                         f"for the store's lag of {behind} rows, so the view "
                         f"reads the files only and is that far behind. "
-                        f"Connect with Memory(lookback={want}) or more "
+                        f"Connect with MemoryOptions(lookback={want}) or more "
                         f"(now {capacity}).")
             else:
                 note = (f"the store is {behind} rows behind a ring of "
                         f"{capacity}: a running query has less than a "
                         f"quarter of the ring to reach memory. Connect with "
-                        f"Memory(lookback={want}) or more.")
+                        f"MemoryOptions(lookback={want}) or more.")
         if (note is None) != (self.ring_note is None):
             if note is not None:
                 _diag.warning(f"[{self._source.name}] view {self.name}: {note}")

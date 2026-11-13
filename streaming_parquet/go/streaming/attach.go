@@ -32,8 +32,8 @@ type Attached struct {
 	mu      sync.Mutex
 	ring    *ring.Ring
 	arch    *archiver
-	archOpt ArchiveOptions
-	armed   atomic.Bool // StartParquet requested (possibly pre-schema)
+	archOpt *ParquetOptions // nil: this reader writes no files
+	armed   atomic.Bool     // StartParquet requested (possibly pre-schema)
 	label   string
 
 	capacity int64
@@ -44,23 +44,32 @@ type Attached struct {
 }
 
 type AttachOptions struct {
-	RingRows int64    // local ring rows; see ringSizes for the default
-	Columns  []string // subset subscription; nil = all
-	Ticket   *Ticket  // dial directly, skipping root discovery
-	Archive  ArchiveOptions
+	RingRows int64           // local ring rows; see ringSizes for the default
+	Columns  []string        // subset subscription; nil = all
+	Ticket   *Ticket         // dial directly, skipping root discovery
+	Parquet  *ParquetOptions // for a reader that writes the rows it receives to parquet; nil = it writes none
 }
 
 // Attach opens the read face. Remote: a feeder goroutine waits for a
 // live ticket, connects, and appends every received batch into the
 // local ring (reconnecting with backoff). State() reports where it is.
 func (t *Telemetry) Attach(name string, o AttachOptions) (*Attached, error) {
-	ringRows, groupRows, err := ringSizes(name, o.RingRows, o.Archive.RowGroupRows)
+	var archOpt *ParquetOptions
+	var givenGroupRows int64
+	if o.Parquet != nil {
+		givenGroupRows = o.Parquet.RowGroupRows
+	}
+	ringRows, groupRows, err := ringSizes(name, o.RingRows, givenGroupRows)
 	if err != nil {
 		return nil, err
 	}
-	o.Archive.RowGroupRows = groupRows
+	if o.Parquet != nil {
+		opts := *o.Parquet
+		opts.RowGroupRows = groupRows
+		archOpt = &opts
+	}
 	a := &Attached{Name: name, capacity: ringRows, columns: o.Columns,
-		archOpt: o.Archive, closed: make(chan struct{})}
+		archOpt: archOpt, closed: make(chan struct{})}
 	a.state.Store("no-ticket")
 	if o.Ticket != nil {
 		a.state.Store("connecting")
@@ -105,6 +114,10 @@ func (a *Attached) WaitRing(timeout time.Duration) (*ring.Ring, error) {
 func (a *Attached) StartParquet(label string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.archOpt == nil {
+		return fmt.Errorf("attach %s: StartParquet needs AttachOptions.Parquet: "+
+			"it says where the files go", a.Name)
+	}
 	a.label = label
 	a.armed.Store(true)
 	if a.arch != nil {
@@ -293,16 +306,18 @@ func (a *Attached) receive(tk *Ticket) error {
 			return err
 		}
 		a.ring = r
-		arch, err := newArchiver(r, a.Name, tk.Run, a.archOpt)
-		if err != nil {
-			a.mu.Unlock()
-			return err
-		}
-		a.arch = arch
-		if a.armed.Load() {
-			if err := arch.start(a.label); err != nil {
+		if a.archOpt != nil {
+			arch, err := newArchiver(r, a.Name, tk.Run, *a.archOpt)
+			if err != nil {
 				a.mu.Unlock()
 				return err
+			}
+			a.arch = arch
+			if a.armed.Load() {
+				if err := arch.start(a.label); err != nil {
+					a.mu.Unlock()
+					return err
+				}
 			}
 		}
 	}

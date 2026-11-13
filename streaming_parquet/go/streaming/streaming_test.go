@@ -34,11 +34,20 @@ func writeRows(t *testing.T, s *Stream, start, count int) {
 		r.SetF64(x, float64(i)*0.5)
 		r.SetString(sl, fmt.Sprintf("row-%d", i))
 	}
-	if _, err := r.Commit(); err != nil {
+	if _, err := s.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Publish(); err != nil {
-		t.Fatal(err)
+}
+
+// waitUntil polls cond for up to three seconds.
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -51,14 +60,12 @@ func TestLoopbackAttach(t *testing.T) {
 	}
 	defer tel.Close()
 	s, err := tel.CreateStream("t/loop", testSchema(),
-		StreamOptions{RingRows: 1000,
-			Archive: ArchiveOptions{BaseDir: t.TempDir()}})
+		StreamOptions{RingRows: 1000})
 	if err != nil {
 		t.Fatal(err)
 	}
 	a, err := tel.Attach("t/loop", AttachOptions{
-		Ticket:  &Ticket{Name: "t/loop", Host: "127.0.0.1", Port: tel.FlightPort()},
-		Archive: ArchiveOptions{BaseDir: t.TempDir()},
+		Ticket: &Ticket{Name: "t/loop", Host: "127.0.0.1", Port: tel.FlightPort()},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -108,16 +115,15 @@ func TestAttachedArchivesParquet(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tel.Close()
-	pubDir, subDir := t.TempDir(), t.TempDir()
+	subDir := t.TempDir()
 	s, err := tel.CreateStream("t/arch", testSchema(),
-		StreamOptions{RingRows: 2000,
-			Archive: ArchiveOptions{BaseDir: pubDir}})
+		StreamOptions{RingRows: 2000})
 	if err != nil {
 		t.Fatal(err)
 	}
 	a, err := tel.Attach("t/arch", AttachOptions{
 		Ticket: &Ticket{Name: "t/arch", Host: "127.0.0.1", Port: tel.FlightPort()},
-		Archive: ArchiveOptions{BaseDir: subDir, RowGroupRows: 200,
+		Parquet: &ParquetOptions{BaseDir: subDir, RowGroupRows: 200,
 			CheckpointSeconds: 0.05},
 	})
 	if err != nil {

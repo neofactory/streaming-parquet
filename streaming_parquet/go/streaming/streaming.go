@@ -9,7 +9,7 @@
 //	tel, _ := streaming.Init(streaming.Config{Root: "/data/streams"})
 //	s, _ := tel.CreateStream("press/fieldbus", schema, opts)
 //	    // write via s.Ring(): RowBegin / Set* / Commit / wire maps
-//	    // s.Publish() from your loop; s.StartParquet("O0019")
+//	    // s.Commit() after your rows; s.StartParquet("O0019", nil)
 //	a, _ := tel.Attach("probe/voltages", streaming.AttachOptions{})
 //	    // read via a.Ring(): getters, relations
 //	    // a.StartParquet("cal-run")  <- archival is symmetric: any

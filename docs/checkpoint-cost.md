@@ -40,7 +40,7 @@ The four designs:
   file is also cut at 256 MB. A checkpoint with 5 MiB of new rows
   writes them straight into a chunk.
 - **Row groups only.** No checkpoints
-  (`Archive(checkpoint_seconds=None)`). A row group is written once,
+  (`ParquetOptions(checkpoint_seconds=None)`). A row group is written once,
   when it is full, with the same byte rules.
 
 Rows lost if the writer dies, as time. This is also how stale the store
@@ -158,10 +158,10 @@ as the last part of the file. The tables count this.
 
 The checkpoint interval. The design added no setting.
 
-- `Archive(checkpoint_seconds=...)` is the promise. `None`, the
+- `ParquetOptions(checkpoint_seconds=...)` is the promise. `None`, the
   default, is row groups only: the store gets a row group when it is
   full, and not before.
-- `Archive(row_group_seconds=...)` ends a row group after that long.
+- `ParquetOptions(row_group_seconds=...)` ends a row group after that long.
 - A stream that commits no rows writes no checkpoint. The cost is for
   intervals that have new rows.
 
