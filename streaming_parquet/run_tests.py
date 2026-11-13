@@ -23,7 +23,6 @@ import pyarrow.parquet as pq
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-os.environ["STREAMING_PARQUET_CHECK_CORE"] = "1"   # the core beside this code
 import streaming_parquet as sp
 import parquet_checkpoint  # noqa: E402 (path set above)
 
@@ -2822,12 +2821,23 @@ def _():
 
 print("\n--- the stream core, side by side ---")
 
-@test("the core wrote and read every ticket of this suite as the Python code did")
+@test("the ticket in the store is the core's text, with every member")
 def _():
-    assert sp._tickets.CHECK_CORE
-    n = sp._tickets.core_checks[0]
-    assert n > 200, f"only {n} comparisons with the core were made"
-    print(f"        {n} comparisons, no difference", flush=True)
+    from streaming_parquet import _core
+    with tempfile.TemporaryDirectory() as tmp:
+        s = sp.create_stream("v2test/coretk", SCHEMA, store=tmp,
+                             memory=MemoryOptions(lookback=500),
+                             parquet=ParquetOptions(checkpoint_seconds=0.1))
+        fill(s, 10)
+        path = os.path.join(tmp, "tickets", "v2test", "coretk.json")
+        wait_for(lambda: os.path.exists(path) and
+                 sp._tickets.get_ticket(tmp, "v2test/coretk")["files"],
+                 what="a ticket that names the unfinished file")
+        text = open(path).read()
+        t = _core.ticket_from_text(text)
+        assert _core.ticket_text(t) == text
+        assert set(t) == set(_core.TICKET_FIELDS) - {"archive"} | {"files", "unfinished"}, sorted(t)
+        assert t["unfinished"] == [f["checkpoint"] for f in t["files"]]
 
 
 @test("the core refuses a ticket with a member of the wrong kind, naming it")

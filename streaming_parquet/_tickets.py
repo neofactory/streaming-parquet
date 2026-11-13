@@ -29,11 +29,12 @@ daemon must fail visibly, never publish somewhere surprising.
 """
 
 import getpass
-import json
 import os
 import threading
 
 import parquet_checkpoint
+
+from . import _core
 
 DEFAULT_PUBLIC_STORE = "s3://streaming-parquet"
 
@@ -145,44 +146,24 @@ def stale_after(ticket):
     writer: three of its beats, at least 30 seconds
     (parquet_checkpoint.dead_after). A ticket that does not say gets
     the rule for a writer with no beat."""
-    promised = ticket.get("stale_after")
-    answer = (parquet_checkpoint.dead_after() if promised is None
-              else float(promised))
-    if CHECK_CORE:
-        from . import _core
-        core = _core.ticket_stale_after(ticket, parquet_checkpoint.dead_after())
-        if core != answer:
-            raise AssertionError(f"the core's stale_after is {core}, this "
-                                 f"module's {answer}, for {ticket}")
-        core_checks[0] += 1
-    return answer
+    return _core.ticket_stale_after(ticket, parquet_checkpoint.dead_after())
 
 
-#: Side by side with the stream core (core/sp.c). While this is set, every
-#: ticket this module writes and every stale_after it answers is also
-#: done by the core, and a difference raises. The suite sets it; it goes
-#: when the core's ticket is the only one. [compared, differences]
-CHECK_CORE = bool(os.environ.get("STREAMING_PARQUET_CHECK_CORE"))
-core_checks = [0]
+def _text(ticket):
+    """A ticket dict as the bytes the store holds: the stream core
+    writes the text (core/sp.h is the ticket's spec)."""
+    return _core.ticket_text(ticket).encode()
 
 
-def _check_core_ticket(ticket):
-    """The core writes and reads this ticket as this module does."""
-    from . import _core
-    written = json.loads(_core.ticket_text(ticket))
-    if written != ticket:
-        raise AssertionError(f"the core writes this ticket differently:\n"
-                             f"  python {ticket}\n  core   {written}")
-    read = _core.ticket_from_text(json.dumps(ticket))
-    if read != ticket:
-        raise AssertionError(f"the core reads this ticket differently:\n"
-                             f"  python {ticket}\n  core   {read}")
-    core_checks[0] += 1
+def _ticket(raw):
+    """The ticket dict of the bytes the store holds: the stream core
+    reads them. It has every member the core knows, None for one the
+    writer did not say; a member of the wrong kind is refused, by name
+    (_core.TicketError)."""
+    return _core.ticket_from_text(raw)
 
 
 def put_ticket(store, name, ticket):
-    if CHECK_CORE:
-        _check_core_ticket(ticket)
     _store_for(store).put(name, ticket)
 
 
@@ -208,11 +189,11 @@ class _SinkStore:
         self._sink = sink.sub("tickets")
 
     def put(self, name, ticket):
-        self._sink.put(name + ".json", json.dumps(ticket).encode())
+        self._sink.put(name + ".json", _text(ticket))
 
     def get(self, name):
         try:
-            return json.loads(self._sink.get(name + ".json"))
+            return _ticket(self._sink.get(name + ".json"))
         except Exception:
             return None
 
@@ -242,14 +223,14 @@ class _FileStore:
         path = self._path(name)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(ticket, f)
+        with open(tmp, "wb") as f:
+            f.write(_text(ticket))
         os.replace(tmp, path)
 
     def get(self, name):
         try:
-            with open(self._path(name)) as f:
-                return json.load(f)
+            with open(self._path(name), "rb") as f:
+                return _ticket(f.read())
         except FileNotFoundError:
             return None
 
@@ -294,7 +275,7 @@ class _S3Store:
     def put(self, name, ticket):
         key = self._key(name)
         self._timed("put", key, lambda: self._s3.put_object(
-            Bucket=self._bucket, Key=key, Body=json.dumps(ticket).encode(),
+            Bucket=self._bucket, Key=key, Body=_text(ticket),
             ContentType="application/json"))
 
     def get(self, name):
@@ -306,7 +287,7 @@ class _S3Store:
             if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
                 return None
             raise
-        return json.loads(obj["Body"].read())
+        return _ticket(obj["Body"].read())
 
     def delete(self, name):
         key = self._key(name)
