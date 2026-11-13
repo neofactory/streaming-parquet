@@ -1,6 +1,7 @@
 package streaming
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/neofactory/streaming-parquet/parquet_checkpoint/go/s3fake"
@@ -41,7 +42,7 @@ func TestS3StoreTickets(t *testing.T) {
 		t.Fatal("the ticket is not at <prefix>/tickets/<name>.json")
 	}
 	got, err := store.get("air/dfw")
-	if err != nil || got == nil || *got != want {
+	if err != nil || got == nil || !reflect.DeepEqual(*got, want) {
 		t.Fatalf("round trip: %+v %v", got, err)
 	}
 	if err := store.put("air/hou", Ticket{Name: "air/hou"}); err != nil {

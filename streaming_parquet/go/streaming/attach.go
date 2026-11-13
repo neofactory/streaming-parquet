@@ -190,7 +190,7 @@ func (a *Attached) lifecycle(t *Telemetry, direct *Ticket) {
 			continue
 		}
 		if direct == nil && cur.Ts > 0 &&
-			float64(time.Now().UnixNano())/1e9-cur.Ts > cur.staleAfter() {
+			cur.isStale(float64(time.Now().UnixNano())/1e9) {
 			a.state.Store("waiting")
 			if !wait(ticketPollInterval) {
 				return

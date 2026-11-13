@@ -37,6 +37,16 @@ atexit.register(lambda: shutil.rmtree(ROOT, ignore_errors=True))
 
 import streaming_parquet as sp
 
+# The Go package compiles checked-in copies of the stream core (the Go
+# build cache needs in-package files). Refresh them; the last test
+# fails if they differ.
+import filecmp
+CORE_COPIES = [(os.path.join(PKG, 'core', 'sp.c'), os.path.join(GO, 'streaming', 'sp_core.c')),
+               (os.path.join(PKG, 'core', 'sp.h'), os.path.join(GO, 'streaming', 'sp.h'))]
+for src, dst in CORE_COPIES:
+    if not os.path.exists(dst) or not filecmp.cmp(src, dst, shallow=False):
+        shutil.copyfile(src, dst)
+
 BIN = os.path.join(tempfile.gettempdir(), 'stream-compat-bin')
 r = subprocess.run(['go', 'build', '-o', BIN, './cmd/stream-compat'],
                    cwd=GO, capture_output=True, text=True)
@@ -226,6 +236,39 @@ def _():
         if child.poll() is None:
             child.kill()
     s.close()
+
+@test("a Go writer's ticket is the new ticket: the core reads it with its members")
+def _():
+    from streaming_parquet import _core
+    child = subprocess.Popen(
+        [BIN, 'serve', ROOT, 'x/goticket', '200', '3'],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        path = os.path.join(ROOT, 'tickets', 'x', 'goticket.json')
+        deadline = time.time() + 20
+        while not os.path.exists(path) and time.time() < deadline:
+            time.sleep(0.05)
+        text = open(path).read()
+        t = _core.ticket_from_text(text)
+        assert t["name"] == 'x/goticket' and t["port"] > 0 and t["run"], t
+        assert t["beat_seconds"] == 60 and t["stale_after"] == 180, t
+        assert t["revision"] == 1, t
+        assert t["files"] == [] and t["unfinished"] == [], t
+        assert t["stored_row"] is None, t      # Go does not say yet
+        # and it is the text the core writes: Python's core writes the same
+        assert _core.ticket_text(t) == text, (_core.ticket_text(t), text)
+        assert not _core.ticket_is_stale(t, t["ts"] + 179, 30.0)
+        assert _core.ticket_is_stale(t, t["ts"] + 180, 30.0)
+    finally:
+        child.wait(timeout=30)
+        assert child.returncode == 0, child.stderr.read()
+
+
+@test("the Go package's copies of the stream core are the core")
+def _():
+    for src, dst in CORE_COPIES:
+        assert filecmp.cmp(src, dst, shallow=False), f"{dst} differs from core/"
+
 
 sp.close()
 print(f"\n{'=' * 50}")

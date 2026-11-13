@@ -1,45 +1,53 @@
 package streaming
 
 import (
-	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/neofactory/streaming-parquet/parquet_checkpoint/go/pqc"
 )
 
-// Ticket is the discovery record, wire-compatible with the Python
-// module: one JSON object at <root>/tickets/<name>.json, rewritten
-// every heartbeat with a fresh Ts; deleted on clean close. A missing
-// ticket means "no publisher"; a stale Ts means "dead publisher".
-// StaleAfter is the writer's own word on when its ticket is stale.
+// Ticket is a stream's ticket: one JSON object at
+// <root>/tickets/<name>.json, written by the stream's writer and
+// deleted on a clean close. A missing ticket means no writer; a stale
+// one means a writer that died. Its members, their kinds, its text and
+// the stale rule are the stream core's (sp.h is the spec); this struct
+// is the Go form. A text member that is "" and a number that is 0 are
+// members the writer did not know; StoredRow is a pointer because -1 is
+// a value ("no row stored").
 type Ticket struct {
-	Name string  `json:"name"`
-	Host string  `json:"host"`
-	Port int     `json:"port"`
-	Ts   float64 `json:"ts"`
-	Run  string  `json:"run,omitempty"` // the writer's start time, UTC
-	//                 text to the microsecond; changes on respawn, so
-	//                 subscribers resync instead of livelocking on the
-	//                 restarted seq axis; every file records it as sp_run
-	Archive string `json:"archive,omitempty"` // where the history lives
-	// seconds after Ts at which a reader calls the writer dead: three
-	// beats, at least 30 seconds (pqc.DeadAfter, the one rule)
-	StaleAfter float64 `json:"stale_after,omitempty"`
+	Name string
+	Host string
+	Port int
+	Ts   float64 // when the ticket was written
+	Run  string  // the writer's start time, UTC to the microsecond;
+	//              every file it writes records it as sp_run
+
+	BeatSeconds       float64 // the longest gap between two writes of the ticket
+	StaleAfter        float64 // seconds after Ts at which a reader calls the writer dead
+	CheckpointSeconds float64
+	ShipSeconds       float64
+	StoredRow         *int64 // the newest row of this run the store holds; -1 = none
+	StoredAt          float64
+	Files             []TicketFile // the files not finished in the store
+	KeepSeconds       float64
+	CatalogEtag       string
+	Revision          int64 // counts this run's writes of the ticket
+
+	Archive string // where the files are; writers before 2026-11 wrote it
 }
 
-// staleAfter is the seconds after its write at which a ticket means a
-// dead writer: what the ticket says, else the rule for a writer that
-// names no beat.
-func (t *Ticket) staleAfter() float64 {
-	if t.StaleAfter > 0 {
-		return t.StaleAfter
-	}
-	return pqc.DeadAfter(0).Seconds()
+// TicketFile is one file not finished in the store: the path of its
+// newest checkpoint version, the stream row number of its first row,
+// the rows in its finished row groups, and its rows. A nil number is
+// one the writer did not know.
+type TicketFile struct {
+	Checkpoint string
+	FirstRow   *int64
+	FinalRows  *int64
+	Rows       *int64
 }
 
 const (
@@ -90,7 +98,7 @@ func (f *fileStore) put(name string, t Ticket) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	b, err := json.Marshal(t)
+	b, err := ticketText(&t)
 	if err != nil {
 		return err
 	}
@@ -109,11 +117,11 @@ func (f *fileStore) get(name string) (*Ticket, error) {
 	if err != nil {
 		return nil, err
 	}
-	var t Ticket
-	if err := json.Unmarshal(b, &t); err != nil {
+	t, err := ticketFromText(b)
+	if err != nil {
 		return nil, fmt.Errorf("ticket %s: %w", name, err)
 	}
-	return &t, nil
+	return t, nil
 }
 
 func (f *fileStore) delete(name string) error {

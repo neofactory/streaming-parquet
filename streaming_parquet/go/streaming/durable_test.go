@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -485,5 +486,50 @@ func TestWriterWaitsForRowsNotYetWritten(t *testing.T) {
 	}
 	if rows != 410 {
 		t.Fatalf("the files hold %d rows, want 410", rows)
+	}
+}
+
+// The ticket's text, its members and the stale rule are the stream
+// core's: Go writes the ticket through the core and reads it back the
+// same, reads a ticket from a writer before 2026-11, and is told by
+// name when a member is of the wrong kind.
+func TestTicketIsTheCores(t *testing.T) {
+	row, first, final := int64(41), int64(0), int64(30)
+	want := Ticket{Name: "plant/press", Host: "10.0.0.5", Port: 8815,
+		Ts: 1762979473.5, Run: "2026-11-12T20:31:12.123456Z",
+		BeatSeconds: 15, StaleAfter: 45, CheckpointSeconds: 0.5,
+		StoredRow: &row, StoredAt: 1762979472.25, KeepSeconds: 600,
+		CatalogEtag: "\"abc-1\"", Revision: 7,
+		Files: []TicketFile{
+			{Checkpoint: "s3://b/streams/x/a.parquet.000003.ckpt", FirstRow: &first, FinalRows: &final},
+			{Checkpoint: "s3://b/streams/x/b.parquet.000001.ckpt"}}}
+	text, err := ticketText(&want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, member := range []string{`"ship_seconds": null`, `"stored_row": 41`,
+		`"unfinished": ["s3://b/streams/x/a.parquet.000003.ckpt", "s3://b/streams/x/b.parquet.000001.ckpt"]`,
+		`"first_row": 0, "final_rows": 30, "rows": null`} {
+		if !strings.Contains(string(text), member) {
+			t.Fatalf("the ticket text has no %s:\n%s", member, text)
+		}
+	}
+	got, err := ticketFromText(text)
+	if err != nil || !reflect.DeepEqual(*got, want) {
+		t.Fatalf("round trip: %+v, %v\nwant %+v", got, err, want)
+	}
+	if got.isStale(want.Ts+44.9) || !got.isStale(want.Ts+45) {
+		t.Fatal("stale at the wrong time: want exactly stale_after past ts")
+	}
+	old, err := ticketFromText([]byte(`{"name":"air/dfw","host":"h","port":1,"ts":100,"archive":"s3://b/x","later":[1]}`))
+	if err != nil || old.Archive != "s3://b/x" || old.StoredRow != nil || old.Revision != 0 {
+		t.Fatalf("a ticket from an older writer: %+v, %v", old, err)
+	}
+	if old.staleAfter() != 30 || old.isStale(129.9) || !old.isStale(130) {
+		t.Fatalf("an older ticket's stale rule: %v", old.staleAfter())
+	}
+	if _, err := ticketFromText([]byte(`{"port": "8815"}`)); err == nil ||
+		!strings.Contains(err.Error(), "port is not a number") {
+		t.Fatalf("a port that is text: %v, want it refused by name", err)
 	}
 }

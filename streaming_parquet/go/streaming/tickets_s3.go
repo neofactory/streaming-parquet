@@ -10,7 +10,6 @@ package streaming
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -62,7 +61,7 @@ func newDefaultS3Store(bucket, prefix string) (*s3Store, error) {
 func (s *s3Store) key(name string) string { return s.prefix + "tickets/" + name + ".json" }
 
 func (s *s3Store) put(name string, t Ticket) error {
-	b, err := json.Marshal(t)
+	b, err := ticketText(&t)
 	if err != nil {
 		return err
 	}
@@ -86,11 +85,11 @@ func (s *s3Store) get(name string) (*Ticket, error) {
 	if err != nil {
 		return nil, err
 	}
-	var t Ticket
-	if err := json.Unmarshal(b, &t); err != nil {
+	t, err := ticketFromText(b)
+	if err != nil {
 		return nil, fmt.Errorf("ticket %s: %w", name, err)
 	}
-	return &t, nil
+	return t, nil
 }
 
 func (s *s3Store) delete(name string) error {

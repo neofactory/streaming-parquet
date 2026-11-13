@@ -340,14 +340,25 @@ func (s *Stream) heartbeat(stop chan struct{}) {
 	defer s.hbDone.Done()
 	tick := time.NewTicker(heartbeatInterval)
 	defer tick.Stop()
+	var revision int64
 	pub := func() {
-		err := s.tel.tickets.put(s.Name, Ticket{
+		revision++
+		t := Ticket{
 			Name: s.Name, Host: localIP(), Port: s.tel.flight.port,
-			Ts:         float64(time.Now().UnixNano()) / 1e9,
-			Run:        s.run,
-			Archive:    s.location.Load().(string),
-			StaleAfter: pqc.DeadAfter(heartbeatInterval).Seconds()})
-		if err != nil {
+			Ts:          float64(time.Now().UnixNano()) / 1e9,
+			Run:         s.run,
+			BeatSeconds: heartbeatInterval.Seconds(),
+			StaleAfter:  pqc.DeadAfter(heartbeatInterval).Seconds(),
+			Revision:    revision,
+			Archive:     s.location.Load().(string)}
+		s.mu.Lock()
+		if s.arch != nil && s.arch.recording {
+			t.CheckpointSeconds = s.arch.ckptSeconds
+		}
+		s.mu.Unlock()
+		// StoredRow and Files stay unknown until the core holds the rule
+		// for what the store holds.
+		if err := s.tel.tickets.put(s.Name, t); err != nil {
 			fmt.Fprintf(os.Stderr, "[%s] ticket publish error: %v\n",
 				s.Name, err)
 		}
