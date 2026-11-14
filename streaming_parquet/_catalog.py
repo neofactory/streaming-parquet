@@ -305,6 +305,8 @@ class Catalog:
         """Queue a pass on the catalog thread if one is owed and none is
         queued (after a failure, not before retry_s)."""
         with self._lock:
+            if self._stop.is_set():
+                return              # the stream closed: the next start's reconcile
             if self._queued or not (self._wanted or self._copy_due()):
                 return
             if (self._failed_mono is not None and
