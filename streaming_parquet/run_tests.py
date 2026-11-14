@@ -1593,6 +1593,26 @@ def _():
                 and not n.endswith('.parquet.chunks')] == []
 
 
+@test("catalog: a file that finishes after the stream closed starts no "
+      "pass (the process must not exit inside DuckDB); the next start "
+      "registers it")
+def _():
+    flat = pa.schema([("n", pa.int64())])
+    with tempfile.TemporaryDirectory() as root:
+        s = sp.create_stream("v2test/late", flat, store=root,
+                                    memory=Memory(lookback=500),
+                                    archive=Archive(checkpoint_seconds=0.05))
+        s.append(pa.record_batch([pa.array(range(10))], schema=flat))
+        s.close()
+        cat = s._parquet.catalog
+        started = []
+        start = cat._start
+        cat._start = lambda: (started.append(1), start())
+        cat.file_finished()            # what a late upload's end calls
+        assert started == [], "a pass started after close"
+        assert cat.wait(0.0), "a pass is queued after close"
+
+
 @test("catalog: the reconcile at start registers every finished file the "
       "catalog lacks (a lost catalog is rebuilt from the files)")
 def _():
