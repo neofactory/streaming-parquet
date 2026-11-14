@@ -159,6 +159,78 @@ int main(void) {
     refused("{\"name\": \"a", "text with no end");
     refused("{\"name\" \"a\"}", "':' expected");
 
+    /* ---- the ownership decision ---- */
+    {
+        char msg[1024];
+        size_t len;
+        char *rec = sp_lock_record(4242, "10.0.0.5", 8815,
+                                   "2026-11-12T20:31:12.123456Z", &len);
+        CHECK(strcmp(rec, "{\"pid\":4242,\"host\":\"10.0.0.5\",\"port\":8815,"
+                          "\"run\":\"2026-11-12T20:31:12.123456Z\"}") == 0);
+        sp_lock_refusal("create_stream('a/b')", "/s/streams/a/b/writer.lock",
+                        rec, len, msg, sizeof msg);
+        CHECK(strcmp(msg, "create_stream('a/b'): another process on this "
+            "server writes this stream: pid 4242, run "
+            "2026-11-12T20:31:12.123456Z holds /s/streams/a/b/writer.lock. "
+            "One writer per stream: stop that process first.") == 0);
+        sp_free(rec);
+        /* Python's own spacing, an empty file, damage: all answer */
+        const char *py = "{\"pid\": 7, \"host\": \"h\", \"port\": 1, \"run\": \"r1\"}";
+        sp_lock_refusal("w", "p", py, strlen(py), msg, sizeof msg);
+        CHECK(strstr(msg, "pid 7, run r1 holds p") != NULL);
+        sp_lock_refusal("w", "p", "", 0, msg, sizeof msg);
+        CHECK(strstr(msg, "pid ?, run ? holds p") != NULL);
+        sp_lock_refusal("w", "p", NULL, 0, msg, sizeof msg);
+        CHECK(strstr(msg, "pid ?, run ?") != NULL);
+        const char *bad = "{\"pid\": \"x\", \"run\": 5, \"z\": [1,{\"a\":";
+        sp_lock_refusal("w", "p", bad, strlen(bad), msg, sizeof msg);
+        CHECK(strstr(msg, "pid ?, run ?") != NULL);
+        char tiny[8];
+        sp_lock_refusal("w", "p", py, strlen(py), tiny, sizeof tiny);
+        CHECK(strlen(tiny) == 7);
+        rec = sp_lock_record(1, NULL, 0, NULL, NULL);
+        CHECK(strstr(rec, "\"host\":null") && strstr(rec, "\"run\":null"));
+        sp_free(rec);
+
+        SpTicket *o = full_ticket();              /* host 10.0.0.5, ts ...473.5, stale 45 */
+        double ts = 1762979473.5;
+        CHECK(sp_ownership("w", "n", "s", NULL, "10.0.0.9", ts, 30, msg, sizeof msg) == SP_OWN);
+        CHECK(msg[0] == 0);
+        CHECK(sp_ownership("w", "n", "s", o, "10.0.0.5", ts + 1, 30, msg, sizeof msg) == SP_OWN);
+        CHECK(msg[0] == 0);
+        CHECK(sp_ownership("create_stream('n')", "n", "s3://b", o, "10.0.0.9",
+                           ts + 12.4, 30, msg, sizeof msg) == SP_REFUSED);
+        CHECK(strcmp(msg, "create_stream('n'): the server at 10.0.0.5:8815 "
+            "writes this stream: its ticket in s3://b is 12s old (run "
+            "2026-11-12T20:31:12.123456Z; a ticket is stale after 45s). One "
+            "writer per stream: stop it there, or wait until its ticket is "
+            "stale.") == 0);
+        CHECK(sp_ownership("w", "n", "s", o, "10.0.0.9", ts + 44.9, 30, msg, sizeof msg) == SP_REFUSED);
+        CHECK(sp_ownership("w", "n", "s3://b", o, "10.0.0.9", ts + 45, 30, msg, sizeof msg) == SP_TAKE_OVER);
+        CHECK(strcmp(msg, "[n] taking over from 10.0.0.5:8815: its ticket in "
+            "s3://b is 45s old (run 2026-11-12T20:31:12.123456Z); stale "
+            "after 45s") == 0);
+        /* a ticket that does not say: the host's rule; no ts: stale */
+        sp_ticket_clear(o, SP_T_STALE_AFTER);
+        CHECK(sp_ownership("w", "n", "s", o, "10.0.0.9", ts + 29, 30, msg, sizeof msg) == SP_REFUSED);
+        CHECK(sp_ownership("w", "n", "s", o, "10.0.0.9", ts + 30, 30, msg, sizeof msg) == SP_TAKE_OVER);
+        sp_ticket_clear(o, SP_T_TS);
+        CHECK(sp_ownership("w", "n", "s", o, "10.0.0.9", ts, 30, msg, sizeof msg) == SP_TAKE_OVER);
+        /* a ticket with no host is another writer's */
+        sp_ticket_clear(o, SP_T_HOST);
+        sp_ticket_clear(o, SP_T_PORT);
+        sp_ticket_clear(o, SP_T_RUN);
+        CHECK(sp_ownership("w", "n", "s", o, "10.0.0.9", ts, 30, msg, sizeof msg) == SP_TAKE_OVER);
+        CHECK(strstr(msg, "from ?:?") && strstr(msg, "(run ?)"));
+        CHECK(sp_ownership(NULL, NULL, NULL, o, NULL, ts, 30, NULL, 0) == SP_TAKE_OVER);
+        sp_ticket_free(o);
+
+        sp_ownership_unread("n", "s3://b", "timeout", msg, sizeof msg);
+        CHECK(strcmp(msg, "[n] ownership: the ticket in s3://b could not be "
+            "read (timeout); starting on this server's lock alone -- another "
+            "server writing this stream would not be seen") == 0);
+    }
+
     if (failures == 0) printf("san_test: all checks passed\n");
     return failures ? 1 : 0;
 }

@@ -53,7 +53,28 @@ type Stream struct {
 	stopHB    chan struct{}
 	hbDone    sync.WaitGroup
 
+	// The writer lock (owner.go): taken the first time the stream is
+	// published or starts a file, held until Close.
+	ownMu sync.Mutex
+	owner *ownership
+
 	closed bool
+}
+
+// own holds the stream's writer lock, or returns an error that names
+// the writer that has it.
+func (s *Stream) own() error {
+	s.ownMu.Lock()
+	defer s.ownMu.Unlock()
+	if s.owner != nil {
+		return nil
+	}
+	o, err := s.tel.claim(s.Name, s.run)
+	if err != nil {
+		return err
+	}
+	s.owner = o
+	return nil
 }
 
 // StreamOptions are given once, at CreateStream.
@@ -80,6 +101,12 @@ func (t *Telemetry) CreateStream(name string, schema *arrow.Schema,
 	if err != nil {
 		return nil, err
 	}
+	t.mu.Lock()
+	_, dup := t.streams[name]
+	t.mu.Unlock()
+	if dup {
+		return nil, &DupStreamError{name}
+	}
 	r, err := ring.NewRing(schema, ringRows, nil)
 	if err != nil {
 		return nil, err
@@ -88,8 +115,17 @@ func (t *Telemetry) CreateStream(name string, schema *arrow.Schema,
 		run: runStart(), wake: make(chan struct{}, 1),
 		stopWork: make(chan struct{})}
 	s.location.Store("")
+	// Own the stream before anything of it is written: one writer per
+	// stream. An internal stream with no files takes no lock.
+	if !o.Internal || o.Parquet != nil {
+		if err := s.own(); err != nil {
+			r.Close()
+			return nil, err
+		}
+	}
 	if o.Parquet != nil {
 		if err := s.StartParquet("", o.Parquet); err != nil {
+			s.owner.release()
 			r.Close()
 			return nil, err
 		}
@@ -97,6 +133,7 @@ func (t *Telemetry) CreateStream(name string, schema *arrow.Schema,
 	t.mu.Lock()
 	if _, dup := t.streams[name]; dup {
 		t.mu.Unlock()
+		s.owner.release()
 		r.Close()
 		return nil, &DupStreamError{name}
 	}
@@ -105,7 +142,10 @@ func (t *Telemetry) CreateStream(name string, schema *arrow.Schema,
 	s.workDone.Add(1)
 	go s.work()
 	if !o.Internal {
-		s.Publish()
+		if err := s.Publish(); err != nil {
+			s.Close()
+			return nil, err
+		}
 	}
 	return s, nil
 }
@@ -290,12 +330,16 @@ func (s *Stream) Published() bool {
 }
 
 // Publish lets other processes find the stream (its ticket under the
-// root) and read it (the Flight face).
-func (s *Stream) Publish() {
+// root) and read it (the Flight face). It takes the stream's writer
+// lock: the error names the holder when another writer has it.
+func (s *Stream) Publish() error {
 	s.pubMu.Lock()
 	defer s.pubMu.Unlock()
 	if s.published || s.closed {
-		return
+		return nil
+	}
+	if err := s.own(); err != nil {
+		return err
 	}
 	s.published = true
 	s.tel.flight.register(s.Name, s.ring.Schema(), s)
@@ -308,6 +352,7 @@ func (s *Stream) Publish() {
 			"(Config.Root / $STREAMING_PARQUET_ROOT) — no ticket; "+
 			"the stream is local + direct-ticket only\n", s.Name)
 	}
+	return nil
 }
 
 // Unpublish makes the stream internal: its ticket is deleted and the
@@ -409,6 +454,9 @@ func (s *Stream) StartParquet(label string, o *ParquetOptions) error {
 	if err != nil {
 		return err
 	}
+	if err := s.own(); err != nil {
+		return err
+	}
 	opts.RowGroupRows = groupRows
 	var lost int64
 	if s.arch != nil {
@@ -502,5 +550,9 @@ func (s *Stream) Close() error {
 	delete(s.tel.streams, s.Name)
 	s.tel.mu.Unlock()
 	s.ring.Close()
+	s.ownMu.Lock()
+	s.owner.release() // the next writer may start now
+	s.owner = nil
+	s.ownMu.Unlock()
 	return err
 }

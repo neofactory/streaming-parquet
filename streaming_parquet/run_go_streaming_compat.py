@@ -264,6 +264,40 @@ def _():
         assert child.returncode == 0, child.stderr.read()
 
 
+@test("one writer per stream across languages: a Go writer is refused "
+      "while a Python writer holds the stream, and a Python writer while "
+      "a Go writer does; each refusal is the core's and names the holder")
+def _():
+    s = sp.create_stream('x/own', pa.schema([('n', pa.int64())]), store=ROOT)
+    try:
+        r = subprocess.run([BIN, 'serve', ROOT, 'x/own', '10', '0'],
+                           capture_output=True, text=True, timeout=60)
+        assert r.returncode != 0, "the Go writer was not refused"
+        assert ('CreateStream("x/own"): another process on this server '
+                f'writes this stream: pid {os.getpid()}, run {s._run} holds'
+                in r.stderr), r.stderr
+    finally:
+        s.close()
+    child = subprocess.Popen(
+        [BIN, 'serve', ROOT, 'x/own', '10', '4'],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        path = os.path.join(ROOT, 'tickets', 'x', 'own.json')
+        deadline = time.time() + 20
+        while not os.path.exists(path) and time.time() < deadline:
+            time.sleep(0.05)
+        try:
+            sp.create_stream('x/own', pa.schema([('n', pa.int64())]),
+                             store=ROOT).close()
+            raise AssertionError("the Python writer was not refused")
+        except RuntimeError as e:
+            assert ("create_stream('x/own'): another process on this server "
+                    f"writes this stream: pid {child.pid}, run ") in str(e), e
+    finally:
+        child.wait(timeout=30)
+        assert child.returncode == 0, child.stderr.read()
+
+
 @test("the Go package's copies of the stream core are the core")
 def _():
     for src, dst in CORE_COPIES:

@@ -197,3 +197,76 @@ func (t *Ticket) staleAfter() float64 {
 	defer C.sp_ticket_free(ct)
 	return float64(C.sp_ticket_stale_after(ct, C.double(pqc.DeadAfter(0).Seconds())))
 }
+
+// ---- the ownership decision (sp.h: THE OWNERSHIP DECISION) ----
+
+const coreMsgLen = 2048
+
+// lockRecord is the text a lock holder writes into its lock file.
+func lockRecord(pid int, host string, port int, run string) []byte {
+	ch, cr := C.CString(host), C.CString(run)
+	defer C.free(unsafe.Pointer(ch))
+	defer C.free(unsafe.Pointer(cr))
+	var n C.size_t
+	p := C.sp_lock_record(C.int64_t(pid), ch, C.int64_t(port), cr, &n)
+	if p == nil {
+		return nil
+	}
+	defer C.sp_free(unsafe.Pointer(p))
+	return C.GoBytes(unsafe.Pointer(p), C.int(n))
+}
+
+// lockRefusal is the refusal for a lock another process holds; holder
+// is the text of the lock file.
+func lockRefusal(who, lockPath string, holder []byte) string {
+	cw, cp := C.CString(who), C.CString(lockPath)
+	defer C.free(unsafe.Pointer(cw))
+	defer C.free(unsafe.Pointer(cp))
+	var h *C.char
+	if len(holder) > 0 {
+		h = (*C.char)(unsafe.Pointer(&holder[0]))
+	}
+	var msg [coreMsgLen]C.char
+	C.sp_lock_refusal(cw, cp, h, C.size_t(len(holder)), &msg[0], coreMsgLen)
+	return C.GoString(&msg[0])
+}
+
+// ownershipDecision is the ticket check: own, take over (with the
+// warning to log) or refused (with the error). ticket nil = none there.
+func ownershipDecision(who, name, store string, ticket *Ticket, host string,
+	now float64) (decision int, message string) {
+	var ct *C.SpTicket
+	if ticket != nil {
+		var err error
+		if ct, err = coreTicket(ticket); err != nil {
+			return int(C.SP_REFUSED), fmt.Sprintf("%s: the ticket in %s: %v", who, store, err)
+		}
+		defer C.sp_ticket_free(ct)
+	}
+	cw, cn, cs, ch := C.CString(who), C.CString(name), C.CString(store), C.CString(host)
+	defer C.free(unsafe.Pointer(cw))
+	defer C.free(unsafe.Pointer(cn))
+	defer C.free(unsafe.Pointer(cs))
+	defer C.free(unsafe.Pointer(ch))
+	var msg [coreMsgLen]C.char
+	d := C.sp_ownership(cw, cn, cs, ct, ch, C.double(now),
+		C.double(pqc.DeadAfter(0).Seconds()), &msg[0], coreMsgLen)
+	return int(d), C.GoString(&msg[0])
+}
+
+// ownershipUnread is the warning for a ticket that could not be read.
+func ownershipUnread(name, store string, why error) string {
+	cn, cs, cw := C.CString(name), C.CString(store), C.CString(why.Error())
+	defer C.free(unsafe.Pointer(cn))
+	defer C.free(unsafe.Pointer(cs))
+	defer C.free(unsafe.Pointer(cw))
+	var msg [coreMsgLen]C.char
+	C.sp_ownership_unread(cn, cs, cw, &msg[0], coreMsgLen)
+	return C.GoString(&msg[0])
+}
+
+const (
+	ownOwn      = int(C.SP_OWN)
+	ownTakeOver = int(C.SP_TAKE_OVER)
+	ownRefused  = int(C.SP_REFUSED)
+)

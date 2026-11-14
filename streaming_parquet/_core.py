@@ -52,6 +52,16 @@ SpTicket *sp_ticket_read(const char *text, size_t len,
 double sp_ticket_stale_after(const SpTicket *t, double if_absent);
 int sp_ticket_is_stale(const SpTicket *t, double now, double if_absent);
 void sp_free(void *p);
+char *sp_lock_record(int64_t pid, const char *host, int64_t port,
+                     const char *run, size_t *out_len);
+void sp_lock_refusal(const char *who, const char *lock_path,
+                     const char *holder, size_t holder_len,
+                     char *msg, size_t msglen);
+int sp_ownership(const char *who, const char *name, const char *store,
+                 const SpTicket *ticket, const char *host,
+                 double now, double if_absent, char *msg, size_t msglen);
+void sp_ownership_unread(const char *name, const char *store,
+                         const char *why, char *msg, size_t msglen);
 """)
 
 
@@ -198,3 +208,49 @@ def ticket_stale_after(ticket, if_absent):
 def ticket_is_stale(ticket, now, if_absent):
     """True when, at `now`, the ticket's writer is dead."""
     return bool(lib.sp_ticket_is_stale(_from_dict(ticket), now, if_absent))
+
+
+# ---- the ownership decision (core/sp.h: THE OWNERSHIP DECISION) ----------
+
+OWN, TAKE_OVER, REFUSED = 0, 1, 2
+_MSGLEN = 2048
+
+
+def lock_record(pid, host, port, run):
+    """The bytes a lock holder writes into its lock file."""
+    n = ffi.new("size_t *")
+    p = lib.sp_lock_record(pid, str(host).encode(), port, str(run).encode(), n)
+    if p == ffi.NULL:
+        raise MemoryError("lock record")
+    try:
+        return ffi.buffer(p, n[0])[:]
+    finally:
+        lib.sp_free(p)
+
+
+def lock_refusal(who, lock_path, holder):
+    """The refusal for a lock another process holds; `holder` is the
+    bytes of the lock file."""
+    msg = ffi.new("char[]", _MSGLEN)
+    lib.sp_lock_refusal(who.encode(), str(lock_path).encode(), holder,
+                        len(holder), msg, _MSGLEN)
+    return ffi.string(msg).decode("utf-8", "replace")
+
+
+def ownership(who, name, store, ticket, host, now, if_absent):
+    """The ticket check: (OWN | TAKE_OVER | REFUSED, message). ticket is
+    the store's ticket dict, None for none."""
+    msg = ffi.new("char[]", _MSGLEN)
+    t = _from_dict(ticket) if ticket is not None else ffi.NULL
+    got = lib.sp_ownership(who.encode(), name.encode(), str(store).encode(),
+                           t, str(host).encode(), now, if_absent,
+                           msg, _MSGLEN)
+    return got, ffi.string(msg).decode("utf-8", "replace")
+
+
+def ownership_unread(name, store, why):
+    """The warning for a ticket the host could not read."""
+    msg = ffi.new("char[]", _MSGLEN)
+    lib.sp_ownership_unread(name.encode(), str(store).encode(),
+                            str(why).encode(), msg, _MSGLEN)
+    return ffi.string(msg).decode("utf-8", "replace")

@@ -743,3 +743,115 @@ int sp_ticket_is_stale(const SpTicket *t, double now, double if_absent) {
     if (!sp_ticket_number(t, SP_T_TS, &ts)) return 1;
     return now - ts >= sp_ticket_stale_after(t, if_absent);
 }
+
+/* ---- the ownership decision --------------------------------------------- */
+
+char *sp_lock_record(int64_t pid, const char *host, int64_t port,
+                     const char *run, size_t *out_len) {
+    Text b = {0};
+    text_str(&b, "{\"pid\":");
+    text_integer(&b, pid);
+    text_str(&b, ",\"host\":");
+    if (host) text_json_string(&b, host); else text_str(&b, "null");
+    text_str(&b, ",\"port\":");
+    text_integer(&b, port);
+    text_str(&b, ",\"run\":");
+    if (run) text_json_string(&b, run); else text_str(&b, "null");
+    text_str(&b, "}");
+    if (b.oom || !b.p) { free(b.p); return NULL; }
+    if (out_len) *out_len = b.len;
+    return b.p;
+}
+
+/* The pid and run of a lock record. Whatever the text is, this returns;
+ * what it could not read stays unknown (*has_pid 0, *run NULL). The
+ * caller frees *run. */
+static void lock_holder(const char *text, size_t len, int64_t *pid,
+                        int *has_pid, char **run) {
+    Reader r = {text, text ? text + len : NULL, NULL, 0, 0};
+    *has_pid = 0;
+    *run = NULL;
+    if (!text || !take(&r, '{') || take(&r, '}')) return;
+    do {
+        char *key = read_string(&r);
+        if (!key) return;
+        if (!take(&r, ':')) { free(key); return; }
+        int c = peek(&r);
+        if (strcmp(key, "pid") == 0 && c != '"' && c != '{' && c != '['
+                && c != 't' && c != 'f' && c != 'n') {
+            double number; int64_t integer; int is_integer;
+            if (read_number(&r, &number, &integer, &is_integer) && is_integer) {
+                *pid = integer;
+                *has_pid = 1;
+            }
+        } else if (strcmp(key, "run") == 0 && c == '"') {
+            free(*run);
+            *run = read_string(&r);
+        } else {
+            skip_value(&r, 0);
+        }
+        free(key);
+    } while (!r.failed && take(&r, ','));
+}
+
+void sp_lock_refusal(const char *who, const char *lock_path,
+                     const char *holder, size_t holder_len,
+                     char *msg, size_t msglen) {
+    int64_t pid = 0;
+    int has_pid;
+    char *run;
+    char pid_text[32] = "?";
+    lock_holder(holder, holder_len, &pid, &has_pid, &run);
+    if (has_pid) snprintf(pid_text, sizeof pid_text, "%lld", (long long)pid);
+    fail(msg, msglen,
+         "%s: another process on this server writes this stream: pid %s, "
+         "run %s holds %s. One writer per stream: stop that process first.",
+         who ? who : "?", pid_text, run ? run : "?",
+         lock_path ? lock_path : "?");
+    free(run);
+}
+
+int sp_ownership(const char *who, const char *name, const char *store,
+                 const SpTicket *ticket, const char *host,
+                 double now, double if_absent, char *msg, size_t msglen) {
+    if (msg && msglen) msg[0] = 0;
+    if (!ticket) return SP_OWN;
+    const char *theirs = sp_ticket_text(ticket, SP_T_HOST);
+    if (theirs && host && strcmp(theirs, host) == 0) return SP_OWN;
+
+    char port[32] = "?";
+    int64_t p;
+    if (sp_ticket_integer(ticket, SP_T_PORT, &p))
+        snprintf(port, sizeof port, "%lld", (long long)p);
+    const char *run = sp_ticket_text(ticket, SP_T_RUN);
+    double ts = 0;
+    sp_ticket_number(ticket, SP_T_TS, &ts);       /* no ts: stale */
+    double age = now - ts;
+    double stale = sp_ticket_stale_after(ticket, if_absent);
+
+    if (!sp_ticket_is_stale(ticket, now, if_absent)) {
+        fail(msg, msglen,
+             "%s: the server at %s:%s writes this stream: its ticket in %s "
+             "is %.0fs old (run %s; a ticket is stale after %.0fs). One "
+             "writer per stream: stop it there, or wait until its ticket "
+             "is stale.",
+             who ? who : "?", theirs ? theirs : "?", port,
+             store ? store : "?", age, run ? run : "?", stale);
+        return SP_REFUSED;
+    }
+    fail(msg, msglen,
+         "[%s] taking over from %s:%s: its ticket in %s is %.0fs old "
+         "(run %s); stale after %.0fs",
+         name ? name : "?", theirs ? theirs : "?", port,
+         store ? store : "?", age, run ? run : "?", stale);
+    return SP_TAKE_OVER;
+}
+
+void sp_ownership_unread(const char *name, const char *store,
+                         const char *why, char *msg, size_t msglen) {
+    fail(msg, msglen,
+         "[%s] ownership: the ticket in %s could not be read (%s); "
+         "starting on this server's lock alone -- another server writing "
+         "this stream would not be seen",
+         name ? name : "?", store ? store : "?", why ? why : "?");
+}

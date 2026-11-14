@@ -156,6 +156,64 @@ double sp_ticket_stale_after(const SpTicket *t, double if_absent);
  * past ts. A ticket with no ts is stale. */
 int sp_ticket_is_stale(const SpTicket *t, double now, double if_absent);
 
+/* THE OWNERSHIP DECISION
+ *
+ * One writer per stream. A host that is about to write a stream (it
+ * publishes it, or writes its files) makes two checks, in this order,
+ * and the core decides each from the facts the host brings:
+ *
+ *   the lock file   a second process on THIS server. The host takes an
+ *                   exclusive lock on <dir>/streams/<name>/writer.lock
+ *                   and holds it for the stream's life; the operating
+ *                   system releases it when the process ends, a crash
+ *                   included. The holder writes its lock record into
+ *                   the file (sp_lock_record). A host that cannot take
+ *                   the lock is refused, and sp_lock_refusal names the
+ *                   holder from that record.
+ *   the ticket      another SERVER. The host reads the stream's ticket
+ *                   from the store and asks sp_ownership. No ticket, or
+ *                   a ticket with this host's address: own. A ticket of
+ *                   another host that is not stale: refused, naming it.
+ *                   A stale one: that server is gone, take over.
+ *
+ * A host that could not read the ticket still owns the stream on its
+ * lock alone, and logs sp_ownership_unread: an unreachable store at
+ * start delays the uploads and never the stream.
+ *
+ * `who` in each message is the host's own call, as its user wrote it:
+ * create_stream('a/b') in Python, CreateStream("a/b") in Go.
+ */
+
+/* The lock record: {"pid", "host", "port", "run"} as JSON text, for the
+ * host to write into the lock file it holds: sp_free it. NULL when
+ * memory is out. */
+char *sp_lock_record(int64_t pid, const char *host, int64_t port,
+                     const char *run, size_t *out_len);
+
+/* The refusal for a lock another process holds. `holder` is the text of
+ * the lock file (its lock record; any text is taken, and what cannot be
+ * read from it shows as "?"). */
+void sp_lock_refusal(const char *who, const char *lock_path,
+                     const char *holder, size_t holder_len,
+                     char *msg, size_t msglen);
+
+typedef enum {
+    SP_OWN = 0,        /* this writer owns the stream; msg is empty */
+    SP_TAKE_OVER = 1,  /* it owns it, from a writer that died; msg is the
+                          warning to log */
+    SP_REFUSED = 2     /* another server writes it; msg is the error */
+} SpOwnership;
+
+/* The ticket check. ticket: what the store holds, NULL for none. host:
+ * this writer's address. now, if_absent: as sp_ticket_is_stale. */
+int sp_ownership(const char *who, const char *name, const char *store,
+                 const SpTicket *ticket, const char *host,
+                 double now, double if_absent, char *msg, size_t msglen);
+
+/* The warning for a ticket the host could not read (`why`: its error). */
+void sp_ownership_unread(const char *name, const char *store,
+                         const char *why, char *msg, size_t msglen);
+
 void sp_free(void *p);
 
 #ifdef __cplusplus

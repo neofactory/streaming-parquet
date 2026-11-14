@@ -52,9 +52,14 @@ int main(int argc, char **argv) {
         char *exact = malloc(n ? n : 1);
         memcpy(exact, buf, n);
         char err[128];
+        /* the lock file's text is read the same way, and never refused */
+        char held[512];
+        sp_lock_refusal("w", "p", exact, n, held, sizeof held);
         SpTicket *t = sp_ticket_read(exact, n, err, sizeof err);
         if (t) {
             read_ok++;
+            sp_ownership("w", "n", "s", t, "10.0.0.9", 1762979480.0, 30,
+                         held, sizeof held);
             size_t len;
             char *text = sp_ticket_write(t, &len);
             SpTicket *back = sp_ticket_read(text, len, err, sizeof err);
