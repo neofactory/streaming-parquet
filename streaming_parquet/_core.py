@@ -79,6 +79,27 @@ int sp_writes_on(const SpWrites *w);
 int64_t sp_writes_cursor(const SpWrites *w);
 int64_t sp_writes_planned(const SpWrites *w);
 int64_t sp_writes_lost(const SpWrites *w);
+typedef struct SpStore SpStore;
+SpStore *sp_store_new(double keep_seconds);
+void sp_store_free(SpStore *s);
+int sp_store_set_keep_seconds(SpStore *s, double keep_seconds);
+double sp_store_keep_seconds(const SpStore *s);
+int sp_store_begins(SpStore *s, const char *file, int64_t first_row);
+int sp_store_covers(SpStore *s, const char *file, int64_t version,
+                    const char *checkpoint, int64_t final_rows, int64_t rows);
+int sp_store_stored(SpStore *s, const char *file, int64_t version,
+                    const char *checkpoint, int64_t rows, double wall);
+int sp_store_finished(SpStore *s, const char *file);
+int sp_store_awaits(SpStore *s, const char *file);
+int sp_store_listed(SpStore *s, const char *file);
+int sp_store_dropped(SpStore *s, double now);
+const char *sp_store_due(const SpStore *s, double now, int32_t index);
+int sp_store_discarded(SpStore *s, const char *file);
+int64_t sp_store_stored_row(const SpStore *s);
+int sp_store_stored_at(const SpStore *s, double *wall);
+int sp_store_fill(const SpStore *s, SpTicket *t, const char *where,
+                  char *err, size_t errlen);
+int32_t sp_store_files(const SpStore *s);
 void sp_ownership_unread(const char *name, const char *store,
                          const char *why, char *msg, size_t msglen);
 """)
@@ -338,3 +359,83 @@ class Writes:
     @property
     def lost(self):
         return lib.sp_writes_lost(self._w)
+
+
+# ---- what the store holds (core/sp.h: WHAT THE STORE HOLDS) --------------
+
+class Store:
+    """What the store holds of one stream's run, for its ticket, and
+    when a file's old checkpoints are deleted. The caller's lock covers
+    every call. `wall` is the time the ticket shows; `now` is
+    time.monotonic()."""
+
+    def __init__(self, keep_seconds):
+        self._s = ffi.gc(lib.sp_store_new(keep_seconds), lib.sp_store_free)
+        if self._s == ffi.NULL:
+            raise ValueError(f"store: keep_seconds {keep_seconds!r}")
+
+    @staticmethod
+    def _ok(rc):
+        if rc != 0:
+            raise MemoryError("store")
+
+    @property
+    def keep_seconds(self):
+        return lib.sp_store_keep_seconds(self._s)
+
+    @keep_seconds.setter
+    def keep_seconds(self, seconds):
+        if lib.sp_store_set_keep_seconds(self._s, seconds) != 0:
+            raise ValueError(f"store: keep_seconds {seconds!r}")
+
+    def begins(self, file, first_row):
+        self._ok(lib.sp_store_begins(self._s, file.encode(), first_row))
+
+    def covers(self, file, version, checkpoint, final_rows, rows):
+        self._ok(lib.sp_store_covers(self._s, file.encode(), version,
+                                     checkpoint.encode(), final_rows, rows))
+
+    def stored(self, file, version, checkpoint, rows, wall):
+        self._ok(lib.sp_store_stored(self._s, file.encode(), version,
+                                     checkpoint.encode(), rows, wall))
+
+    def finished(self, file):
+        self._ok(lib.sp_store_finished(self._s, file.encode()))
+
+    def awaits(self, file):
+        self._ok(lib.sp_store_awaits(self._s, file.encode()))
+
+    def listed(self, file):
+        """True when the file was awaiting its catalog: it leaves the
+        ticket."""
+        return bool(lib.sp_store_listed(self._s, file.encode()))
+
+    def dropped(self, now):
+        return lib.sp_store_dropped(self._s, now)
+
+    def due(self, now):
+        """The files whose checkpoints are to delete now."""
+        out, i = [], 0
+        while True:
+            p = lib.sp_store_due(self._s, now, i)
+            if p == ffi.NULL:
+                return out
+            out.append(ffi.string(p).decode())
+            i += 1
+
+    def discarded(self, file):
+        self._ok(lib.sp_store_discarded(self._s, file.encode()))
+
+    def state(self, where=""):
+        """(stored_row, stored_at, files, keep_seconds) as the ticket
+        holds them; each file's checkpoint is where + its object name."""
+        t = ffi.gc(lib.sp_ticket_new(), lib.sp_ticket_free)
+        err = _err()
+        if lib.sp_store_fill(self._s, t, where.encode(), err, _ERRLEN) != 0:
+            _raise(err)
+        d = _to_dict(t)
+        return d["stored_row"], d["stored_at"], d["files"], d["keep_seconds"]
+
+    @property
+    def files(self):
+        return lib.sp_store_files(self._s)

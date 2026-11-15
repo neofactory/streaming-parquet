@@ -367,6 +367,121 @@ int main(void) {
         sp_writes_free(w);
     }
 
+    /* ---- what the store holds ---- */
+    {
+        double at;
+        CHECK(sp_store_new(-1) == NULL && sp_store_new(NAN) == NULL);
+        SpStore *st = sp_store_new(600);
+        SpTicket *k = sp_ticket_new();
+        CHECK(sp_store_stored_row(st) == -1 && !sp_store_stored_at(st, &at));
+        CHECK(sp_store_fill(st, k, "s3://b/x/", err, sizeof err) == 0);
+        char *text = sp_ticket_write(k, NULL);
+        CHECK(strstr(text, "\"stored_row\": -1") && strstr(text, "\"stored_at\": null"));
+        CHECK(strstr(text, "\"files\": []") && strstr(text, "\"keep_seconds\": 600"));
+        sp_free(text);
+
+        /* file b begins at row 1000; two versions written, the first stored */
+        CHECK(sp_store_begins(st, "b.parquet", 1000) == 0);
+        CHECK(sp_store_covers(st, "b.parquet", 1, "b.parquet.000001.ckpt", 0, 50) == 0);
+        CHECK(sp_store_fill(st, k, "w/", err, sizeof err) == 0);
+        CHECK(sp_ticket_file_count(k) == 0);       /* written, not yet in the store */
+        CHECK(sp_store_stored(st, "b.parquet", 1, "b.parquet.000001.ckpt", 50, 111.5) == 0);
+        CHECK(sp_store_stored_row(st) == 1049);
+        CHECK(sp_store_stored_at(st, &at) && at == 111.5);
+        CHECK(sp_store_covers(st, "b.parquet", 2, "b.parquet.000002.ckpt", 64, 80) == 0);
+        CHECK(sp_store_fill(st, k, "w/", err, sizeof err) == 0);
+        const char *cp; int64_t fr, fin, rows; int hf, hfin, hr;
+        CHECK(sp_ticket_file_count(k) == 1);
+        sp_ticket_file(k, 0, &cp, &fr, &hf, &fin, &hfin, &rows, &hr);
+        CHECK(strcmp(cp, "w/b.parquet.000001.ckpt") == 0 && hf && fr == 1000);
+        CHECK(hfin && fin == 0 && hr && rows == 50);
+        /* the second lands: the ticket names it; the first is forgotten */
+        CHECK(sp_store_stored(st, "b.parquet", 2, "b.parquet.000002.ckpt", 80, 112.5) == 0);
+        CHECK(sp_store_stored_row(st) == 1079);
+        /* a version that holds no later row does not move the stored row */
+        CHECK(sp_store_stored(st, "b.parquet", 2, "b.parquet.000002.ckpt", 80, 999) == 0);
+        CHECK(sp_store_stored_at(st, &at) && at == 112.5);
+        /* file a: found by a start-up sweep, nothing known of it */
+        CHECK(sp_store_stored(st, "a.parquet", 7, "a.parquet.000007.ckpt", 0, 113) == 0);
+        CHECK(sp_store_stored_row(st) == 1079);
+        CHECK(sp_store_fill(st, k, "w/", err, sizeof err) == 0);
+        CHECK(sp_ticket_file_count(k) == 2);       /* in the order of the names */
+        sp_ticket_file(k, 0, &cp, &fr, &hf, &fin, &hfin, &rows, &hr);
+        CHECK(strcmp(cp, "w/a.parquet.000007.ckpt") == 0 && !hf && !hfin && !hr);
+        sp_ticket_file(k, 1, &cp, &fr, &hf, &fin, &hfin, &rows, &hr);
+        CHECK(strcmp(cp, "w/b.parquet.000002.ckpt") == 0 && fin == 64 && rows == 80);
+
+        /* a is finished and nothing lists finished files: it is gone */
+        CHECK(sp_store_finished(st, "a.parquet") == 0);
+        CHECK(sp_store_files(st) == 1);
+        /* b is finished and awaits its catalog: it stays in the ticket */
+        CHECK(sp_store_awaits(st, "b.parquet") == 0);
+        CHECK(sp_store_fill(st, k, "w/", err, sizeof err) == 0);
+        CHECK(sp_ticket_file_count(k) == 1);
+        CHECK(sp_store_listed(st, "zzz.parquet") == 0);
+        CHECK(sp_store_listed(st, "b.parquet") == 1);
+        CHECK(sp_store_fill(st, k, "w/", err, sizeof err) == 0);
+        CHECK(sp_ticket_file_count(k) == 0);
+        /* the ticket write failed: nothing is superseded; a second
+         * catalog pass finds it again */
+        CHECK(sp_store_due(st, 1e9, 0) == NULL);
+        CHECK(sp_store_listed(st, "b.parquet") == 1);
+        CHECK(sp_store_dropped(st, 50.0) == 1);
+        CHECK(sp_store_dropped(st, 60.0) == 0);
+        CHECK(sp_store_listed(st, "b.parquet") == 0);
+        /* its checkpoints stay keep_seconds, then are due */
+        CHECK(sp_store_due(st, 649.9, 0) == NULL);
+        CHECK(strcmp(sp_store_due(st, 650.0, 0), "b.parquet") == 0);
+        CHECK(sp_store_due(st, 650.0, 1) == NULL);
+        /* a shorter keep time counts from the same moment */
+        CHECK(sp_store_set_keep_seconds(st, -1) == -1);
+        CHECK(sp_store_set_keep_seconds(st, 10) == 0 && sp_store_keep_seconds(st) == 10);
+        CHECK(strcmp(sp_store_due(st, 60.0, 0), "b.parquet") == 0);
+        CHECK(sp_store_set_keep_seconds(st, 600) == 0);
+        /* a delete that failed leaves it due; a delete that worked ends it */
+        CHECK(strcmp(sp_store_due(st, 700.0, 0), "b.parquet") == 0);
+        CHECK(sp_store_discarded(st, "b.parquet") == 0);
+        CHECK(sp_store_due(st, 700.0, 0) == NULL && sp_store_files(st) == 0);
+        /* the stored row outlives its file */
+        CHECK(sp_store_stored_row(st) == 1079);
+
+        /* a long run does not grow the state */
+        for (int i = 0; i < 5000; i++) {
+            char name[40], ck[60];
+            snprintf(name, sizeof name, "f%06d.parquet", i);
+            snprintf(ck, sizeof ck, "%s.000001.ckpt", name);
+            CHECK(sp_store_begins(st, name, 2000 + (int64_t)i * 10) == 0);
+            CHECK(sp_store_covers(st, name, 1, ck, 10, 10) == 0);
+            CHECK(sp_store_stored(st, name, 1, ck, 10, 200.0 + i) == 0);
+            if (i % 2) {
+                CHECK(sp_store_finished(st, name) == 0);
+            } else {
+                CHECK(sp_store_awaits(st, name) == 0);
+                CHECK(sp_store_listed(st, name) == 1);
+                CHECK(sp_store_dropped(st, (double)i) == 1);
+                const char *due;
+                while ((due = sp_store_due(st, (double)i + 600, 0)) != NULL)
+                    CHECK(sp_store_discarded(st, due) == 0);
+            }
+            CHECK(sp_store_files(st) <= 1);
+        }
+        CHECK(sp_store_stored_row(st) == 2000 + 4999 * 10 + 9);
+        CHECK(sp_store_files(st) == 0);
+
+        /* NULL is taken everywhere */
+        CHECK(sp_store_begins(NULL, "a", 0) == -1 && sp_store_begins(st, NULL, 0) == -1);
+        CHECK(sp_store_covers(st, "a", 1, NULL, 0, 0) == -1);
+        CHECK(sp_store_stored(st, "a", 1, NULL, 0, 0) == -1);
+        CHECK(sp_store_finished(st, "nothing") == 0 && sp_store_discarded(st, "nothing") == 0);
+        CHECK(sp_store_listed(NULL, "a") == 0 && sp_store_dropped(NULL, 0) == 0);
+        CHECK(sp_store_due(NULL, 0, 0) == NULL && sp_store_due(st, 0, -1) == NULL);
+        CHECK(sp_store_fill(NULL, k, "", err, sizeof err) == -1);
+        CHECK(sp_store_stored_row(NULL) == -1 && sp_store_files(NULL) == 0);
+        sp_store_free(NULL);
+        sp_ticket_free(k);
+        sp_store_free(st);
+    }
+
     if (failures == 0) printf("san_test: all checks passed\n");
     return failures ? 1 : 0;
 }

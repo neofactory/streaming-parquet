@@ -981,3 +981,289 @@ int sp_writes_on(const SpWrites *w) { return w ? w->on : 0; }
 int64_t sp_writes_cursor(const SpWrites *w) { return w ? w->cursor : 0; }
 int64_t sp_writes_planned(const SpWrites *w) { return w ? w->planned : 0; }
 int64_t sp_writes_lost(const SpWrites *w) { return w ? w->lost : 0; }
+
+/* ---- what the store holds ----------------------------------------------- */
+
+typedef struct {
+    int64_t version, final_rows, rows;
+    char *checkpoint;
+} StoreVersion;
+
+typedef struct {
+    char *name;
+    int has_first;
+    int64_t first_row;
+    char *in_store;             /* its newest checkpoint version in the store */
+    StoreVersion *versions;     /* what the versions written cover */
+    int32_t n_versions;
+    int awaiting, listed, superseded;
+    double superseded_at;
+} StoreFile;
+
+struct SpStore {
+    double keep_seconds;
+    StoreFile *files;
+    int32_t n_files, cap_files;
+    int64_t stored_row;
+    int has_stored_at;
+    double stored_at;
+};
+
+SpStore *sp_store_new(double keep_seconds) {
+    if (!(isfinite(keep_seconds) && keep_seconds >= 0)) return NULL;
+    SpStore *s = calloc(1, sizeof(SpStore));
+    if (!s) return NULL;
+    s->keep_seconds = keep_seconds;
+    s->stored_row = -1;
+    return s;
+}
+
+int sp_store_set_keep_seconds(SpStore *s, double keep_seconds) {
+    if (!s || !(isfinite(keep_seconds) && keep_seconds >= 0)) return -1;
+    s->keep_seconds = keep_seconds;
+    return 0;
+}
+
+double sp_store_keep_seconds(const SpStore *s) {
+    return s ? s->keep_seconds : 0;
+}
+
+static void store_file_clear(StoreFile *f) {
+    for (int32_t i = 0; i < f->n_versions; i++) free(f->versions[i].checkpoint);
+    free(f->versions);
+    free(f->in_store);
+    free(f->name);
+}
+
+void sp_store_free(SpStore *s) {
+    if (!s) return;
+    for (int32_t i = 0; i < s->n_files; i++) store_file_clear(&s->files[i]);
+    free(s->files);
+    free(s);
+}
+
+static StoreFile *store_find(const SpStore *s, const char *name) {
+    if (!s || !name) return NULL;
+    for (int32_t i = 0; i < s->n_files; i++)
+        if (strcmp(s->files[i].name, name) == 0) return &s->files[i];
+    return NULL;
+}
+
+/* The file's record, made when there is none. NULL when memory is out. */
+static StoreFile *store_get(SpStore *s, const char *name) {
+    StoreFile *f = store_find(s, name);
+    if (f || !s || !name) return f;
+    if (s->n_files == s->cap_files) {
+        int32_t cap = s->cap_files ? s->cap_files * 2 : 4;
+        StoreFile *grown = realloc(s->files, (size_t)cap * sizeof(StoreFile));
+        if (!grown) return NULL;
+        s->files = grown;
+        s->cap_files = cap;
+    }
+    char *copy = copy_text(name, strlen(name));
+    if (!copy) return NULL;
+    f = &s->files[s->n_files++];
+    memset(f, 0, sizeof *f);
+    f->name = copy;
+    return f;
+}
+
+static void store_remove(SpStore *s, StoreFile *f) {
+    store_file_clear(f);
+    int32_t i = (int32_t)(f - s->files);
+    memmove(f, f + 1, (size_t)(s->n_files - i - 1) * sizeof(StoreFile));
+    s->n_files--;
+}
+
+/* A record nothing needs any more: not in the ticket, not awaiting its
+ * catalog, no checkpoints to delete. */
+static void store_settle(SpStore *s, StoreFile *f) {
+    if (!f->in_store && !f->awaiting && !f->superseded) store_remove(s, f);
+}
+
+int sp_store_begins(SpStore *s, const char *file, int64_t first_row) {
+    StoreFile *f = store_get(s, file);
+    if (!f) return -1;
+    f->has_first = 1;
+    f->first_row = first_row;
+    return 0;
+}
+
+int sp_store_covers(SpStore *s, const char *file, int64_t version,
+                    const char *checkpoint, int64_t final_rows, int64_t rows) {
+    if (!checkpoint) return -1;
+    StoreFile *f = store_get(s, file);
+    if (!f) return -1;
+    StoreVersion *v = NULL;
+    for (int32_t i = 0; i < f->n_versions; i++)
+        if (f->versions[i].version == version) v = &f->versions[i];
+    if (!v) {
+        StoreVersion *grown = realloc(f->versions,
+                                      (size_t)(f->n_versions + 1) * sizeof *grown);
+        if (!grown) return -1;
+        f->versions = grown;
+        v = &f->versions[f->n_versions];
+        v->checkpoint = NULL;
+        v->version = version;
+        f->n_versions++;
+    }
+    char *copy = copy_text(checkpoint, strlen(checkpoint));
+    if (!copy) {
+        if (!v->checkpoint) f->n_versions--;      /* the new one: take it back */
+        return -1;
+    }
+    free(v->checkpoint);
+    v->checkpoint = copy;
+    v->final_rows = final_rows;
+    v->rows = rows;
+    return 0;
+}
+
+int sp_store_stored(SpStore *s, const char *file, int64_t version,
+                    const char *checkpoint, int64_t rows, double wall) {
+    if (!checkpoint) return -1;
+    StoreFile *f = store_get(s, file);
+    if (!f) return -1;
+    char *copy = copy_text(checkpoint, strlen(checkpoint));
+    if (!copy) return -1;
+    free(f->in_store);
+    f->in_store = copy;
+    /* the versions before it are named by no later ticket */
+    int32_t kept = 0;
+    for (int32_t i = 0; i < f->n_versions; i++) {
+        if (f->versions[i].version < version) free(f->versions[i].checkpoint);
+        else f->versions[kept++] = f->versions[i];
+    }
+    f->n_versions = kept;
+    if (f->has_first && rows > 0 && f->first_row <= INT64_MAX - rows
+            && f->first_row + rows - 1 > s->stored_row) {
+        s->stored_row = f->first_row + rows - 1;
+        s->stored_at = wall;
+        s->has_stored_at = 1;
+    }
+    return 0;
+}
+
+int sp_store_finished(SpStore *s, const char *file) {
+    if (!s || !file) return -1;
+    StoreFile *f = store_find(s, file);
+    if (!f) return 0;
+    free(f->in_store);
+    f->in_store = NULL;
+    store_settle(s, f);
+    return 0;
+}
+
+int sp_store_awaits(SpStore *s, const char *file) {
+    StoreFile *f = store_get(s, file);
+    if (!f) return -1;
+    f->awaiting = 1;
+    return 0;
+}
+
+int sp_store_listed(SpStore *s, const char *file) {
+    StoreFile *f = store_find(s, file);
+    if (!f || !f->awaiting) return 0;
+    free(f->in_store);
+    f->in_store = NULL;
+    f->listed = 1;
+    return 1;
+}
+
+int sp_store_dropped(SpStore *s, double now) {
+    int n = 0;
+    if (!s) return 0;
+    for (int32_t i = 0; i < s->n_files; i++) {
+        StoreFile *f = &s->files[i];
+        if (!f->awaiting || !f->listed) continue;
+        f->awaiting = f->listed = 0;
+        f->superseded = 1;
+        f->superseded_at = now;
+        n++;
+    }
+    return n;
+}
+
+const char *sp_store_due(const SpStore *s, double now, int32_t index) {
+    if (!s || index < 0) return NULL;
+    for (int32_t i = 0; i < s->n_files; i++) {
+        const StoreFile *f = &s->files[i];
+        if (f->superseded && now - f->superseded_at >= s->keep_seconds
+                && index-- == 0)
+            return f->name;
+    }
+    return NULL;
+}
+
+int sp_store_discarded(SpStore *s, const char *file) {
+    if (!s || !file) return -1;
+    StoreFile *f = store_find(s, file);
+    if (!f) return 0;
+    f->superseded = 0;
+    store_settle(s, f);
+    return 0;
+}
+
+int64_t sp_store_stored_row(const SpStore *s) { return s ? s->stored_row : -1; }
+
+int sp_store_stored_at(const SpStore *s, double *wall) {
+    if (!s || !s->has_stored_at) return 0;
+    if (wall) *wall = s->stored_at;
+    return 1;
+}
+
+int32_t sp_store_files(const SpStore *s) { return s ? s->n_files : 0; }
+
+static int by_name(const void *a, const void *b) {
+    const StoreFile *x = *(const StoreFile *const *)a;
+    const StoreFile *y = *(const StoreFile *const *)b;
+    return strcmp(x->name, y->name);
+}
+
+int sp_store_fill(const SpStore *s, SpTicket *t, const char *where,
+                  char *err, size_t errlen) {
+    if (!s || !t) { fail(err, errlen, "store: nothing to fill"); return -1; }
+    if (!where) where = "";
+    if (sp_ticket_set_integer(t, SP_T_STORED_ROW, s->stored_row, err, errlen)
+            || sp_ticket_set_number(t, SP_T_KEEP_SECONDS, s->keep_seconds,
+                                    err, errlen))
+        return -1;
+    if (s->has_stored_at) {
+        if (sp_ticket_set_number(t, SP_T_STORED_AT, s->stored_at, err, errlen))
+            return -1;
+    } else {
+        sp_ticket_clear(t, SP_T_STORED_AT);
+    }
+    for (int32_t i = 0; i < t->n_files; i++) free(t->files[i].checkpoint);
+    t->n_files = 0;
+    if (s->n_files == 0) return 0;
+    const StoreFile **order = malloc((size_t)s->n_files * sizeof *order);
+    if (!order) { fail(err, errlen, "store: out of memory"); return -1; }
+    int32_t n = 0;
+    for (int32_t i = 0; i < s->n_files; i++)
+        if (s->files[i].in_store) order[n++] = &s->files[i];
+    qsort(order, (size_t)n, sizeof *order, by_name);
+    int rc = 0;
+    for (int32_t i = 0; i < n && rc == 0; i++) {
+        const StoreFile *f = order[i];
+        const StoreVersion *v = NULL;
+        for (int32_t k = 0; k < f->n_versions; k++)
+            if (strcmp(f->versions[k].checkpoint, f->in_store) == 0)
+                v = &f->versions[k];
+        Text path = {0};
+        text_str(&path, where);
+        text_str(&path, f->in_store);
+        if (path.oom || !path.p) {
+            free(path.p);
+            fail(err, errlen, "store: out of memory");
+            rc = -1;
+            break;
+        }
+        rc = sp_ticket_add_file(t, path.p, f->has_first ? &f->first_row : NULL,
+                                v ? &v->final_rows : NULL, v ? &v->rows : NULL,
+                                err, errlen);
+        free(path.p);
+    }
+    free(order);
+    return rc;
+}

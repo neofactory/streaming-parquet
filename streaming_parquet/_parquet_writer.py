@@ -29,6 +29,7 @@ import parquet_checkpoint
 
 import time
 
+from . import _core
 from ._diag import _diag, get_verbosity
 
 
@@ -123,30 +124,22 @@ class ParquetWriter:
         self._sink = sink
         self._remote = remote.sub(stream_dir) if remote is not None else None
         self._ships = {}                # file name -> Shipper (live + pending)
-        # What the store holds of this run, for the ticket: written on
-        # the pool's lanes, read by the stream's heartbeat thread.
+        # What the store holds of this run, for the ticket, and when a
+        # finished file's checkpoints are deleted: the stream core's
+        # rule and state (core/sp.h, WHAT THE STORE HOLDS). Written on
+        # the pool's lanes, read by the stream's heartbeat thread, under
+        # _store_lock. In short: a finished file stays in the ticket
+        # until a published catalog lists it; then the ticket drops it,
+        # and its checkpoints are deleted the keep time later, in an
+        # upload step (discard_due), so a reader told of them still
+        # finds them.
         self._store_lock = threading.Lock()
-        self._bases = {}                # file name -> first row number (this run's files)
-        self._in_store = {}             # file -> its newest checkpoint version in the store, unfinished there
-        # checkpoint version -> (rows in finished row groups, rows): what
-        # each version this run wrote covers, for the ticket
-        self._ckpt_rows = {}
-        self._stored_row = -1           # newest row of this run in the store
-        self._stored_at = None          # when it got there (library clock)
+        self._store = _core.Store(parquet_checkpoint.SUPERSEDED_KEEP_S)
+        # file -> the sink that holds its checkpoints, from the moment
+        # it is finished until they are deleted
+        self._ckpt_sink = {}
         self.catalog = None             # _catalog.Catalog, set by create_stream
-        # Finished files whose checkpoints readers may still be reading:
-        # file -> the sink holding them. A finished file stays in the
-        # ticket's unfinished list until a published catalog lists it;
-        # then the ticket drops it, and only then are its checkpoint
-        # versions and chunks deleted (cataloged()).
-        self._awaiting = {}
         self.on_ticket = None           # the stream's "write the ticket now"
-        # Files the ticket has dropped: file -> (sink, when). Their
-        # checkpoints are superseded then; like any superseded version
-        # they are deleted SUPERSEDED_KEEP_S later, in an upload step
-        # (discard_due), so a reader told of them still finds them.
-        self._discard_at = {}
-        self.superseded_keep_s = parquet_checkpoint.SUPERSEDED_KEEP_S
         self._remote_swept = False      # the remote half of the boot sweep
                                         # runs on the first mirror pass
         self._writer = None
@@ -270,7 +263,7 @@ class ParquetWriter:
         if first_seq is not None:
             md[b'sp_base_seq'] = str(int(first_seq)).encode()
             with self._store_lock:
-                self._bases[name] = int(first_seq)
+                self._store.begins(name, int(first_seq))
         schema = self._schema.with_metadata(md)
         self._writer = parquet_checkpoint.CheckpointWriter(
             name, schema, sink=self._sink,
@@ -336,14 +329,32 @@ class ParquetWriter:
         self._note_checkpoint()
         self._stored_locally()
 
+    @property
+    def superseded_keep_s(self):
+        """How long a superseded checkpoint stays, in seconds."""
+        return self._store.keep_seconds
+
+    @superseded_keep_s.setter
+    def superseded_keep_s(self, seconds):
+        with self._store_lock:
+            self._store.keep_seconds = seconds
+
+    @staticmethod
+    def _version(ckpt):
+        """A checkpoint object's version number, by the checkpoint
+        core's rule; 0 for a name that has none."""
+        got = parquet_checkpoint.parse_ckpt_object(ckpt)
+        return got[1] if got is not None else 0
+
     def _note_checkpoint(self):
         """Record what the writer's newest checkpoint version covers:
         the rows of its finished row groups, and its rows."""
         w = self._writer
         if w.ckpt_name is not None:
             with self._store_lock:
-                self._ckpt_rows[w.ckpt_name] = (w.rows_written,
-                                                w.rows_checkpointed)
+                self._store.covers(w.name, self._version(w.ckpt_name),
+                                   w.ckpt_name, w.rows_written,
+                                   w.rows_checkpointed)
 
     def _stored_locally(self):
         """Without a mirror the first copy is the store: a checkpoint is
@@ -358,18 +369,8 @@ class ParquetWriter:
         """`rows` of file `name` are in the store, unfinished there, in
         the checkpoint version `ckpt` (its object name)."""
         with self._store_lock:
-            self._in_store[name] = ckpt
-            # the versions before it are named by no later ticket
-            at = parquet_checkpoint.parse_ckpt_object(ckpt)
-            for old in [c for c in self._ckpt_rows if c != ckpt]:
-                got = parquet_checkpoint.parse_ckpt_object(old)
-                if got is not None and at is not None and got[0] == at[0] \
-                        and got[1] < at[1]:
-                    del self._ckpt_rows[old]
-            base = self._bases.get(name)
-            if base is not None and rows > 0 and base + rows - 1 > self._stored_row:
-                self._stored_row = base + rows - 1
-                self._stored_at = _wall_time()
+            self._store.stored(name, self._version(ckpt), ckpt, rows,
+                               _wall_time())
 
     def _await_catalog(self, name, sink, ckpt, rows=0):
         """File `name` is finished in `sink`; its checkpoint version
@@ -377,7 +378,8 @@ class ParquetWriter:
         if ckpt is not None:
             self._stored(name, rows, ckpt)
         with self._store_lock:
-            self._awaiting[name] = sink
+            self._ckpt_sink[name] = sink
+            self._store.awaits(name)
         if self.catalog is not None:
             self.catalog.file_finished()
 
@@ -387,46 +389,42 @@ class ParquetWriter:
         ticket is written, and only then are its checkpoints deleted.
         Called on the catalog thread."""
         with self._store_lock:
-            done = [n for n in self._awaiting if n in names]
-            for n in done:
-                self._in_store.pop(n, None)
+            done = [n for n in self._ckpt_sink
+                    if n in names and self._store.listed(n)]
         if not done:
             return
         if self.on_ticket is not None and not self.on_ticket():
             return                      # ticket not written: delete nothing yet
-        now = time.monotonic()
         with self._store_lock:
-            for n in done:
-                sink = self._awaiting.pop(n, None)
-                if sink is not None:
-                    self._discard_at[n] = (sink, now)
+            self._store.dropped(time.monotonic())
         self.discard_due()
 
     def discard_due(self):
         """Delete the checkpoints of files the ticket dropped at least
-        superseded_keep_s ago. Called in the steps that upload (a ship
+        the keep time ago. Called in the steps that upload (a ship
         pass; a checkpoint when the first copy is the store) and when
         the catalog drops files; nothing runs on a timer."""
-        now = time.monotonic()
         with self._store_lock:
-            due = [(n, sink) for n, (sink, at) in self._discard_at.items()
-                   if now - at >= self.superseded_keep_s]
+            due = [(n, self._ckpt_sink.get(n))
+                   for n in self._store.due(time.monotonic())]
         for n, sink in due:
             try:
-                parquet_checkpoint.discard_checkpoints(n, sink)
+                if sink is not None:
+                    parquet_checkpoint.discard_checkpoints(n, sink)
             except Exception as e:
                 _diag.error(f"[{self._stream_name}] deleting the checkpoints "
                             f"of {n} after the ticket dropped it: {e}; the "
                             f"next upload retries")
                 continue
             with self._store_lock:
-                self._discard_at.pop(n, None)
+                self._store.discarded(n)
+                self._ckpt_sink.pop(n, None)
 
     def _finished(self, name):
         """File `name` is finished in the store: an ordinary parquet file,
         for the catalog to register."""
         with self._store_lock:
-            self._in_store.pop(name, None)
+            self._store.finished(name)
         if self.catalog is not None:
             self.catalog.file_finished()
 
@@ -435,9 +433,8 @@ class ParquetWriter:
         in the store and when it got there (-1, None before any), and the
         object names of the newest checkpoint version of each file in the
         store unfinished."""
-        with self._store_lock:
-            return (self._stored_row, self._stored_at,
-                    sorted(c for c in self._in_store.values() if c))
+        stored_row, stored_at, files = self.store_files()
+        return stored_row, stored_at, sorted(f["checkpoint"] for f in files)
 
     def store_files(self):
         """(stored_row, stored_at, files): store_state() with, for each
@@ -449,15 +446,7 @@ class ParquetWriter:
         file its start-up sweep found) is None. One reading: the row
         and the files belong together."""
         with self._store_lock:
-            files = []
-            for name, ckpt in sorted(self._in_store.items()):
-                if not ckpt:
-                    continue
-                final, rows = self._ckpt_rows.get(ckpt, (None, None))
-                files.append({"checkpoint": ckpt,
-                              "first_row": self._bases.get(name),
-                              "final_rows": final, "rows": rows})
-            return self._stored_row, self._stored_at, files
+            return self._store.state()[:3]
 
     def store_location(self):
         """The stream's folder in the store, ending in '/': the bucket's

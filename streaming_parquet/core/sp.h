@@ -317,6 +317,103 @@ int64_t sp_writes_cursor(const SpWrites *w);
 int64_t sp_writes_planned(const SpWrites *w);
 int64_t sp_writes_lost(const SpWrites *w);
 
+/* WHAT THE STORE HOLDS
+ *
+ * The part of the ticket that says what a reader can take from the
+ * store, and the rule for when a file's old checkpoints are deleted.
+ * One SpStore per stream; the host tells it each thing that lands in
+ * the store, and asks it for the ticket's values. The host does the
+ * writes and the deletes.
+ *
+ * A file of this run is named by its object name in the stream's
+ * folder (20261114-174256.parquet). While it is written it is in the
+ * store as checkpoint versions, numbered from 1; a version's object
+ * name is `checkpoint` here. The host takes a version's number from
+ * its name by the checkpoint core's rule and gives both.
+ *
+ * The life of a file, as the host tells it:
+ *
+ *   sp_store_begins     the file's first row has a stream row number
+ *   sp_store_covers     a checkpoint version was written: the rows of
+ *                       its finished row groups, and its rows
+ *   sp_store_stored     a version is in the store (at once when the
+ *                       first copy is the store; after its upload when
+ *                       the store is a mirror). The file is in the
+ *                       ticket's `files` with this version. What the
+ *                       plan knew of older versions is dropped: no
+ *                       later ticket names them. The newest stored row
+ *                       moves up when this version holds a later one.
+ *   then one of:
+ *   sp_store_finished   the file is finished in the store and nothing
+ *                       lists finished files: it leaves the ticket.
+ *   sp_store_awaits     the file is finished in the store and a catalog
+ *                       will list it: it STAYS in the ticket, with its
+ *                       last checkpoint version, until the catalog
+ *                       lists it, so no reader is between the two.
+ *   sp_store_listed     a published catalog lists the file: it leaves
+ *                       the ticket. The host writes the ticket, and
+ *   sp_store_dropped    when that write worked: the file's checkpoints
+ *                       are superseded from `now`.
+ *   sp_store_due        the files whose checkpoints were superseded
+ *                       keep_seconds ago or more: a reader told of them
+ *                       has had that long. The host deletes them and
+ *   sp_store_discarded  says so.
+ *
+ * Two clocks, both the host's: `wall` is the time the ticket shows
+ * (stored_at), `now` is monotonic seconds.
+ */
+typedef struct SpStore SpStore;
+
+/* keep_seconds: how long a superseded checkpoint stays. NULL when
+ * memory is out or keep_seconds is negative or not finite. */
+SpStore *sp_store_new(double keep_seconds);
+void sp_store_free(SpStore *s);
+
+/* The keep time from now on. Returns 0, or -1 for a value that is
+ * negative or not finite. */
+int sp_store_set_keep_seconds(SpStore *s, double keep_seconds);
+double sp_store_keep_seconds(const SpStore *s);
+
+/* Each returns 0, or -1 when memory is out or the name is NULL. */
+int sp_store_begins(SpStore *s, const char *file, int64_t first_row);
+int sp_store_covers(SpStore *s, const char *file, int64_t version,
+                    const char *checkpoint, int64_t final_rows, int64_t rows);
+int sp_store_stored(SpStore *s, const char *file, int64_t version,
+                    const char *checkpoint, int64_t rows, double wall);
+int sp_store_finished(SpStore *s, const char *file);
+int sp_store_awaits(SpStore *s, const char *file);
+
+/* 1 when the file was awaiting its catalog (it now leaves the ticket,
+ * and waits for sp_store_dropped); 0 when it was not. */
+int sp_store_listed(SpStore *s, const char *file);
+
+/* The ticket without the listed files is written: their checkpoints are
+ * superseded from now. Returns how many files that is. */
+int sp_store_dropped(SpStore *s, double now);
+
+/* The index-th file (from 0) whose checkpoints are due for deletion at
+ * `now`; NULL past the last. The pointer holds until the next call that
+ * changes the store. */
+const char *sp_store_due(const SpStore *s, double now, int32_t index);
+int sp_store_discarded(SpStore *s, const char *file);
+
+/* The newest row of this run the store holds, -1 for none; 1 and *wall
+ * filled when one is there, else 0. */
+int64_t sp_store_stored_row(const SpStore *s);
+int sp_store_stored_at(const SpStore *s, double *wall);
+
+/* Put what the store holds into a ticket: stored_row, stored_at,
+ * keep_seconds, and `files` (replaced), in the order of the files'
+ * names. `where` is the stream's folder in the store, ending in '/':
+ * each checkpoint is written as where + its object name. Returns 0, or
+ * -1 with the reason in err. */
+int sp_store_fill(const SpStore *s, SpTicket *t, const char *where,
+                  char *err, size_t errlen);
+
+/* How many files the store's state holds (in the ticket, awaiting, or
+ * with checkpoints to delete): what a long run must not let grow. */
+int32_t sp_store_files(const SpStore *s);
+
 void sp_free(void *p);
 
 #ifdef __cplusplus
