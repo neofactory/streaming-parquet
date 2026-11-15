@@ -3,6 +3,7 @@ package streaming
 import (
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,6 +53,11 @@ type Stream struct {
 	published bool
 	stopHB    chan struct{}
 	hbDone    sync.WaitGroup
+
+	// What the store holds of this run, for the ticket; ticketNow asks
+	// the ticket's goroutine to write it at once: the store changed.
+	store     *storeState
+	ticketNow chan struct{}
 
 	// The writer lock (owner.go): taken the first time the stream is
 	// published or starts a file, held until Close.
@@ -113,6 +119,7 @@ func (t *Telemetry) CreateStream(name string, schema *arrow.Schema,
 	}
 	s := &Stream{Name: name, tel: t, ring: r, ringRows: ringRows,
 		run: runStart(), wake: make(chan struct{}, 1),
+		store: newStoreState(pqc.SupersededKeep), ticketNow: make(chan struct{}, 1),
 		stopWork: make(chan struct{})}
 	s.location.Store("")
 	// Own the stream before anything of it is written: one writer per
@@ -265,6 +272,10 @@ func (s *Stream) write() {
 		}
 		s.wrote(err)
 		s.mu.Unlock()
+		select { // the ticket says what the store holds: write it now
+		case s.ticketNow <- struct{}{}:
+		default:
+		}
 		if err != nil {
 			return
 		}
@@ -397,12 +408,20 @@ func (s *Stream) heartbeat(stop chan struct{}) {
 			Revision:    revision,
 			Archive:     s.location.Load().(string)}
 		s.mu.Lock()
-		if s.arch != nil && s.arch.recording() {
-			t.CheckpointSeconds = s.arch.ckptSeconds
+		where := ""
+		if s.arch != nil {
+			where = strings.TrimSuffix(s.arch.location, "/") + "/"
+			if s.arch.recording() {
+				t.CheckpointSeconds = s.arch.ckptSeconds
+			}
 		}
 		s.mu.Unlock()
-		// StoredRow and Files stay unknown until the core holds the rule
-		// for what the store holds.
+		if where != "" {
+			// what a reader can take from the store: the core's record
+			if err := s.store.fill(&t, where); err != nil {
+				fmt.Fprintf(os.Stderr, "[%s] ticket: %v\n", s.Name, err)
+			}
+		}
 		if err := s.tel.tickets.put(s.Name, t); err != nil {
 			fmt.Fprintf(os.Stderr, "[%s] ticket publish error: %v\n",
 				s.Name, err)
@@ -412,6 +431,8 @@ func (s *Stream) heartbeat(stop chan struct{}) {
 	for {
 		select {
 		case <-tick.C:
+			pub()
+		case <-s.ticketNow:
 			pub()
 		case <-stop:
 			return
@@ -466,7 +487,7 @@ func (s *Stream) StartParquet(label string, o *ParquetOptions) error {
 		}
 		lost = s.arch.lost()
 	}
-	arch, err := newArchiver(s.ring, s.Name, s.run, opts)
+	arch, err := newArchiver(s.ring, s.Name, s.run, opts, s.store)
 	if err != nil {
 		return err
 	}

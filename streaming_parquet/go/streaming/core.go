@@ -21,6 +21,7 @@ import "C"
 import (
 	"fmt"
 	"runtime"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -337,4 +338,83 @@ func (w *writePlan) plan(forceRowGroup bool, lo, hi int64, now float64) (kind in
 	}
 	C.sp_writes_plan(w.p, force, C.int64_t(lo), C.int64_t(hi), C.double(now), &out)
 	return int(out.kind), int64(out.lo), int64(out.hi), int64(out.lost)
+}
+
+// ---- what the store holds (sp.h: WHAT THE STORE HOLDS) ----
+
+// storeState is what the store holds of one stream's run, in the core:
+// the ticket's stored row and files. It has its own lock: the stream's
+// goroutine writes it and the ticket's goroutine reads it.
+type storeState struct {
+	mu sync.Mutex
+	p  *C.SpStore
+}
+
+func newStoreState(keep time.Duration) *storeState {
+	st := &storeState{p: C.sp_store_new(C.double(keep.Seconds()))}
+	runtime.SetFinalizer(st, func(st *storeState) { C.sp_store_free(st.p) })
+	return st
+}
+
+// begins: the file's first row has the stream row number firstRow.
+func (st *storeState) begins(file string, firstRow int64) {
+	cf := C.CString(file)
+	defer C.free(unsafe.Pointer(cf))
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	C.sp_store_begins(st.p, cf, C.int64_t(firstRow))
+}
+
+// stored: the checkpoint version is written and in the store; it holds
+// finalRows in finished row groups, and rows in all.
+func (st *storeState) stored(file string, version int, checkpoint string, finalRows, rows int64) {
+	cf, cc := C.CString(file), C.CString(checkpoint)
+	defer C.free(unsafe.Pointer(cf))
+	defer C.free(unsafe.Pointer(cc))
+	wall := float64(time.Now().UnixNano()) / 1e9
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	C.sp_store_covers(st.p, cf, C.int64_t(version), cc, C.int64_t(finalRows), C.int64_t(rows))
+	C.sp_store_stored(st.p, cf, C.int64_t(version), cc, C.int64_t(rows), C.double(wall))
+}
+
+// finished: the file is finished in the store; it leaves the ticket.
+func (st *storeState) finished(file string) {
+	cf := C.CString(file)
+	defer C.free(unsafe.Pointer(cf))
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	C.sp_store_finished(st.p, cf)
+}
+
+// fill puts what the store holds into t: the stored row and when, the
+// keep time, the files. where is the stream's folder, ending in "/".
+func (st *storeState) fill(t *Ticket, where string) error {
+	ct := C.sp_ticket_new()
+	if ct == nil {
+		return fmt.Errorf("ticket: out of memory")
+	}
+	defer C.sp_ticket_free(ct)
+	cw := C.CString(where)
+	defer C.free(unsafe.Pointer(cw))
+	var eb [coreErrLen]C.char
+	st.mu.Lock()
+	rc := C.sp_store_fill(st.p, ct, cw, &eb[0], coreErrLen)
+	st.mu.Unlock()
+	if rc != 0 {
+		return fmt.Errorf("%s", C.GoString(&eb[0]))
+	}
+	var n C.size_t
+	p := C.sp_ticket_write(ct, &n)
+	if p == nil {
+		return fmt.Errorf("ticket: out of memory")
+	}
+	defer C.sp_free(unsafe.Pointer(p))
+	got, err := ticketFromText(C.GoBytes(unsafe.Pointer(p), C.int(n)))
+	if err != nil {
+		return err
+	}
+	t.StoredRow, t.StoredAt = got.StoredRow, got.StoredAt
+	t.KeepSeconds, t.Files = got.KeepSeconds, got.Files
+	return nil
 }

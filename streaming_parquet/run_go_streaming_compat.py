@@ -298,6 +298,66 @@ def _():
         assert child.returncode == 0, child.stderr.read()
 
 
+@test("a Python reader's exact view of a Go writer's stream: the Go "
+      "ticket says what the store holds (stored row, the unfinished file "
+      "with its checkpoint), and the view joins that file to memory with "
+      "every row there once")
+def _():
+    import duckdb
+    from streaming_parquet import _core
+    child = subprocess.Popen(
+        [BIN, 'serve', ROOT, 'x/gopq', '3000', '6', 'pq'],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    a = rel = con = None
+    try:
+        path = os.path.join(ROOT, 'tickets', 'x', 'gopq.json')
+        deadline = time.time() + 30
+        def ticket():
+            try:
+                return _core.ticket_from_text(open(path).read())
+            except (OSError, _core.TicketError):
+                return None
+        # the writer is 1,000 rows in before the reader connects: those
+        # rows reach the view from the store alone
+        while time.time() < deadline:
+            t = ticket()
+            if t and (t["stored_row"] or -1) >= 999:
+                break
+            time.sleep(0.05)
+        t = ticket()
+        assert t and t["stored_row"] >= 999 and t["stored_at"], t
+        assert t["keep_seconds"] == 600 and len(t["files"]) == 1, t
+        f = t["files"][0]
+        assert f["first_row"] == 0 and f["rows"] == t["stored_row"] + 1, t
+        assert f["final_rows"] % 500 == 0 and os.path.exists(f["checkpoint"]), t
+        a = sp.connect('x/gopq', store=ROOT)
+        while a.state != 'streaming' and time.time() < deadline:
+            time.sleep(0.05)
+        con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+        rel = a.duckdb_all(con)
+        seen = []
+        while time.time() < deadline:
+            n, distinct, lo, hi = con.sql(
+                f"SELECT count(*), count(DISTINCT n), min(n), max(n) "
+                f"FROM {rel.name}").fetchall()[0]
+            assert n == distinct and lo == 0 and hi == n - 1, (n, distinct, lo, hi)
+            seen.append(n)
+            if n == 3000:
+                break
+            time.sleep(0.1)
+        assert seen[-1] == 3000 and seen[0] >= 1000, seen
+        assert len(set(seen)) > 2, f"the view did not follow the writer: {seen}"
+    finally:
+        if rel is not None:
+            rel.close()
+        if a is not None:
+            a.close()
+        if con is not None:
+            con.close()
+        child.wait(timeout=40)
+        assert child.returncode == 0, child.stderr.read()
+
+
 @test("the Go package's copies of the stream core are the core")
 def _():
     for src, dst in CORE_COPIES:

@@ -273,8 +273,13 @@ func main() {
 	case "serve":
 		rows, _ := strconv.Atoi(os.Args[4])
 		hold, _ := strconv.ParseFloat(os.Args[5], 64)
-		s, err := tel.CreateStream(name, schema(),
-			streaming.StreamOptions{RingRows: int64(rows) * 2})
+		o := streaming.StreamOptions{RingRows: int64(rows) * 2}
+		if len(os.Args) > 6 && os.Args[6] == "pq" {
+			// files under the root, where a reader of the root finds them
+			o.Parquet = &streaming.ParquetOptions{BaseDir: os.Args[2],
+				RowGroupRows: 500, CheckpointSeconds: 0.1}
+		}
+		s, err := tel.CreateStream(name, schema(), o)
 		if err != nil {
 			die(err)
 		}

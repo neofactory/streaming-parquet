@@ -37,7 +37,8 @@ type archiver struct {
 	sink       pqc.Sink
 	label      string
 	wp         *writePlan
-	lostBefore int64 // rows lost under this stream's earlier options
+	store      *storeState // what the store holds, for the ticket; the owner's
+	lostBefore int64       // rows lost under this stream's earlier options
 
 	// The writes owed, oldest first: each a row range, pinned when it
 	// became due. plan adds to it; write does its head.
@@ -108,7 +109,12 @@ func ringSizes(name string, ringRows, rowGroupRows int64) (int64, int64, error) 
 }
 
 // newArchiver takes o.RowGroupRows as settled by ringSizes.
-func newArchiver(r *ring.Ring, name, run string, o ParquetOptions) (*archiver, error) {
+// store is the owner's record of what the store holds, which outlives
+// one archiver; nil makes one for this archiver alone.
+func newArchiver(r *ring.Ring, name, run string, o ParquetOptions, store *storeState) (*archiver, error) {
+	if store == nil {
+		store = newStoreState(pqc.SupersededKeep)
+	}
 	// The layout, the same under a directory and under a bucket:
 	// <root>/streams/<name>/<files>, the ticket at <root>/tickets/<name>.json.
 	var sink pqc.Sink
@@ -139,6 +145,7 @@ func newArchiver(r *ring.Ring, name, run string, o ParquetOptions) (*archiver, e
 	}
 	a := &archiver{
 		wp:              wp,
+		store:           store,
 		ring:            r,
 		schema:          r.Schema(),
 		name:            name,
@@ -241,7 +248,21 @@ func (a *archiver) open(baseSeq int64) error {
 	a.fileSchema = arrow.NewSchema(a.schema.Fields(), &md)
 	a.w = w
 	a.fileName = name
+	a.store.begins(name, baseSeq)
 	return nil
+}
+
+// noteStored tells the store's record that the writer's newest
+// checkpoint version is written. The sink is the store: a version that
+// is written is there.
+func (a *archiver) noteStored() {
+	ck := a.w.CkptName()
+	if ck == "" {
+		return
+	}
+	_, version, _ := pqc.ParseCkptObject(ck)
+	a.store.stored(a.fileName, version, ck, int64(a.w.RowsFinal()),
+		int64(a.w.RowsCheckpointed()))
 }
 
 // work is one write the archiver owes: the rows [lo, hi), held by a
@@ -386,6 +407,7 @@ func (a *archiver) write(w *work) error {
 		}
 		w.written = true
 		a.durable = w.hi
+		a.noteStored()
 		if a.w.FileBytes() >= FileCutBytes {
 			// the file is large enough: the next row group begins a
 			// new one, with the same label
@@ -408,6 +430,7 @@ func (a *archiver) write(w *work) error {
 		return err
 	}
 	a.durable = w.hi
+	a.noteStored()
 	return nil
 }
 
@@ -523,6 +546,9 @@ func (a *archiver) rotate() error {
 		return err
 	}
 	err = a.w.Close(empty)
+	// finished in the store, or (on an error) left for the next start's
+	// sweep: no ticket of this run names it again
+	a.store.finished(a.fileName)
 	a.w = nil
 	a.fileName = ""
 	return err
