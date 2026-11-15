@@ -214,6 +214,109 @@ int sp_ownership(const char *who, const char *name, const char *store,
 void sp_ownership_unread(const char *name, const char *store,
                          const char *why, char *msg, size_t msglen);
 
+/* THE WRITE PLAN
+ *
+ * Which committed rows go to the stream's files, and when. One SpWrites
+ * per stream holds the plan's state; the host tells it what was
+ * committed and what time it is, pins the rows, and does the writes the
+ * plan names. The plan does no I/O and has no clock: `now` is the
+ * host's monotonic clock, in seconds.
+ *
+ * Rows have stream row numbers. The plan keeps:
+ *
+ *   cursor    the first row not yet planned as a row group
+ *   planned   the first row not yet planned as a row group or a
+ *             checkpoint (>= cursor)
+ *   lost      rows the ring reused before they were planned
+ *
+ * While the plan is on (between a start and a stop):
+ *
+ *   A ROW GROUP is due when the rows from cursor reach row_group_rows,
+ *   or, with row_group_seconds, when that long has passed since the
+ *   first of them was committed. Its rows are final in the file.
+ *
+ *   A CHECKPOINT is due when rows past `planned` are committed and
+ *   checkpoint_seconds have passed since the last planned write (or,
+ *   before any, since the first pending row). It makes the rows from
+ *   cursor durable and leaves cursor where it is: the next row group
+ *   holds the same rows. So an idle stream plans nothing.
+ *
+ *   A row group is also planned, due or not, when the host forces one:
+ *   at a cut, at a start that changes the options, at a stop. That is
+ *   how a file ends with every row committed before the call.
+ *
+ * The host pins the rows [cursor, committed) and tells the plan what
+ * the pin holds. Rows of it that the ring had already reused are lost:
+ * a row group counts them and goes on from the first row still there.
+ * A checkpoint is not planned over lost rows; the next row group counts
+ * them.
+ *
+ * The order of a host's calls at a commit:
+ *   sp_writes_commit    is a write due? (and: do the pending rows begin
+ *                       now -- the moment that names the next file)
+ *   pin [sp_writes_cursor, committed)
+ *   sp_writes_plan      the write to do, and the plan moves
+ */
+typedef struct SpWrites SpWrites;
+
+typedef enum {
+    SP_W_NOTHING = 0,
+    SP_W_ROW_GROUP = 1,
+    SP_W_CHECKPOINT = 2
+} SpWriteKind;
+
+/* One planned write: the rows [lo, hi). lost: the rows before lo that
+ * this step found reused, 0 for none. kind SP_W_NOTHING: no write (lost
+ * may still be more than 0). */
+typedef struct {
+    int kind;
+    int64_t lo, hi;
+    int64_t lost;
+} SpWrite;
+
+/* A plan that is off, at row 0, with row_group_rows 1 and no cadences.
+ * NULL when memory is out. */
+SpWrites *sp_writes_new(void);
+void sp_writes_free(SpWrites *w);
+
+/* The cadences, from now on. A NULL seconds is none: no row group by
+ * time, no checkpoints. Returns 0, or -1 with the reason in err:
+ * row_group_rows under 1, seconds negative or not finite. New options
+ * start the checkpoint cadence again. */
+int sp_writes_set_options(SpWrites *w, int64_t row_group_rows,
+                          const double *row_group_seconds,
+                          const double *checkpoint_seconds,
+                          char *err, size_t errlen);
+
+/* Turn the plan on at the row `committed` (the first row not yet
+ * committed): earlier rows are not planned. No change when it is on. */
+void sp_writes_start(SpWrites *w, int64_t committed);
+
+/* Turn the plan off. A host that wants the pending rows in the file
+ * forces a row group first. */
+void sp_writes_stop(SpWrites *w);
+
+/* The kind of write due for `committed` at `now`; nothing moves. */
+int sp_writes_due(const SpWrites *w, int64_t committed, double now);
+
+/* sp_writes_due, and the pending rows' clock starts when it was not
+ * running: then *begins is 1 (the pending rows begin at this commit),
+ * else 0. The answer is from before the clock started. */
+int sp_writes_commit(SpWrites *w, int64_t committed, double now,
+                     int *begins);
+
+/* Plan the write for a pin that holds the rows [lo, hi): hi is the
+ * committed row count the host pinned to, lo is cursor or, after a
+ * loss, later. force_row_group: plan a row group whatever is due.
+ * *out is the write; the plan moves with it. */
+void sp_writes_plan(SpWrites *w, int force_row_group, int64_t lo,
+                    int64_t hi, double now, SpWrite *out);
+
+int sp_writes_on(const SpWrites *w);
+int64_t sp_writes_cursor(const SpWrites *w);
+int64_t sp_writes_planned(const SpWrites *w);
+int64_t sp_writes_lost(const SpWrites *w);
+
 void sp_free(void *p);
 
 #ifdef __cplusplus

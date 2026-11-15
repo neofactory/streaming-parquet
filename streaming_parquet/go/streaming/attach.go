@@ -208,7 +208,7 @@ func (a *Attached) lifecycle(t *Telemetry, direct *Ticket) {
 				"rows are discarded here; the archive keeps them)\n",
 				a.Name, cur.Host, cur.Port, cur.Run, run)
 			a.mu.Lock()
-			if a.arch != nil && a.arch.recording {
+			if a.arch != nil && a.arch.recording() {
 				if err := a.arch.stop(); err != nil {
 					fmt.Fprintf(os.Stderr, "[%s] run resync: "+
 						"finalize of the previous run's recording "+
@@ -403,7 +403,7 @@ func (a *Attached) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	var err error
-	if a.arch != nil && a.arch.recording {
+	if a.arch != nil && a.arch.recording() {
 		err = a.arch.stop()
 	} else if a.arch != nil {
 		err = a.arch.rotate()

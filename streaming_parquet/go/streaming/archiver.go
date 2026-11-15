@@ -25,21 +25,23 @@ import (
 // its rows; that is cheap, and a Stream does it in Commit. write does the
 // write; a Stream's goroutine does that. The Attached feeder does both
 // in one call (step). The owner's locks cover every call.
+//
+// Which rows are due, and when, is the stream core's rule (sp.h, THE
+// WRITE PLAN): wp holds it and its state.
 type archiver struct {
-	ring      *ring.Ring
-	schema    *arrow.Schema
-	name      string
-	run       string // the writer's run: every file records it as sp_run
-	location  string // where the files land: the local directory, or the sink's URI
-	sink      pqc.Sink
-	recording bool
-	label     string
-	lost      int64 // rows the ring reused before they were written
+	ring       *ring.Ring
+	schema     *arrow.Schema
+	name       string
+	run        string // the writer's run: every file records it as sp_run
+	location   string // where the files land: the local directory, or the sink's URI
+	sink       pqc.Sink
+	label      string
+	wp         *writePlan
+	lostBefore int64 // rows lost under this stream's earlier options
 
 	// The writes owed, oldest first: each a row range, pinned when it
 	// became due. plan adds to it; write does its head.
-	queue   []*work
-	planned int64 // first seq no queued or finished write covers
+	queue []*work
 
 	rowGroupRows    int64
 	rowGroupSeconds float64
@@ -50,13 +52,14 @@ type archiver struct {
 	w          *pqc.Writer
 	fileSchema *arrow.Schema
 	fileName   string
-	cursor     int64 // first seq not yet written as a final row group
 	durable    int64 // first seq not yet in the archive: rows below it are in a chunk or the checkpoint
-	openMono   time.Time
-	ckptMono   time.Time
-	hasClock   bool
-	hasCkptCl  bool
 }
+
+// recording reports whether rows are being planned into files.
+func (a *archiver) recording() bool { return a.wp.on() }
+
+// lost is the count of rows the ring reused before they were written.
+func (a *archiver) lost() int64 { return a.lostBefore + a.wp.lost() }
 
 // ParquetOptions says how a stream's rows are written to parquet.
 type ParquetOptions struct {
@@ -130,7 +133,12 @@ func newArchiver(r *ring.Ring, name, run string, o ParquetOptions) (*archiver, e
 	default:
 		return nil, fmt.Errorf("archiver: unknown compression %q", o.Compression)
 	}
+	wp, err := newWritePlan(o.RowGroupRows, o.RowGroupSeconds, o.CheckpointSeconds)
+	if err != nil {
+		return nil, err
+	}
 	a := &archiver{
+		wp:              wp,
 		ring:            r,
 		schema:          r.Schema(),
 		name:            name,
@@ -237,14 +245,16 @@ func (a *archiver) open(baseSeq int64) error {
 }
 
 // work is one write the archiver owes: the rows [lo, hi), held by a
-// pin from the moment the write became due.
+// pin from the moment the write became due. Or a cut: the file ends.
 type work struct {
-	flush   bool  // a final row group; false = a checkpoint of the tail
-	lo, hi  int64 // the rows; lo is the next row of the file
-	dropped bool  // rows before lo were reused before they were written
-	added   bool  // the core has the row group; its objects are not all stored yet
-	written bool  // the row group is in the file (a failed cut is all that is left)
-	rs      *ring.RecordSet
+	flush    bool  // a final row group; false = a checkpoint of the tail
+	lo, hi   int64 // the rows; lo is the next row of the file
+	added    bool  // the core has the row group; its objects are not all stored yet
+	written  bool  // the row group is in the file (a failed cut is all that is left)
+	cut      bool  // no rows: the open file ends, the next row begins a new one
+	setLabel bool  // a cut that changes the label, to label
+	label    string
+	rs       *ring.RecordSet
 }
 
 func max64(a, b int64) int64 {
@@ -260,80 +270,72 @@ func min64(a, b int64) int64 {
 	return b
 }
 
-// plan decides whether a write is due for the rows committed so far.
-// If one is, it pins those rows and adds the write to the queue. No
-// I/O: the owner calls it at each commit, and when a time is due.
+// plan asks the write plan whether a write is due for the rows
+// committed so far. If one is, it pins those rows and adds the write to
+// the queue. No I/O: the owner calls it at each commit, and when a time
+// is due.
 func (a *archiver) plan() error {
-	if !a.recording {
-		return nil
-	}
 	committed := a.ring.NewestSeq() + 1
-	pending := committed - a.cursor
-	if pending <= 0 {
+	if a.wp.commit(committed, monoNow()) == writeNothing {
 		return nil
 	}
-	if !a.hasClock {
-		a.openMono = time.Now()
-		a.hasClock = true
-	}
-	due := pending >= a.rowGroupRows ||
-		(a.rowGroupSeconds > 0 &&
-			time.Since(a.openMono).Seconds() >= a.rowGroupSeconds)
-	if due {
-		return a.enqueue(true, committed)
-	}
-	// Every committed row is already in a checkpoint, written or
-	// queued: nothing to claim, so an idle stream costs no encode and
-	// no upload.
-	if a.ckptSeconds > 0 && committed > a.planned {
-		base := a.ckptMono
-		if !a.hasCkptCl {
-			base = a.openMono
-		}
-		if time.Since(base).Seconds() >= a.ckptSeconds {
-			return a.enqueue(false, committed)
-		}
-	}
-	return nil
+	return a.enqueue(false, committed)
 }
 
-// enqueue pins the rows [cursor, committed) and queues their write: a
-// final row group (flush), or a checkpoint of the tail, which leaves
-// the cursor where it is so the next row group writes the same rows.
-func (a *archiver) enqueue(flush bool, committed int64) error {
-	rs, err := a.ring.Pin(a.cursor, committed) // these rows and no others
+// enqueue pins the rows [cursor, committed) and queues the write the
+// plan names for them: a final row group, or a checkpoint of the tail,
+// which leaves the cursor where it is so the next row group writes the
+// same rows. force: a row group whatever is due.
+func (a *archiver) enqueue(force bool, committed int64) error {
+	cursor := a.wp.cursor()
+	if committed <= cursor {
+		return nil
+	}
+	rs, err := a.ring.Pin(cursor, committed) // these rows and no others
 	if err != nil {
 		return err
 	}
-	w := &work{flush: flush, rs: rs}
-	if rs.Lo > a.cursor {
+	kind, lo, hi, lost := a.wp.plan(force, rs.Lo, min64(committed, rs.Hi), monoNow())
+	if lost > 0 {
 		// rows reused before their write: loud, counted, then on from
-		// what the ring still has (the Python module's policy)
+		// what the ring still has
 		fmt.Fprintf(os.Stderr, "[%s] ARCHIVE LOSS: rows [%d,%d) recycled "+
-			"before parquet flush\n", a.name, a.cursor, rs.Lo)
-		a.lost += rs.Lo - a.cursor
-		a.cursor = rs.Lo
-		w.dropped = true
+			"before parquet flush\n", a.name, cursor, cursor+lost)
 	}
-	w.lo, w.hi = a.cursor, min64(committed, rs.Hi)
-	if w.hi <= w.lo {
+	if kind == writeNothing {
 		rs.Release()
 		return nil
 	}
-	a.queue = append(a.queue, w)
-	if flush {
-		a.cursor = w.hi
-		a.hasClock = false
+	a.queue = append(a.queue, &work{flush: kind == writeRowGroup, lo: lo, hi: hi, rs: rs})
+	return nil
+}
+
+// cut queues the end of the open file: every row committed so far goes
+// into it as a final row group, and the next committed row begins a new
+// file. No I/O.
+func (a *archiver) cut(setLabel bool, label string) error {
+	if !a.wp.on() {
+		return nil
 	}
-	a.planned = w.hi
-	a.ckptMono = time.Now()
-	a.hasCkptCl = true
+	if err := a.enqueue(true, a.ring.NewestSeq()+1); err != nil {
+		return err
+	}
+	a.queue = append(a.queue, &work{cut: true, setLabel: setLabel, label: label})
 	return nil
 }
 
 // write does one queued write. On an error the write stays owed: the
 // owner runs it again, and its pin holds the rows until it works.
 func (a *archiver) write(w *work) error {
+	if w.cut {
+		if err := a.rotate(); err != nil {
+			return err
+		}
+		if w.setLabel {
+			a.label = w.label
+		}
+		return nil
+	}
 	if w.written {
 		return a.rotate() // the cut that failed after the row group went in
 	}
@@ -391,11 +393,6 @@ func (a *archiver) write(w *work) error {
 		}
 		return nil
 	}
-	if w.dropped {
-		// the objects stored of the tail hold rows it no longer has:
-		// begin the tail again
-		a.w.DropUnfinished()
-	}
 	// The writer asks for the rows no object holds yet, or for a merge:
 	// rows [offset, offset+rows) of the tail.
 	_, err = a.w.CheckpointTail(uint64(w.hi-w.lo), func(offset, n uint64) ([]byte, error) {
@@ -416,7 +413,9 @@ func (a *archiver) write(w *work) error {
 
 // pop drops the queue's head, a write that is done, and its pin.
 func (a *archiver) pop() {
-	a.queue[0].rs.Release()
+	if rs := a.queue[0].rs; rs != nil {
+		rs.Release()
+	}
 	a.queue = a.queue[1:]
 }
 
@@ -453,10 +452,8 @@ func (a *archiver) flushAll() error {
 	if err := a.drain(); err != nil {
 		return err
 	}
-	if committed := a.ring.NewestSeq() + 1; committed > a.cursor {
-		if err := a.enqueue(true, committed); err != nil {
-			return err
-		}
+	if err := a.enqueue(true, a.ring.NewestSeq()+1); err != nil {
+		return err
 	}
 	return a.drain()
 }
@@ -483,7 +480,7 @@ func sliceRecords(recs []arrow.RecordBatch, offset, rows int64) []arrow.RecordBa
 // every row committed before the mark in it.
 func (a *archiver) start(label string) error {
 	var err error
-	if a.recording {
+	if a.wp.on() {
 		err = a.flushAll()
 	} else {
 		err = a.drain()
@@ -494,27 +491,26 @@ func (a *archiver) start(label string) error {
 	if err := a.rotate(); err != nil {
 		return err
 	}
-	committed := a.ring.NewestSeq() + 1
 	a.label = label
-	a.recording = true
-	a.cursor = committed
-	a.planned = committed
-	a.durable = committed
-	a.hasClock = false
-	a.hasCkptCl = false
+	if !a.wp.on() {
+		// off until now: the rows before the mark are not planned
+		committed := a.ring.NewestSeq() + 1
+		a.wp.start(committed)
+		a.durable = committed
+	}
 	return nil
 }
 
 // stop writes the pending rows and finishes the file.
 func (a *archiver) stop() error {
-	if a.recording {
+	if a.wp.on() {
 		if err := a.flushAll(); err != nil {
 			return err
 		}
 	} else if err := a.drain(); err != nil {
 		return err
 	}
-	a.recording = false
+	a.wp.stop()
 	return a.rotate()
 }
 

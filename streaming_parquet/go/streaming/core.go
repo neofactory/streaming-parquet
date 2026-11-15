@@ -20,6 +20,8 @@ import "C"
 
 import (
 	"fmt"
+	"runtime"
+	"time"
 	"unsafe"
 
 	"github.com/neofactory/streaming-parquet/parquet_checkpoint/go/pqc"
@@ -270,3 +272,69 @@ const (
 	ownTakeOver = int(C.SP_TAKE_OVER)
 	ownRefused  = int(C.SP_REFUSED)
 )
+
+// ---- the write plan (sp.h: THE WRITE PLAN) ----
+
+const (
+	writeNothing    = int(C.SP_W_NOTHING)
+	writeRowGroup   = int(C.SP_W_ROW_GROUP)
+	writeCheckpoint = int(C.SP_W_CHECKPOINT)
+)
+
+// writePlan is one stream's write plan in the core: which committed
+// rows go to its files, and when. The owner's lock covers every call.
+type writePlan struct{ p *C.SpWrites }
+
+var monoStart = time.Now()
+
+// monoNow is the plan's clock: monotonic seconds.
+func monoNow() float64 { return time.Since(monoStart).Seconds() }
+
+// newWritePlan: seconds of 0 mean none (no row group by time, no
+// checkpoints), as ParquetOptions says.
+func newWritePlan(rowGroupRows int64, rowGroupSeconds, checkpointSeconds float64) (*writePlan, error) {
+	w := &writePlan{p: C.sp_writes_new()}
+	if w.p == nil {
+		return nil, fmt.Errorf("write plan: out of memory")
+	}
+	runtime.SetFinalizer(w, func(w *writePlan) { C.sp_writes_free(w.p) })
+	var rgs, cs *C.double
+	if rowGroupSeconds > 0 {
+		v := C.double(rowGroupSeconds)
+		rgs = &v
+	}
+	if checkpointSeconds > 0 {
+		v := C.double(checkpointSeconds)
+		cs = &v
+	}
+	var eb [coreErrLen]C.char
+	if C.sp_writes_set_options(w.p, C.int64_t(rowGroupRows), rgs, cs, &eb[0], coreErrLen) != 0 {
+		return nil, fmt.Errorf("%s", C.GoString(&eb[0]))
+	}
+	return w, nil
+}
+
+func (w *writePlan) start(committed int64) { C.sp_writes_start(w.p, C.int64_t(committed)) }
+func (w *writePlan) stop()                 { C.sp_writes_stop(w.p) }
+func (w *writePlan) on() bool              { return C.sp_writes_on(w.p) != 0 }
+func (w *writePlan) cursor() int64         { return int64(C.sp_writes_cursor(w.p)) }
+func (w *writePlan) planned() int64        { return int64(C.sp_writes_planned(w.p)) }
+func (w *writePlan) lost() int64           { return int64(C.sp_writes_lost(w.p)) }
+
+// commit reports the kind of write due for the rows committed so far.
+func (w *writePlan) commit(committed int64, now float64) int {
+	var begins C.int
+	return int(C.sp_writes_commit(w.p, C.int64_t(committed), C.double(now), &begins))
+}
+
+// plan is the write for a pin that holds the rows [lo, hi); the plan
+// moves with it. lost: rows before lo that the ring had reused.
+func (w *writePlan) plan(forceRowGroup bool, lo, hi int64, now float64) (kind int, from, to, lost int64) {
+	var out C.SpWrite
+	force := C.int(0)
+	if forceRowGroup {
+		force = 1
+	}
+	C.sp_writes_plan(w.p, force, C.int64_t(lo), C.int64_t(hi), C.double(now), &out)
+	return int(out.kind), int64(out.lo), int64(out.hi), int64(out.lost)
+}

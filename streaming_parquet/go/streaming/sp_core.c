@@ -855,3 +855,129 @@ void sp_ownership_unread(const char *name, const char *store,
          "this stream would not be seen",
          name ? name : "?", store ? store : "?", why ? why : "?");
 }
+
+/* ---- the write plan ----------------------------------------------------- */
+
+struct SpWrites {
+    int on;
+    int64_t cursor, planned, lost;
+    int64_t row_group_rows;
+    int has_group_seconds, has_checkpoint_seconds;
+    double group_seconds, checkpoint_seconds;
+    int has_open, has_planned_at;
+    double open_at;       /* when the pending rows began */
+    double planned_at;    /* when the last write was planned */
+};
+
+SpWrites *sp_writes_new(void) {
+    SpWrites *w = calloc(1, sizeof(SpWrites));
+    if (w) w->row_group_rows = 1;
+    return w;
+}
+
+void sp_writes_free(SpWrites *w) { free(w); }
+
+int sp_writes_set_options(SpWrites *w, int64_t row_group_rows,
+                          const double *row_group_seconds,
+                          const double *checkpoint_seconds,
+                          char *err, size_t errlen) {
+    if (!w) { fail(err, errlen, "write plan: no plan"); return -1; }
+    if (row_group_rows < 1) {
+        fail(err, errlen, "write plan: row_group_rows is %lld; it must be "
+             "1 or more", (long long)row_group_rows);
+        return -1;
+    }
+    if (row_group_seconds && !(isfinite(*row_group_seconds)
+                               && *row_group_seconds >= 0)) {
+        fail(err, errlen, "write plan: row_group_seconds must be 0 or more");
+        return -1;
+    }
+    if (checkpoint_seconds && !(isfinite(*checkpoint_seconds)
+                                && *checkpoint_seconds >= 0)) {
+        fail(err, errlen, "write plan: checkpoint_seconds must be 0 or more");
+        return -1;
+    }
+    w->row_group_rows = row_group_rows;
+    w->has_group_seconds = row_group_seconds != NULL;
+    w->group_seconds = row_group_seconds ? *row_group_seconds : 0;
+    w->has_checkpoint_seconds = checkpoint_seconds != NULL;
+    w->checkpoint_seconds = checkpoint_seconds ? *checkpoint_seconds : 0;
+    w->has_planned_at = 0;
+    return 0;
+}
+
+void sp_writes_start(SpWrites *w, int64_t committed) {
+    if (!w || w->on) return;
+    w->on = 1;
+    w->cursor = w->planned = committed;
+    w->has_open = 0;
+}
+
+void sp_writes_stop(SpWrites *w) {
+    if (w) w->on = 0;
+}
+
+int sp_writes_due(const SpWrites *w, int64_t committed, double now) {
+    if (!w || !w->on || committed <= w->cursor) return SP_W_NOTHING;
+    /* the subtraction cannot overflow: both are row counts, 0 or more */
+    if (committed - w->cursor >= w->row_group_rows) return SP_W_ROW_GROUP;
+    if (w->has_group_seconds && w->has_open
+            && now - w->open_at >= w->group_seconds)
+        return SP_W_ROW_GROUP;
+    if (w->has_checkpoint_seconds && committed > w->planned) {
+        if (w->has_planned_at) {
+            if (now - w->planned_at >= w->checkpoint_seconds)
+                return SP_W_CHECKPOINT;
+        } else if (w->has_open) {
+            if (now - w->open_at >= w->checkpoint_seconds)
+                return SP_W_CHECKPOINT;
+        }
+    }
+    return SP_W_NOTHING;
+}
+
+int sp_writes_commit(SpWrites *w, int64_t committed, double now,
+                     int *begins) {
+    if (begins) *begins = 0;
+    if (!w) return SP_W_NOTHING;
+    int due = sp_writes_due(w, committed, now);
+    if (w->on && committed > w->cursor && !w->has_open) {
+        w->has_open = 1;
+        w->open_at = now;
+        if (begins) *begins = 1;
+    }
+    return due;
+}
+
+void sp_writes_plan(SpWrites *w, int force_row_group, int64_t lo,
+                    int64_t hi, double now, SpWrite *out) {
+    SpWrite none = {SP_W_NOTHING, 0, 0, 0};
+    if (out) *out = none;
+    if (!w || !out || !w->on || hi <= w->cursor) return;
+    int kind = force_row_group ? SP_W_ROW_GROUP : sp_writes_due(w, hi, now);
+    if (kind == SP_W_NOTHING) return;
+    if (lo > w->cursor) {
+        if (kind == SP_W_CHECKPOINT) return;   /* the next row group counts them */
+        if (lo > hi) lo = hi;
+        out->lost = lo - w->cursor;
+        w->lost += out->lost;
+        w->cursor = lo;
+        if (w->planned < lo) w->planned = lo;
+        if (hi <= w->cursor) return;
+    }
+    out->kind = kind;
+    out->lo = w->cursor;
+    out->hi = hi;
+    if (kind == SP_W_ROW_GROUP) {
+        w->cursor = hi;
+        w->has_open = 0;
+    }
+    if (w->planned < hi) w->planned = hi;
+    w->has_planned_at = 1;
+    w->planned_at = now;
+}
+
+int sp_writes_on(const SpWrites *w) { return w ? w->on : 0; }
+int64_t sp_writes_cursor(const SpWrites *w) { return w ? w->cursor : 0; }
+int64_t sp_writes_planned(const SpWrites *w) { return w ? w->planned : 0; }
+int64_t sp_writes_lost(const SpWrites *w) { return w ? w->lost : 0; }

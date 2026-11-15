@@ -226,7 +226,7 @@ func (s *Stream) workWait() time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	wait := waitFor
-	if s.arch != nil && s.arch.recording {
+	if s.arch != nil && s.arch.recording() {
 		for _, seconds := range []float64{s.arch.ckptSeconds, s.arch.rowGroupSeconds} {
 			if seconds > 0 {
 				if d := time.Duration(seconds * float64(time.Second) / 2); d < wait {
@@ -315,7 +315,7 @@ func (s *Stream) ArchiveState() ArchiveState {
 	st := ArchiveState{Failing: s.failing, Error: s.errText,
 		Location: s.location.Load().(string), File: s.file}
 	if s.arch != nil {
-		st.LostRows = s.arch.lost
+		st.LostRows = s.arch.lost()
 	}
 	return st
 }
@@ -397,7 +397,7 @@ func (s *Stream) heartbeat(stop chan struct{}) {
 			Revision:    revision,
 			Archive:     s.location.Load().(string)}
 		s.mu.Lock()
-		if s.arch != nil && s.arch.recording {
+		if s.arch != nil && s.arch.recording() {
 			t.CheckpointSeconds = s.arch.ckptSeconds
 		}
 		s.mu.Unlock()
@@ -464,13 +464,13 @@ func (s *Stream) StartParquet(label string, o *ParquetOptions) error {
 		if err := s.arch.stop(); err != nil {
 			return err
 		}
-		lost = s.arch.lost
+		lost = s.arch.lost()
 	}
 	arch, err := newArchiver(s.ring, s.Name, s.run, opts)
 	if err != nil {
 		return err
 	}
-	arch.lost = lost
+	arch.lostBefore = lost
 	s.arch, s.parquet = arch, &opts
 	s.location.Store(arch.location)
 	err = arch.start(label)
@@ -488,6 +488,36 @@ func (s *Stream) ParquetOptions() *ParquetOptions {
 	}
 	o := *s.parquet
 	return &o
+}
+
+// Cut ends the open file at the last committed row; the next committed
+// row begins a new file with the same label. No committed row is
+// skipped or written twice. The boundary call for a stream that records
+// all the time. It returns at once: the stream's goroutine writes the
+// rows and ends the file. A stream that is not recording does nothing.
+func (s *Stream) Cut() { s.cut(false, "") }
+
+// CutLabel is Cut, and the next file carries label in its name ("" for
+// no label).
+func (s *Stream) CutLabel(label string) { s.cut(true, label) }
+
+func (s *Stream) cut(setLabel bool, label string) {
+	s.tel.flight.notify(s.Name)
+	s.mu.Lock()
+	owed := false
+	if s.arch != nil {
+		if err := s.arch.cut(setLabel, label); err != nil {
+			s.fault(err)
+		}
+		owed = len(s.arch.queue) > 0
+	}
+	s.mu.Unlock()
+	if owed {
+		select {
+		case s.wake <- struct{}{}:
+		default: // a wake is already waiting
+		}
+	}
 }
 
 // StopParquet ends the open file, with every row committed up to now in
