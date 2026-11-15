@@ -607,10 +607,10 @@ s, _ := tel.CreateStream("press/fieldbus", schema,
 // stream's goroutine writes the files. A write fault shows in
 // s.ArchiveState(); s.Durable() is the first row not yet in a file.
 // s.StartParquet("job-19", nil) is a mark: a new file from this row on.
-// s.Cut() ends the open file at the last committed row; the next row
-// begins a new one. s.CutLabel("job-20") also names the next file.
 // Give options there to replace the stream's, or to start files on a
 // stream created with none.
+// s.Cut() ends the open file at the last committed row; the next row
+// begins a new one. s.CutLabel("job-20") also names the next file.
 // StreamOptions{Internal: true} makes a stream no other process finds
 // or reads; s.Publish() and s.Unpublish() change it later.
 
