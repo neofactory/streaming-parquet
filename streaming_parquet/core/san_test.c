@@ -231,6 +231,142 @@ int main(void) {
             "server writing this stream would not be seen") == 0);
     }
 
+    /* ---- the write plan ---- */
+    {
+        SpWrite o;
+        int begins;
+        double rgs = 10, cs = 2;
+        SpWrites *w = sp_writes_new();
+        CHECK(sp_writes_set_options(w, 0, NULL, NULL, err, sizeof err) == -1);
+        CHECK(strstr(err, "row_group_rows is 0") != NULL);
+        double bad = -1;
+        CHECK(sp_writes_set_options(w, 5, &bad, NULL, err, sizeof err) == -1);
+        bad = NAN;
+        CHECK(sp_writes_set_options(w, 5, NULL, &bad, err, sizeof err) == -1);
+        CHECK(sp_writes_set_options(w, 100, &rgs, &cs, err, sizeof err) == 0);
+
+        /* off: nothing is due, nothing is planned */
+        CHECK(sp_writes_commit(w, 500, 0, &begins) == SP_W_NOTHING && !begins);
+        sp_writes_plan(w, 1, 0, 500, 0, &o);
+        CHECK(o.kind == SP_W_NOTHING);
+
+        /* on at row 500: the earlier rows are not planned */
+        sp_writes_start(w, 500);
+        CHECK(sp_writes_on(w) && sp_writes_cursor(w) == 500);
+        CHECK(sp_writes_commit(w, 500, 1, &begins) == SP_W_NOTHING && !begins);
+        /* the first pending row starts the clock; the answer is from before */
+        CHECK(sp_writes_commit(w, 510, 1, &begins) == SP_W_NOTHING && begins);
+        CHECK(sp_writes_commit(w, 520, 2, &begins) == SP_W_NOTHING && !begins);
+        /* a checkpoint: cadence from the first pending row */
+        CHECK(sp_writes_due(w, 520, 2.9) == SP_W_NOTHING);
+        CHECK(sp_writes_due(w, 520, 3.0) == SP_W_CHECKPOINT);
+        sp_writes_plan(w, 0, 500, 520, 3.0, &o);
+        CHECK(o.kind == SP_W_CHECKPOINT && o.lo == 500 && o.hi == 520 && o.lost == 0);
+        CHECK(sp_writes_cursor(w) == 500 && sp_writes_planned(w) == 520);
+        /* no new rows: nothing to claim, however long */
+        CHECK(sp_writes_due(w, 520, 9.0) == SP_W_NOTHING);
+        /* new rows: the cadence runs from the last planned write */
+        CHECK(sp_writes_due(w, 530, 4.9) == SP_W_NOTHING);
+        CHECK(sp_writes_due(w, 530, 5.0) == SP_W_CHECKPOINT);
+        /* the row group by time, from the first pending row (at 1) */
+        CHECK(sp_writes_due(w, 530, 11.0) == SP_W_ROW_GROUP);
+        /* the row group by rows */
+        CHECK(sp_writes_due(w, 599, 4.0) == SP_W_NOTHING);
+        CHECK(sp_writes_due(w, 600, 4.0) == SP_W_ROW_GROUP);
+        sp_writes_plan(w, 0, 500, 640, 4.0, &o);
+        CHECK(o.kind == SP_W_ROW_GROUP && o.lo == 500 && o.hi == 640 && o.lost == 0);
+        CHECK(sp_writes_cursor(w) == 640 && sp_writes_planned(w) == 640);
+        /* the clock starts again with the next pending row */
+        CHECK(sp_writes_commit(w, 640, 30, &begins) == SP_W_NOTHING && !begins);
+        /* (and after an idle spell the first new row is claimed at once) */
+        CHECK(sp_writes_commit(w, 641, 30, &begins) == SP_W_CHECKPOINT && begins);
+        CHECK(sp_writes_due(w, 641, 39.9) != SP_W_ROW_GROUP);
+        CHECK(sp_writes_due(w, 641, 40.0) == SP_W_ROW_GROUP);
+
+        /* a forced row group (a cut): due or not; nothing pending: nothing */
+        sp_writes_plan(w, 1, 640, 650, 31, &o);
+        CHECK(o.kind == SP_W_ROW_GROUP && o.lo == 640 && o.hi == 650);
+        sp_writes_plan(w, 1, 650, 650, 31, &o);
+        CHECK(o.kind == SP_W_NOTHING && o.lost == 0);
+
+        /* lost rows: a checkpoint is not planned over them ... */
+        CHECK(sp_writes_commit(w, 700, 40, &begins) == SP_W_CHECKPOINT && begins);
+        CHECK(sp_writes_due(w, 700, 42) == SP_W_CHECKPOINT);
+        sp_writes_plan(w, 0, 670, 700, 42, &o);
+        CHECK(o.kind == SP_W_NOTHING && o.lost == 0 && sp_writes_lost(w) == 0);
+        CHECK(sp_writes_cursor(w) == 650 && sp_writes_planned(w) == 650);
+        /* ... the next row group counts them and goes on */
+        sp_writes_plan(w, 0, 670, 760, 43, &o);
+        CHECK(o.kind == SP_W_ROW_GROUP && o.lo == 670 && o.hi == 760 && o.lost == 20);
+        CHECK(sp_writes_lost(w) == 20 && sp_writes_cursor(w) == 760);
+        /* every pinned row lost: counted, no write */
+        sp_writes_plan(w, 1, 900, 900, 44, &o);
+        CHECK(o.kind == SP_W_NOTHING && o.lost == 140 && sp_writes_cursor(w) == 900);
+        CHECK(sp_writes_lost(w) == 160 && sp_writes_planned(w) == 900);
+
+        /* stop: off; a second start is at the new row */
+        sp_writes_stop(w);
+        CHECK(!sp_writes_on(w) && sp_writes_due(w, 5000, 99) == SP_W_NOTHING);
+        sp_writes_start(w, 5000);
+        CHECK(sp_writes_cursor(w) == 5000 && sp_writes_planned(w) == 5000);
+        sp_writes_start(w, 6000);                 /* on already: no change */
+        CHECK(sp_writes_cursor(w) == 5000);
+
+        /* no cadences: only rows make a write due */
+        CHECK(sp_writes_set_options(w, 100, NULL, NULL, err, sizeof err) == 0);
+        CHECK(sp_writes_commit(w, 5050, 100, &begins) == SP_W_NOTHING && begins);
+        CHECK(sp_writes_due(w, 5050, 1e9) == SP_W_NOTHING);
+        /* new options start the checkpoint cadence again, from the
+         * first pending row */
+        sp_writes_set_options(w, 100, NULL, &cs, err, sizeof err);
+        CHECK(sp_writes_due(w, 5050, 101.9) == SP_W_NOTHING);
+        CHECK(sp_writes_due(w, 5050, 102) == SP_W_CHECKPOINT);
+        sp_writes_free(w);
+
+        /* NULL is taken everywhere */
+        CHECK(sp_writes_due(NULL, 1, 1) == SP_W_NOTHING);
+        CHECK(sp_writes_commit(NULL, 1, 1, NULL) == SP_W_NOTHING);
+        sp_writes_plan(NULL, 1, 0, 1, 1, &o);
+        CHECK(o.kind == SP_W_NOTHING);
+        sp_writes_start(NULL, 1); sp_writes_stop(NULL); sp_writes_free(NULL);
+        CHECK(sp_writes_cursor(NULL) == 0 && sp_writes_on(NULL) == 0);
+
+        /* a long random run: the rows planned as row groups are every
+         * row from the start, once, in order, less the lost ones */
+        w = sp_writes_new();
+        double c2 = 0.5, g2 = 3;
+        sp_writes_set_options(w, 64, &g2, &c2, err, sizeof err);
+        sp_writes_start(w, 0);
+        uint64_t seed = 88172645463325252ULL;
+        int64_t committed = 0, next = 0, lost = 0;
+        double now = 0;
+        for (int i = 0; i < 200000; i++) {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            committed += (int64_t)(seed % 40);
+            now += (double)((seed >> 8) % 100) / 100.0;
+            int due = sp_writes_commit(w, committed, now, &begins);
+            int force = (seed >> 20) % 50 == 0;
+            if (!due && !force) continue;
+            int64_t lo = sp_writes_cursor(w);
+            if ((seed >> 30) % 97 == 0) lo += (int64_t)((seed >> 40) % 30);
+            if (lo > committed) lo = committed;
+            sp_writes_plan(w, force, lo, committed, now, &o);
+            lost += o.lost;
+            if (o.kind == SP_W_ROW_GROUP) {
+                CHECK(o.lo == next + o.lost && o.hi > o.lo && o.hi == committed);
+                next = o.hi;
+            } else if (o.kind == SP_W_CHECKPOINT) {
+                CHECK(o.lo == next && o.lost == 0 && o.hi == committed);
+            } else {
+                next += o.lost;
+            }
+            CHECK(sp_writes_cursor(w) == next);
+            CHECK(sp_writes_planned(w) >= next && sp_writes_planned(w) <= committed);
+        }
+        CHECK(sp_writes_lost(w) == lost && lost > 0 && next > 1000000);
+        sp_writes_free(w);
+    }
+
     if (failures == 0) printf("san_test: all checks passed\n");
     return failures ? 1 : 0;
 }

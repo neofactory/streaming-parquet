@@ -60,6 +60,25 @@ void sp_lock_refusal(const char *who, const char *lock_path,
 int sp_ownership(const char *who, const char *name, const char *store,
                  const SpTicket *ticket, const char *host,
                  double now, double if_absent, char *msg, size_t msglen);
+typedef struct SpWrites SpWrites;
+typedef struct { int kind; int64_t lo, hi; int64_t lost; } SpWrite;
+SpWrites *sp_writes_new(void);
+void sp_writes_free(SpWrites *w);
+int sp_writes_set_options(SpWrites *w, int64_t row_group_rows,
+                          const double *row_group_seconds,
+                          const double *checkpoint_seconds,
+                          char *err, size_t errlen);
+void sp_writes_start(SpWrites *w, int64_t committed);
+void sp_writes_stop(SpWrites *w);
+int sp_writes_due(const SpWrites *w, int64_t committed, double now);
+int sp_writes_commit(SpWrites *w, int64_t committed, double now,
+                     int *begins);
+void sp_writes_plan(SpWrites *w, int force_row_group, int64_t lo,
+                    int64_t hi, double now, SpWrite *out);
+int sp_writes_on(const SpWrites *w);
+int64_t sp_writes_cursor(const SpWrites *w);
+int64_t sp_writes_planned(const SpWrites *w);
+int64_t sp_writes_lost(const SpWrites *w);
 void sp_ownership_unread(const char *name, const char *store,
                          const char *why, char *msg, size_t msglen);
 """)
@@ -254,3 +273,68 @@ def ownership_unread(name, store, why):
     lib.sp_ownership_unread(name.encode(), str(store).encode(),
                             str(why).encode(), msg, _MSGLEN)
     return ffi.string(msg).decode("utf-8", "replace")
+
+
+# ---- the write plan (core/sp.h: THE WRITE PLAN) --------------------------
+
+NOTHING, ROW_GROUP, CHECKPOINT = 0, 1, 2
+
+
+class Writes:
+    """One stream's write plan: which committed rows go to its files,
+    and when. The caller's lock covers every call; `now` is
+    time.monotonic()."""
+
+    def __init__(self, row_group_rows, row_group_seconds, checkpoint_seconds):
+        self._w = ffi.gc(lib.sp_writes_new(), lib.sp_writes_free)
+        if self._w == ffi.NULL:
+            raise MemoryError("write plan")
+        self._out = ffi.new("SpWrite *")
+        self._begins = ffi.new("int *")
+        self.set_options(row_group_rows, row_group_seconds, checkpoint_seconds)
+
+    def set_options(self, row_group_rows, row_group_seconds, checkpoint_seconds):
+        """The cadences from now on; None seconds = none."""
+        err = _err()
+        opt = lambda v: ffi.NULL if v is None else ffi.new("double *", v)
+        if lib.sp_writes_set_options(self._w, row_group_rows,
+                                     opt(row_group_seconds),
+                                     opt(checkpoint_seconds),
+                                     err, _ERRLEN) != 0:
+            raise ValueError(ffi.string(err).decode(errors="replace"))
+
+    def start(self, committed):
+        lib.sp_writes_start(self._w, committed)
+
+    def stop(self):
+        lib.sp_writes_stop(self._w)
+
+    def due(self, committed, now):
+        return lib.sp_writes_due(self._w, committed, now)
+
+    def commit(self, committed, now):
+        """(the kind of write due, True when the pending rows begin now)"""
+        kind = lib.sp_writes_commit(self._w, committed, now, self._begins)
+        return kind, bool(self._begins[0])
+
+    def plan(self, force_row_group, lo, hi, now):
+        """(kind, lo, hi, lost) for a pin that holds [lo, hi)."""
+        o = self._out
+        lib.sp_writes_plan(self._w, int(force_row_group), lo, hi, now, o)
+        return o.kind, o.lo, o.hi, o.lost
+
+    @property
+    def on(self):
+        return bool(lib.sp_writes_on(self._w))
+
+    @property
+    def cursor(self):
+        return lib.sp_writes_cursor(self._w)
+
+    @property
+    def planned(self):
+        return lib.sp_writes_planned(self._w)
+
+    @property
+    def lost(self):
+        return lib.sp_writes_lost(self._w)

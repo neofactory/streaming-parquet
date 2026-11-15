@@ -33,7 +33,7 @@ from ._diag import _diag, console_print
 from ._options import MemoryOptions, ParquetOptions, ArchiveState, MirrorState, MemoryState
 from ._stream_data import _StreamData
 from ._worker_pool import get_pool
-from . import _tickets
+from . import _core, _tickets
 
 import socket
 
@@ -121,13 +121,11 @@ class Stream:
 
         a = parquet or ParquetOptions()
         self._parquet = writer              # None: no file was ever started
-        self._recording = writer is not None
         # The archive's standing: the first copy's last failure, and rows
         # the archive never got (recycled before their flush). A failing
         # first copy means rows are not durable anywhere but the ring.
         self._archive_failing = False
         self._archive_error = None
-        self._archive_lost_rows = 0
         # The S3 mirror: every ship_seconds, while a file is live or
         # pending, one mirror pass goes to the ship lane.
         self._remote = writer._remote if writer is not None else None
@@ -137,20 +135,23 @@ class Stream:
         self._ship_failing = False      # for transition logging
         self._ship_error = None         # the last failure's text
 
-        # The archive cursor (seq space). Flight readers keep their own:
-        # they pull (see _flight_server).
-        self._pq_cursor = 0
-        self._pq_durable = 0            # rows covered by the last flush
-                                        # or tail checkpoint
-        self._pq_open_mono = None       # when the pending region started
+        # The write plan: which committed rows go to the files, and
+        # when. Its rules and state are the stream core's (core/sp.h,
+        # THE WRITE PLAN); this class pins the rows and does the writes.
+        # Tail-checkpoint cadence: between row groups, the pending rows
+        # ride the checkpoint as a provisional row group. Crash loss =
+        # checkpoint_seconds, independent of the row-group cadence.
+        # None = durability per row group only. self._lock covers it.
         self._row_group_rows = row_group_rows
         self._row_group_seconds = a.row_group_seconds
-        # Tail-checkpoint cadence: between row-group flushes, the
-        # pending region rides the checkpoint as a provisional row
-        # group. Crash loss = checkpoint_seconds, independent of the
-        # row-group cadence. None = durability per flush only.
         self._checkpoint_seconds = a.checkpoint_seconds
-        self._ckpt_mono = None          # last durability point
+        self._plan = _core.Writes(row_group_rows, a.row_group_seconds,
+                                  a.checkpoint_seconds)
+        if writer is not None:
+            self._plan.start(0)
+        # the time the pending rows began, for a writer not built yet
+        # to name its first file by
+        self._next_open = None
 
         self._set_beat()
 
@@ -217,6 +218,19 @@ class Stream:
             self._beat_seconds = self._ship_seconds
         self._stale_after = parquet_checkpoint.dead_after(self._beat_seconds)
 
+    @property
+    def _recording(self):
+        return self._plan.on
+
+    @property
+    def _pq_cursor(self):
+        """The first row not yet planned as a row group."""
+        return self._plan.cursor
+
+    @property
+    def _archive_lost_rows(self):
+        return self._plan.lost
+
     def _set_parquet_options(self, options):
         """The stream's parquet options from the next file on. The pool's
         parquet lane calls it, between two files. The ring was sized at
@@ -228,7 +242,9 @@ class Stream:
             self._row_group_seconds = options.row_group_seconds
             self._checkpoint_seconds = options.checkpoint_seconds
             self._ship_seconds = options.ship_seconds
-            self._ckpt_mono = None
+            self._plan.set_options(self._row_group_rows,
+                                   self._row_group_seconds,
+                                   self._checkpoint_seconds)
             self._set_beat()
         self._parquet.set_compression(**(options.compression or {}))
         if self._parquet.catalog is not None:
@@ -480,18 +496,18 @@ class Stream:
         if self._flight_server is not None:
             self._flight_server.notify(self.name)
         with self._lock:
-            archive = (self._recording and committed > self._pq_cursor
-                       and (self._pq_due(committed)
-                            or self._tail_due(committed)))
-            if self._parquet is not None and self._recording \
-                    and committed > self._pq_cursor and self._pq_open_mono is None:
-                # The pending region begins: this commit's row is the
+            kind, begins = self._plan.commit(committed, time.monotonic())
+            archive = kind != _core.NOTHING
+            if begins:
+                # The pending rows begin: this commit's row is the
                 # first row of the next file, and the file is named by
                 # this moment. For a continuous stream that is within a
                 # frame of the cut; for one whose archive follows the data
                 # (a probe's voltages) it is the session's first sample.
-                self._pq_open_mono = time.monotonic()
-                self._parquet.set_next_open(_now())
+                self._next_open = _now()
+                if self._parquet is not None:
+                    self._parquet.set_next_open(self._next_open)
+                    self._next_open = None
             ship = self._ship_due()
             if ship:
                 self._ship_queued = True
@@ -502,17 +518,13 @@ class Stream:
             self._pool.submit("ship", self.name, self._do_ship)
 
     def _submit_archive(self, committed):
-        """Pin the pending region, slice it, submit the write or the
-        tail checkpoint. Under the lock: the cursors move here."""
+        """Pin the pending rows and submit the write the plan names:
+        a row group or a tail checkpoint. Under the lock: the plan
+        moves here."""
         rel = self._data.pin(self._pq_cursor, committed)
         table = rel.detach()
         with self._lock:
-            if not self._recording or committed <= self._pq_cursor:
-                return
-            if self._pq_due(committed):
-                self._flush_parquet_region(rel, table, committed)
-            elif self._tail_due(committed):
-                self._checkpoint_tail(rel, table, committed)
+            self._write_planned(rel, table, committed, force=False)
 
     # --- the archive's standing ---------------------------------------------
 
@@ -590,41 +602,36 @@ class Stream:
     def _rows_unarchived(self):
         """Committed rows not yet on disk: everything past the last
         durability point. On a stream that never archives, everything."""
-        return max(0, self._ring.newest_seq + 1 - self._pq_durable)
+        return max(0, self._ring.newest_seq + 1 - self._plan.planned)
 
     def memory_state(self):
         return self._face.memory_state()
 
     # --- the parquet region ---------------------------------------------------
 
-    def _pq_due(self, committed):
-        if not self._recording:
-            return False
-        pending = committed - self._pq_cursor
-        if pending <= 0:
-            return False
-        if pending >= self._row_group_rows:
-            return True
-        return (self._row_group_seconds is not None
-                and self._pq_open_mono is not None
-                and time.monotonic() - self._pq_open_mono
-                >= self._row_group_seconds)
-
-    def _flush_parquet_region(self, rel, table, committed):
-        """Submit the pending region [pq_cursor, committed) as one row
-        group. `table` is the detached table covering [rel.lo, rel.hi).
-        Caller holds the lock."""
-        if rel.lo > self._pq_cursor:
+    def _write_planned(self, rel, table, committed, force):
+        """Ask the plan for the write over the pinned rows [rel.lo,
+        committed) and submit it. `table` is the detached table of the
+        pin. force: a row group whatever is due (a cut, a start's mark,
+        a stop). Caller holds the lock."""
+        before = self._plan.cursor
+        kind, lo, hi, lost = self._plan.plan(force, rel.lo, committed,
+                                             time.monotonic())
+        if lost:
             _diag.error(
-                f"[{self.name}] ARCHIVE LOSS: rows [{self._pq_cursor}, "
-                f"{rel.lo}) recycled before parquet flush")
-            self._archive_lost_rows += rel.lo - self._pq_cursor
-            self._pq_cursor = rel.lo
-        region = table.slice(self._pq_cursor - rel.lo,
-                             committed - self._pq_cursor)
-        if region.num_rows == 0:
+                f"[{self.name}] ARCHIVE LOSS: rows [{before}, "
+                f"{before + lost}) recycled before parquet flush")
+        if kind == _core.NOTHING:
             return
-        def do_write(t=region, fs=self._pq_cursor):
+        region = table.slice(lo - rel.lo, hi - lo)
+        if kind == _core.ROW_GROUP:
+            self._submit_row_group(region, lo)
+        else:
+            self._submit_tail(region, lo)
+
+    def _submit_row_group(self, region, first_seq):
+        """The rows as one final row group, on the parquet lane."""
+        def do_write(t=region, fs=first_seq):
             # read when it runs: a first start_parquet builds the writer
             # on this lane, ahead of this task
             parquet = self._parquet
@@ -650,42 +657,12 @@ class Stream:
             if self._remote is None:    # the first copy is the store
                 self._write_ticket()
         self._pool.submit("parquet", self.name, do_write)
-        self._pq_cursor = committed
-        self._pq_durable = committed
-        self._pq_open_mono = None
-        self._ckpt_mono = time.monotonic()  # write_table implies checkpoint
 
-    def _tail_due(self, committed):
-        """A tail checkpoint is due: the cadence elapsed AND committed
-        rows are past the durable mark. Every committed row already in
-        the last checkpoint means nothing to claim, so an idle stream
-        costs no encode and no upload; the rows before an idle spell
-        still get their claim once, on the first check past the
-        cadence, with or without new rows."""
-        return (self._recording and committed > self._pq_durable
-                and self._ckpt_due())
-
-    def _ckpt_due(self):
-        if self._checkpoint_seconds is None:
-            return False
-        base = self._ckpt_mono if self._ckpt_mono is not None \
-            else self._pq_open_mono
-        return (base is not None
-                and time.monotonic() - base >= self._checkpoint_seconds)
-
-    def _checkpoint_tail(self, rel, table, committed):
-        """Durability point between row-group flushes: submit the
-        pending region [pq_cursor, committed) as a provisional tail.
-        The cursor does NOT advance -- the next flush writes the same
-        rows as a final row group, superseding the tail. Caller holds
-        the lock."""
-        if rel.lo > self._pq_cursor:
-            return                      # loss already handled at flush
-        region = table.slice(self._pq_cursor - rel.lo,
-                             committed - self._pq_cursor)
-        if region.num_rows == 0:
-            return
-        def do_ckpt(t=region, fs=self._pq_cursor):
+    def _submit_tail(self, region, first_seq):
+        """Durability point between row groups: the pending rows as a
+        provisional tail. The next row group writes the same rows as a
+        final row group, superseding the tail."""
+        def do_ckpt(t=region, fs=first_seq):
             parquet = self._parquet
             if parquet is None:
                 return
@@ -698,8 +675,6 @@ class Stream:
             if self._remote is None:    # the first copy is the store
                 self._write_ticket()
         self._pool.submit("parquet", self.name, do_ckpt)
-        self._pq_durable = committed
-        self._ckpt_mono = time.monotonic()
 
     # --- the archive's boundaries -----------------------------------------------
 
@@ -718,8 +693,7 @@ class Stream:
         rel = self._data.pin(self._pq_cursor, committed)
         table = rel.detach()
         with self._lock:
-            if committed > self._pq_cursor:
-                self._flush_parquet_region(rel, table, committed)
+            self._write_planned(rel, table, committed, force=True)
         self._pool.submit("parquet", self.name, self._do_cut, label)
 
     def start_parquet(self, label=None, options=None):
@@ -760,13 +734,9 @@ class Stream:
         with self._lock:
             if self._recording and rel is not None:
                 # the open file ends at the mark: what cut does
-                if committed > self._pq_cursor:
-                    self._flush_parquet_region(rel, table, committed)
+                self._write_planned(rel, table, committed, force=True)
             else:
-                self._pq_cursor = self._ring.newest_seq + 1
-                self._pq_durable = self._pq_cursor
-                self._pq_open_mono = None
-                self._recording = True
+                self._plan.start(self._ring.newest_seq + 1)
             self._pool.submit("parquet", self.name, self._do_start_parquet,
                               label, options)
 
@@ -774,19 +744,16 @@ class Stream:
         """End the open file, with every row committed up to now in it.
         Rows still flow to readers and to memory. The stream keeps its
         options for the next start_parquet."""
-        with self._lock:
-            recording = self._recording
-            self._recording = False
-        if not recording:
+        if not self._recording:
             return
         committed = self._ring.newest_seq + 1
         rel = self._data.pin(self._pq_cursor, committed)
         table = rel.detach()
         with self._lock:
-            if committed > self._pq_cursor:
-                self._recording = True   # the flush needs it on
-                self._flush_parquet_region(rel, table, committed)
-                self._recording = False
+            if not self._recording:     # another thread's stop came first
+                return
+            self._write_planned(rel, table, committed, force=True)
+            self._plan.stop()
             self._pool.submit("parquet", self.name, self._do_stop_parquet)
 
     # --- reading: a Stream reads the same way an Attached does -------------
@@ -965,6 +932,11 @@ class Stream:
                 with self._lock:
                     self._parquet = writer
                     self._remote = writer._remote
+                    if self._next_open is not None:
+                        # rows committed before the writer was built
+                        # begin its first file
+                        writer.set_next_open(self._next_open)
+                        self._next_open = None
             else:
                 self._parquet.rotate()
             self._set_parquet_options(options)
@@ -974,7 +946,7 @@ class Stream:
         except Exception as e:
             self._archive_fail(f"start_parquet failed: {e}")
             with self._lock:
-                self._recording = False
+                self._plan.stop()
             return
         self._write_ticket()            # the beat may have changed
 
