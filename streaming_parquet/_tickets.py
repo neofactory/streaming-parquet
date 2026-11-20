@@ -182,11 +182,19 @@ def list_streams(store):
     return sorted(_store_for(store).list())
 
 
+def has_folder(store, folder):
+    """True when the store holds anything in the folder: a ticket under
+    tickets/<folder>/ or a file under streams/<folder>/. What a reader
+    asks before it waits for a name in that folder (_core.Reader)."""
+    return _store_for(store).has_folder(folder)
+
+
 class _SinkStore:
     """Tickets as objects in a parquet_checkpoint sink (tests: FakeS3)."""
 
     def __init__(self, sink):
         self._sink = sink.sub("tickets")
+        self._streams = sink.sub("streams")
 
     def put(self, name, ticket):
         self._sink.put(name + ".json", _text(ticket))
@@ -206,6 +214,10 @@ class _SinkStore:
     def list(self):
         return [n[:-len(".json")] for n in self._sink.list("") if n.endswith(".json")]
 
+    def has_folder(self, folder):
+        return bool(self._sink.list(folder + "/")
+                    or self._streams.list(folder + "/"))
+
 
 # ---- backends ---------------------------------------------------------
 
@@ -215,6 +227,7 @@ class _FileStore:
 
     def __init__(self, base):
         self._base = os.path.join(base, "tickets")
+        self._streams = os.path.join(base, "streams")
 
     def _path(self, name):
         return os.path.join(self._base, name + ".json")
@@ -239,6 +252,10 @@ class _FileStore:
             os.remove(self._path(name))
         except FileNotFoundError:
             pass
+
+    def has_folder(self, folder):
+        return (os.path.isdir(os.path.join(self._base, folder))
+                or os.path.isdir(os.path.join(self._streams, folder)))
 
     def list(self):
         names = []
@@ -293,6 +310,17 @@ class _S3Store:
         key = self._key(name)
         self._timed("delete", key, lambda: self._s3.delete_object(
             Bucket=self._bucket, Key=key))
+
+    def has_folder(self, folder):
+        # one key is enough: at most two small list requests
+        base = self._prefix[:-len("tickets/")]
+        for prefix in (self._prefix + folder + "/",
+                       base + "streams/" + folder + "/"):
+            got = self._timed("list", prefix, lambda: self._s3.list_objects_v2(
+                Bucket=self._bucket, Prefix=prefix, MaxKeys=1))
+            if got.get("KeyCount", 0):
+                return True
+        return False
 
     def list(self):
         return [key[len(self._prefix):-len(".json")]

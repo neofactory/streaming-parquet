@@ -363,11 +363,27 @@ def connect(name=None, store=None, memory=None, columns=None, ticket=None):
         resolved_name = name
         feeder_store = store if store is not None else _tickets.resolve_store()
 
+    def local(name=resolved_name, store=store):
+        """(the stream of this name in this process or None, True when
+        this process has a stream in the name's folder): what a waiting
+        reader looks at before the store, at every poll."""
+        folder = name.rpartition("/")[0] + "/"
+        with _lock:
+            s = _streams.get(name)
+            in_folder = any(n.startswith(folder) for n in _streams)
+        if s is not None and (s._closed or columns is not None
+                              or not (store is None or store == s._store)):
+            s = None
+        return s, in_folder
+
     memory = memory or MemoryOptions()
     feeder = _Feeder(resolved_name, ticket=ticket, store=feeder_store,
                      capacity=(memory.lookback if memory.lookback is not None
                                else 2 * DEFAULT_ROW_GROUP_ROWS),
-                     columns=columns, segment_bytes=memory.segment_bytes)
+                     columns=columns, segment_bytes=memory.segment_bytes,
+                     local=local if ticket is None else None,
+                     who=(f"connect({name!r})" if ticket is None
+                          else f"connect(ticket={resolved_name!r})"))
     a = Attached(data=None, feeder=feeder, on_close=_forget_attached)
     if feeder_store is not None:
         from ._views import TicketSource

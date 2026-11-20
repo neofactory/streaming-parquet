@@ -1267,3 +1267,307 @@ int sp_store_fill(const SpStore *s, SpTicket *t, const char *where,
     free(order);
     return rc;
 }
+
+/* ---- the reader --------------------------------------------------------- */
+
+#define READER_TEXT 640
+#define READER_MESSAGES 4
+#define BACKOFF_FIRST 0.5
+#define BACKOFF_MOST 10.0
+
+struct SpReader {
+    char *who, *name, *store, *folder;
+    int direct;
+    int state;
+    int folder_known;         /* the folder exists, or the reader waited */
+    int asked_folder;         /* SP_DO_LIST is out */
+    int has_ring;             /* a ring of rows of `run` is in hand */
+    int local;                /* reading a local stream */
+    char *run;
+    double backoff;
+    int waiting;              /* a wait for a writer is on */
+    int warned;
+    double waiting_since;
+    int unreadable;           /* the store's error is logged */
+    char reason[READER_TEXT];
+    int n_messages;
+    struct { int level; char text[READER_TEXT]; } messages[READER_MESSAGES];
+};
+
+static const char *const READER_STATE[] = {
+    "no-ticket", "root-unreachable", "waiting", "connecting", "streaming",
+    "reconnecting", "closed",
+};
+
+const char *sp_reader_state_name(int state) {
+    if (state < 0 || state > SP_R_CLOSED) return NULL;
+    return READER_STATE[state];
+}
+
+static void reader_say(SpReader *r, int level, const char *fmt, ...) {
+    if (r->n_messages == READER_MESSAGES) {       /* keep the newest */
+        memmove(&r->messages[0], &r->messages[1],
+                (READER_MESSAGES - 1) * sizeof r->messages[0]);
+        r->n_messages--;
+    }
+    r->messages[r->n_messages].level = level;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(r->messages[r->n_messages].text, READER_TEXT, fmt, ap);
+    va_end(ap);
+    r->n_messages++;
+}
+
+static void reader_reason(SpReader *r, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(r->reason, sizeof r->reason, fmt, ap);
+    va_end(ap);
+}
+
+static const char *reader_store(const SpReader *r) {
+    return r->store ? r->store : "(a direct ticket)";
+}
+
+SpReader *sp_reader_new(const char *who, const char *name, const char *store,
+                        int direct) {
+    if (!name) return NULL;
+    SpReader *r = calloc(1, sizeof(SpReader));
+    if (!r) return NULL;
+    if (!who) who = "connect";
+    r->who = copy_text(who, strlen(who));
+    r->name = copy_text(name, strlen(name));
+    r->store = store ? copy_text(store, strlen(store)) : NULL;
+    const char *slash = strrchr(name, '/');
+    r->folder = copy_text(name, slash ? (size_t)(slash - name) : 0);
+    if (!r->who || !r->name || !r->folder || (store && !r->store)) {
+        sp_reader_free(r);
+        return NULL;
+    }
+    r->direct = direct ? 1 : 0;
+    r->state = direct ? SP_R_CONNECTING : SP_R_NO_TICKET;
+    r->backoff = BACKOFF_FIRST;
+    /* a name with no folder is in the store itself, which exists */
+    r->folder_known = (r->folder[0] == 0) || r->direct;
+    return r;
+}
+
+void sp_reader_free(SpReader *r) {
+    if (!r) return;
+    free(r->who);
+    free(r->name);
+    free(r->store);
+    free(r->folder);
+    free(r->run);
+    free(r);
+}
+
+const char *sp_reader_folder(const SpReader *r) { return r ? r->folder : ""; }
+int sp_reader_state(const SpReader *r) { return r ? r->state : SP_R_CLOSED; }
+const char *sp_reader_reason(const SpReader *r) {
+    return (r && r->state != SP_R_STREAMING) ? r->reason : "";
+}
+const char *sp_reader_run(const SpReader *r) { return r ? r->run : NULL; }
+
+int sp_reader_message(SpReader *r, char *msg, size_t msglen) {
+    if (msg && msglen) msg[0] = 0;
+    if (!r || r->n_messages == 0) return 0;
+    int level = r->messages[0].level;
+    fail(msg, msglen, "%s", r->messages[0].text);
+    r->n_messages--;
+    memmove(&r->messages[0], &r->messages[1],
+            (size_t)r->n_messages * sizeof r->messages[0]);
+    return level;
+}
+
+static void step_set(SpReader *r, SpStep *step, int action, int state,
+                     double wait) {
+    r->state = state;
+    if (!step) return;
+    step->action = action;
+    step->state = state;
+    step->wait_seconds = wait;
+}
+
+/* A step of a wait for a writer: the line at its start, the warning
+ * when it has lasted. `quiet`: the start has its own line already. */
+static void reader_wait(SpReader *r, SpStep *step, int state, double mono,
+                        int quiet) {
+    r->folder_known = 1;
+    if (!r->waiting) {
+        r->waiting = 1;
+        r->warned = 0;
+        r->waiting_since = mono;
+        if (!quiet)
+            reader_say(r, SP_LOG_INFO, "[%s] %s: waiting for a writer",
+                       r->name, r->reason);
+    } else if (!r->warned
+               && mono - r->waiting_since >= SP_READER_WARN_SECONDS) {
+        r->warned = 1;
+        reader_say(r, SP_LOG_WARNING,
+                   "[%s] %s has waited %.0f s for a writer: %s. A reader "
+                   "waits for any name whose folder exists; if no writer "
+                   "is to come, check the name.",
+                   r->name, r->who, mono - r->waiting_since, r->reason);
+    }
+    step_set(r, step, SP_DO_WAIT, state, SP_READER_POLL_SECONDS);
+}
+
+static void reader_drop_ring(SpReader *r, SpStep *step) {
+    if (r->has_ring && step) step->fresh_ring = 1;
+    r->has_ring = 0;
+}
+
+void sp_reader_poll(SpReader *r, int found, const SpTicket *ticket,
+                    const char *why, double now, double mono,
+                    double if_absent, SpStep *step) {
+    if (step) memset(step, 0, sizeof *step);
+    if (!r) return;
+    if (r->state == SP_R_CLOSED) {
+        step_set(r, step, SP_DO_WAIT, SP_R_CLOSED, 0);
+        return;
+    }
+    if (found == SP_FOUND_TICKET && !ticket) found = SP_FOUND_NONE;
+
+    if (found == SP_FOUND_UNREADABLE) {
+        reader_reason(r, "store %s unreadable: %s", reader_store(r),
+                      why ? why : "?");
+        if (!r->unreadable) {
+            r->unreadable = 1;
+            reader_say(r, SP_LOG_ERROR, "[%s] STORE UNREADABLE: %s: %s",
+                       r->name, reader_store(r), why ? why : "?");
+        }
+        r->asked_folder = 0;
+        int known = r->folder_known;      /* the store said nothing */
+        reader_wait(r, step, SP_R_ROOT_UNREACHABLE, mono, 1);
+        r->folder_known = known;
+        return;
+    }
+    if (r->unreadable) {
+        r->unreadable = 0;
+        reader_say(r, SP_LOG_INFO, "[%s] store readable again: %s",
+                   r->name, reader_store(r));
+    }
+
+    if (found == SP_FOUND_LOCAL) {
+        reader_drop_ring(r, step);
+        free(r->run);
+        r->run = NULL;
+        r->local = 1;
+        r->waiting = 0;
+        r->folder_known = 1;
+        r->backoff = BACKOFF_FIRST;
+        r->reason[0] = 0;
+        step_set(r, step, SP_DO_LOCAL, SP_R_STREAMING, 0);
+        return;
+    }
+    r->local = 0;
+
+    if (found == SP_FOUND_NONE) {
+        reader_reason(r, "no ticket for %s under %s: no writer is up",
+                      r->name, reader_store(r));
+        if (!r->folder_known) {
+            r->asked_folder = 1;
+            step_set(r, step, SP_DO_LIST, SP_R_NO_TICKET, 0);
+            return;
+        }
+        reader_wait(r, step, SP_R_NO_TICKET, mono, 0);
+        return;
+    }
+
+    /* a ticket */
+    const char *host = sp_ticket_text(ticket, SP_T_HOST);
+    char port[32] = "?";
+    int64_t p;
+    if (sp_ticket_integer(ticket, SP_T_PORT, &p))
+        snprintf(port, sizeof port, "%lld", (long long)p);
+    double ts;
+    if (!r->direct && sp_ticket_number(ticket, SP_T_TS, &ts)
+            && sp_ticket_is_stale(ticket, now, if_absent)) {
+        reader_reason(r, "ticket stale: the writer at %s:%s last wrote it "
+                      "%.0f s ago (stale after %.0f s)",
+                      host ? host : "?", port, now - ts,
+                      sp_ticket_stale_after(ticket, if_absent));
+        reader_wait(r, step, SP_R_WAITING, mono, 0);
+        return;
+    }
+
+    const char *run = sp_ticket_text(ticket, SP_T_RUN);
+    if (r->has_ring && r->run && (!run || strcmp(run, r->run) != 0)) {
+        reader_say(r, SP_LOG_ERROR,
+                   "[%s] WRITER RESTARTED: the ticket at %s:%s names run %s, "
+                   "this reader streamed run %s; starting again on a fresh "
+                   "ring. Rows of the earlier run are dropped here (the "
+                   "files keep them); make any view over this reader again.",
+                   r->name, host ? host : "?", port, run ? run : "?", r->run);
+        reader_drop_ring(r, step);
+    }
+    char *mine = run ? copy_text(run, strlen(run)) : NULL;
+    free(r->run);
+    r->run = mine;
+    r->waiting = 0;
+    r->folder_known = 1;
+    reader_reason(r, "connecting to %s:%s", host ? host : "?", port);
+    step_set(r, step, SP_DO_CONNECT, SP_R_CONNECTING, 0);
+}
+
+void sp_reader_folder_is(SpReader *r, int exists, double mono, SpStep *step) {
+    if (step) memset(step, 0, sizeof *step);
+    if (!r) return;
+    if (r->state == SP_R_CLOSED) {
+        step_set(r, step, SP_DO_WAIT, SP_R_CLOSED, 0);
+        return;
+    }
+    r->asked_folder = 0;
+    if (!exists && !r->folder_known) {
+        reader_reason(r,
+            "%s: no stream %s is under %s, and nothing is in the folder %s "
+            "there: no ticket, no file, and no stream of this process. A "
+            "reader waits for a writer only when the folder above the name "
+            "exists; check the path.",
+            r->who, r->name, reader_store(r), r->folder);
+        step_set(r, step, SP_DO_FAIL, SP_R_CLOSED, 0);
+        return;
+    }
+    reader_wait(r, step, SP_R_NO_TICKET, mono, 0);
+}
+
+void sp_reader_connected(SpReader *r) {
+    if (!r || r->state == SP_R_CLOSED) return;
+    r->state = SP_R_STREAMING;
+    r->has_ring = 1;
+    r->waiting = 0;
+    r->backoff = BACKOFF_FIRST;
+    r->reason[0] = 0;
+}
+
+void sp_reader_lost(SpReader *r, const char *why, double mono, SpStep *step) {
+    (void)mono;
+    if (step) memset(step, 0, sizeof *step);
+    if (!r) return;
+    if (r->state == SP_R_CLOSED) {
+        step_set(r, step, SP_DO_WAIT, SP_R_CLOSED, 0);
+        return;
+    }
+    if (r->local) {
+        r->local = 0;
+        reader_reason(r, "the stream %s of this process closed", r->name);
+        if (step) step->fresh_ring = 1;       /* the ring was the writer's */
+        step_set(r, step, SP_DO_WAIT, SP_R_RECONNECTING, 0);
+        return;
+    }
+    if (why) {
+        reader_reason(r, "the connection for %s failed: %s", r->name, why);
+        reader_say(r, SP_LOG_ERROR, "[%s] READER CONNECTION: %s", r->name,
+                   why);
+    } else {
+        reader_reason(r, "the connection for %s ended", r->name);
+    }
+    double wait = r->backoff;
+    r->backoff = wait * 2 > BACKOFF_MOST ? BACKOFF_MOST : wait * 2;
+    step_set(r, step, SP_DO_WAIT, SP_R_RECONNECTING, wait);
+}
+
+void sp_reader_close(SpReader *r) {
+    if (r) r->state = SP_R_CLOSED;
+}

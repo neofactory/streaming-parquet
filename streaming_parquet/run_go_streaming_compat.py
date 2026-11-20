@@ -84,6 +84,13 @@ def _():
         [BIN, 'serve', ROOT, 'x/gopub', '3000', '4'],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
+        # The store is new: nothing is in the folder x until this
+        # writer's ticket is. A reader of a name in a folder that does
+        # not exist is refused (core/sp.h: THE READER), so wait for it.
+        deadline = time.monotonic() + 20
+        while 'x/gopub' not in sp.list_streams(ROOT):
+            assert time.monotonic() < deadline, "no ticket from the Go writer"
+            time.sleep(0.05)
         a = sp.connect('x/gopub', store=ROOT)
         deadline = time.time() + 20
         while time.time() < deadline:

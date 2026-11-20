@@ -414,6 +414,145 @@ int sp_store_fill(const SpStore *s, SpTicket *t, const char *where,
  * with checkpoints to delete): what a long run must not let grow. */
 int32_t sp_store_files(const SpStore *s);
 
+/* THE READER
+ *
+ * A reader of a stream by name: where it finds the writer, when it
+ * waits, when it starts again. One SpReader per reader holds the state;
+ * the host runs the thread, reads the store, makes the connection, and
+ * tells the reader what each of those found. The reader answers with
+ * the next step. It does no I/O and has no clock: `now` is the host's
+ * wall clock (the ticket's ts is on it), `mono` its monotonic clock,
+ * both in seconds.
+ *
+ * Where a reader looks, at every poll, in this order:
+ *
+ *   the process's own streams   a stream of that name in this process
+ *                               is read in place: no connection
+ *   the store                   the stream's ticket names the writer
+ *
+ * What a poll finds, and the step:
+ *
+ *   a local stream     read it (SP_DO_LOCAL)
+ *   a ticket           not stale: connect to its writer (SP_DO_CONNECT).
+ *                      Stale: the writer died; wait. A ticket with no
+ *                      ts is not stale, and a ticket the user gave the
+ *                      reader directly is never stale: nothing writes
+ *                      it again.
+ *   no ticket          wait for a writer -- when the folder above the
+ *                      name exists. At the first poll of a name with a
+ *                      folder ("a/b/c": the folder is "a/b") the host
+ *                      is asked to look (SP_DO_LIST): does the store
+ *                      hold anything under tickets/<folder>/ or
+ *                      streams/<folder>/, or has this process a stream
+ *                      in the folder? If not, the path is wrong and the
+ *                      host's connect call fails (SP_DO_FAIL) with the
+ *                      reader's reason. A wrong last part of a name
+ *                      still waits: the folder is there. A reader that
+ *                      has waited once is not asked again.
+ *   an unreadable store  wait; the reader cannot tell
+ *
+ * A ticket with another run than the one this reader last connected to:
+ * the writer started again, and its row numbers start again at 0. The
+ * step says fresh_ring: the host drops the ring it has and makes a new
+ * one, so rows of two runs never share a ring.
+ *
+ * A lost connection, or a connection that could not be made: wait
+ * 0.5 s, then twice as long each time up to 10 s, and poll again. A
+ * connection that was made sets the wait back to 0.5 s.
+ *
+ * What a reader says (sp_reader_message, for the host's log): one line
+ * when a wait for a writer starts, one warning when the wait has lasted
+ * SP_READER_WARN_SECONDS, an error when the store cannot be read and a
+ * line when it can again, an error for each failed connection, and an
+ * error when the writer started again.
+ */
+typedef struct SpReader SpReader;
+
+#define SP_READER_POLL_SECONDS 1.0
+#define SP_READER_WARN_SECONDS 30.0
+
+typedef enum {
+    SP_R_NO_TICKET = 0,       /* "no-ticket" */
+    SP_R_ROOT_UNREACHABLE,    /* "root-unreachable": the store cannot be read */
+    SP_R_WAITING,             /* "waiting": a stale ticket */
+    SP_R_CONNECTING,          /* "connecting" */
+    SP_R_STREAMING,           /* "streaming" */
+    SP_R_RECONNECTING,        /* "reconnecting" */
+    SP_R_CLOSED               /* "closed" */
+} SpReaderState;
+
+/* What a poll found. */
+typedef enum {
+    SP_FOUND_NONE = 0,        /* the store was read; it has no ticket */
+    SP_FOUND_TICKET,
+    SP_FOUND_LOCAL,           /* a stream of this process */
+    SP_FOUND_UNREADABLE       /* the store could not be read */
+} SpFound;
+
+typedef enum {
+    SP_DO_WAIT = 0,           /* wait wait_seconds, then poll again */
+    SP_DO_CONNECT,            /* connect to the ticket's writer */
+    SP_DO_LOCAL,              /* read the local stream */
+    SP_DO_LIST,               /* look for the folder; sp_reader_folder_is */
+    SP_DO_FAIL                /* the connect call fails: sp_reader_reason */
+} SpDo;
+
+typedef enum {
+    SP_LOG_INFO = 1, SP_LOG_WARNING = 2, SP_LOG_ERROR = 3
+} SpLog;
+
+typedef struct {
+    int action;               /* SpDo */
+    int state;                /* SpReaderState, after this step */
+    int fresh_ring;           /* drop the ring in hand first */
+    double wait_seconds;      /* for SP_DO_WAIT */
+} SpStep;
+
+/* who: the host's own call, as its user wrote it (connect('a/b')).
+ * store: where the reader looks, for the messages; NULL for a reader
+ * with a direct ticket. NULL when memory is out or name is NULL. */
+SpReader *sp_reader_new(const char *who, const char *name, const char *store,
+                        int direct);
+void sp_reader_free(SpReader *r);
+
+/* The folder above the name: "a/b" for "a/b/c", "" for a name with no
+ * folder. */
+const char *sp_reader_folder(const SpReader *r);
+
+/* What a poll found. ticket: for SP_FOUND_TICKET. why: the host's error
+ * for SP_FOUND_UNREADABLE. if_absent: as sp_ticket_is_stale. */
+void sp_reader_poll(SpReader *r, int found, const SpTicket *ticket,
+                    const char *why, double now, double mono,
+                    double if_absent, SpStep *step);
+
+/* The answer to SP_DO_LIST: 1 when the folder exists (in the store or
+ * among this process's streams), 0 when not. A host that could not
+ * list polls with SP_FOUND_UNREADABLE instead. */
+void sp_reader_folder_is(SpReader *r, int exists, double mono, SpStep *step);
+
+/* The connection was made and rows flow. */
+void sp_reader_connected(SpReader *r);
+
+/* The connection was lost or could not be made (why: the host's error),
+ * or the local stream closed (why: NULL). The step is a wait. */
+void sp_reader_lost(SpReader *r, const char *why, double mono, SpStep *step);
+
+void sp_reader_close(SpReader *r);
+
+int sp_reader_state(const SpReader *r);
+const char *sp_reader_state_name(int state);
+
+/* Why the reader is not streaming, in words; "" while it is. */
+const char *sp_reader_reason(const SpReader *r);
+
+/* The run the reader last connected to; NULL for none (or a local
+ * stream). */
+const char *sp_reader_run(const SpReader *r);
+
+/* The next line for the host's log: its level (SpLog) with the text in
+ * msg, or 0 when there is none. Call until 0 after each step. */
+int sp_reader_message(SpReader *r, char *msg, size_t msglen);
+
 void sp_free(void *p);
 
 #ifdef __cplusplus

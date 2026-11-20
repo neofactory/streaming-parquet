@@ -31,6 +31,7 @@ type Attached struct {
 
 	mu      sync.Mutex
 	ring    *ring.Ring
+	ownRing bool // this reader made the ring (it is not a local stream's)
 	arch    *archiver
 	archOpt *ParquetOptions // nil: this reader writes no files
 	armed   atomic.Bool     // StartParquet requested (possibly pre-schema)
@@ -39,8 +40,16 @@ type Attached struct {
 	capacity int64
 	columns  []string
 	state    atomic.Value // string
-	closed   chan struct{}
-	done     sync.WaitGroup
+	// the rules: where the writer is, when to wait, when to start again
+	// (core.go: readerRules). The feeder goroutine makes its calls;
+	// reason is what it said last of why the reader is not streaming.
+	rules  *readerRules
+	reason atomic.Value // string
+	direct *Ticket      // the caller's ticket, or nil
+	local  *Stream      // the stream of this process read in place
+	first  readerStep   // the step of the poll Attach made
+	closed chan struct{}
+	done   sync.WaitGroup
 }
 
 type AttachOptions struct {
@@ -70,16 +79,114 @@ func (t *Telemetry) Attach(name string, o AttachOptions) (*Attached, error) {
 	}
 	a := &Attached{Name: name, capacity: ringRows, columns: o.Columns,
 		archOpt: archOpt, closed: make(chan struct{})}
+	rules, err := newReaderRules(fmt.Sprintf("Attach(%q)", name), name, t.root,
+		o.Ticket != nil)
+	if err != nil {
+		return nil, err
+	}
+	a.rules, a.direct = rules, o.Ticket
 	a.state.Store("no-ticket")
-	if o.Ticket != nil {
-		a.state.Store("connecting")
+	a.reason.Store("")
+	// The first poll is made here: a name whose folder does not exist
+	// is refused now, not waited for.
+	a.first = a.poll(t)
+	if a.first.action == doFail {
+		return nil, fmt.Errorf("%s", rules.reason())
 	}
 	a.done.Add(1)
-	go a.lifecycle(t, o.Ticket)
+	go a.lifecycle(t)
 	return a, nil
 }
 
 func (a *Attached) State() string { return a.state.Load().(string) }
+
+// Reason says why the reader is not streaming, in words; "" while it is.
+func (a *Attached) Reason() string {
+	if a.State() == "streaming" {
+		return ""
+	}
+	return a.reason.Load().(string)
+}
+
+// took notes what the core said, and logs its lines.
+func (a *Attached) took(st readerStep) readerStep {
+	a.state.Store(st.state)
+	a.reason.Store(a.rules.reason())
+	for _, line := range a.rules.messages() {
+		fmt.Fprintln(os.Stderr, line)
+	}
+	return st
+}
+
+// lookLocal: the stream of this name in this process (nil for none, and
+// for a reader that needs its own ring: one with a column subset or
+// one that writes files), and whether this process has a stream in the
+// name's folder.
+func (a *Attached) lookLocal(t *Telemetry) (*Stream, bool) {
+	if a.direct != nil {
+		return nil, false
+	}
+	folder := a.rules.folder() + "/"
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	inFolder := false
+	for n := range t.streams {
+		if strings.HasPrefix(n, folder) {
+			inFolder = true
+			break
+		}
+	}
+	s := t.streams[a.Name]
+	if s != nil && (a.columns != nil || a.archOpt != nil || s.isClosed()) {
+		s = nil
+	}
+	return s, inFolder
+}
+
+// poll looks for the stream, in this process and then in the store,
+// and takes the core's step for what was found.
+func (a *Attached) poll(t *Telemetry) readerStep {
+	local, localFolder := a.lookLocal(t)
+	if local != nil {
+		a.local = local
+		return a.took(a.rules.poll(foundLocal, nil, nil))
+	}
+	a.local = nil
+	var st readerStep
+	switch {
+	case a.direct != nil:
+		a.lastTicket.Store(a.direct)
+		st = a.rules.poll(foundTicket, a.direct, nil)
+	case t.tickets == nil:
+		a.lastTicket.Store(nil)
+		st = a.rules.poll(foundNone, nil, nil) // no store: this process alone
+	default:
+		tk, err := t.tickets.get(a.Name)
+		switch {
+		case err != nil:
+			st = a.rules.poll(foundUnreadable, nil, err)
+		case tk == nil:
+			a.lastTicket.Store(nil)
+			st = a.rules.poll(foundNone, nil, nil)
+		default:
+			a.lastTicket.Store(tk)
+			st = a.rules.poll(foundTicket, tk, nil)
+		}
+	}
+	if st.action == doList {
+		exists := localFolder
+		var err error
+		if !exists && t.tickets != nil {
+			exists, err = t.tickets.hasFolder(a.rules.folder())
+		}
+		if err != nil {
+			st = a.rules.poll(foundUnreadable, nil, err)
+		} else {
+			st = a.rules.folderIs(exists)
+		}
+	}
+	return a.took(st)
+}
 
 // Ring returns the local ring once the schema is known (nil before
 // the first connection).
@@ -137,13 +244,30 @@ func (a *Attached) StopParquet() error {
 	return nil
 }
 
-func (a *Attached) lifecycle(t *Telemetry, direct *Ticket) {
+// dropRing: the ring in hand goes (the writer started again, or the
+// local stream it belonged to closed). A ring this reader made closes,
+// so a holder fails loudly and does not read a run that is over; a
+// recording of that run is finished first.
+func (a *Attached) dropRing(own bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if own {
+		if a.arch != nil && a.arch.recording() {
+			if err := a.arch.stop(); err != nil {
+				fmt.Fprintf(os.Stderr, "[%s] a new run: finishing the "+
+					"earlier run's file failed: %v\n", a.Name, err)
+			}
+		}
+		if a.ring != nil {
+			a.ring.Close()
+		}
+	}
+	a.ring, a.arch, a.ownRing = nil, nil, false
+}
+
+func (a *Attached) lifecycle(t *Telemetry) {
 	defer a.done.Done()
-	backoff := time.Second
-	cur := direct
-	rootErrLogged := false
-	run := ""
-	haveRun := false
+	defer a.rules.close()
 	wait := func(d time.Duration) bool { // false = closed
 		select {
 		case <-time.After(d):
@@ -153,6 +277,7 @@ func (a *Attached) lifecycle(t *Telemetry, direct *Ticket) {
 			return false
 		}
 	}
+	st, have := a.first, true
 	for {
 		select {
 		case <-a.closed:
@@ -160,86 +285,45 @@ func (a *Attached) lifecycle(t *Telemetry, direct *Ticket) {
 			return
 		default:
 		}
-		// refresh the ticket from the root (direct tickets are as-is)
-		if direct == nil && t.tickets != nil {
-			tk, err := t.tickets.get(a.Name)
-			if err != nil {
-				if !rootErrLogged {
-					fmt.Fprintf(os.Stderr, "[%s] TICKET ROOT "+
-						"UNREADABLE: %s: %v\n", a.Name, t.root, err)
-					rootErrLogged = true
-				}
-				a.state.Store("root-unreachable")
+		if !have {
+			st = a.poll(t)
+		}
+		have = false
+		if st.freshRing && st.action != doLocal {
+			a.dropRing(a.ownRing)
+		}
+		switch st.action {
+		case doWait:
+			if !wait(st.wait) {
+				return
+			}
+		case doLocal:
+			// read the writer's own ring in place, until it closes
+			a.dropRing(a.ownRing)
+			local := a.local
+			a.mu.Lock()
+			a.ring = local.ring
+			a.mu.Unlock()
+			for !local.isClosed() {
 				if !wait(ticketPollInterval) {
 					return
 				}
-				continue
 			}
-			if rootErrLogged {
-				fmt.Fprintf(os.Stderr, "[%s] ticket root readable "+
-					"again: %s\n", a.Name, t.root)
-				rootErrLogged = false
-			}
-			cur = tk // nil = publisher closed/absent
-		}
-		if cur == nil {
-			a.state.Store("no-ticket")
-			if !wait(ticketPollInterval) {
+			a.dropRing(false) // the ring was the writer's
+			a.local = nil
+			st, have = a.took(a.rules.lost(nil)), true
+		case doConnect:
+			// A fresh ring (above) when the writer started again: its
+			// row numbers start again at 0, and the ring rightly refuses
+			// a row number that goes back.
+			err := a.receive(a.lastTicket.Load())
+			select {
+			case <-a.closed:
+				a.state.Store("closed")
 				return
+			default:
 			}
-			continue
-		}
-		if direct == nil && cur.Ts > 0 &&
-			cur.isStale(float64(time.Now().UnixNano())/1e9) {
-			a.state.Store("waiting")
-			if !wait(ticketPollInterval) {
-				return
-			}
-			continue
-		}
-		// A new run: the publisher respawned; its seq axis
-		// restarted. Resync on a fresh ring (the core rightly refuses
-		// the regression). The old ring closes so stale holders fail
-		// loudly rather than read a dead run.
-		if haveRun && cur.Run != run {
-			fmt.Fprintf(os.Stderr, "[%s] PUBLISHER RESTARTED: the "+
-				"ticket at %s:%d names run %s, this reader streamed "+
-				"run %s; resyncing on a fresh ring (the previous run's "+
-				"rows are discarded here; the archive keeps them)\n",
-				a.Name, cur.Host, cur.Port, cur.Run, run)
-			a.mu.Lock()
-			if a.arch != nil && a.arch.recording() {
-				if err := a.arch.stop(); err != nil {
-					fmt.Fprintf(os.Stderr, "[%s] run resync: "+
-						"finalize of the previous run's recording "+
-						"failed: %v\n", a.Name, err)
-				}
-			}
-			if a.ring != nil {
-				a.ring.Close()
-			}
-			a.ring, a.arch = nil, nil
-			a.mu.Unlock()
-		}
-		run, haveRun = cur.Run, true
-
-		a.state.Store("connecting")
-		err := a.receive(cur)
-		select {
-		case <-a.closed:
-			a.state.Store("closed")
-			return
-		default:
-		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[%s] feeder: %v\n", a.Name, err)
-		}
-		a.state.Store("reconnecting")
-		if !wait(backoff) {
-			return
-		}
-		if backoff *= 2; backoff > 10*time.Second {
-			backoff = 10 * time.Second
+			st, have = a.took(a.rules.lost(err)), true
 		}
 	}
 }
@@ -254,7 +338,6 @@ func (a *Attached) ArchiveLocation() string {
 }
 
 func (a *Attached) receive(tk *Ticket) error {
-	a.lastTicket.Store(tk)
 	addr := fmt.Sprintf("%s:%d", tk.Host, tk.Port)
 	client, err := flight.NewClientWithMiddleware(addr, nil, nil,
 		grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -305,7 +388,7 @@ func (a *Attached) receive(tk *Ticket) error {
 			a.mu.Unlock()
 			return err
 		}
-		a.ring = r
+		a.ring, a.ownRing = r, true
 		if a.archOpt != nil {
 			arch, err := newArchiver(r, a.Name, tk.Run, *a.archOpt, nil)
 			if err != nil {
@@ -328,6 +411,7 @@ func (a *Attached) receive(tk *Ticket) error {
 	// TotalRecords is the committed row count: start at the newest row.
 	name, colsCSV, hasCols := strings.Cut(ticketStr, ":")
 	from := info.TotalRecords
+	a.rules.connected()
 	a.state.Store("streaming")
 	for ctx.Err() == nil {
 		tk := fmt.Sprintf("%s@%d", name, from)
@@ -408,9 +492,9 @@ func (a *Attached) Close() error {
 	} else if a.arch != nil {
 		err = a.arch.rotate()
 	}
-	if a.ring != nil {
+	if a.ring != nil && a.ownRing {
 		a.ring.Close()
-		a.ring = nil
 	}
+	a.ring = nil
 	return err
 }

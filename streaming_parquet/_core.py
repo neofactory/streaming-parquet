@@ -102,6 +102,29 @@ int sp_store_fill(const SpStore *s, SpTicket *t, const char *where,
 int32_t sp_store_files(const SpStore *s);
 void sp_ownership_unread(const char *name, const char *store,
                          const char *why, char *msg, size_t msglen);
+typedef struct SpReader SpReader;
+typedef struct {
+    int action;
+    int state;
+    int fresh_ring;
+    double wait_seconds;
+} SpStep;
+SpReader *sp_reader_new(const char *who, const char *name, const char *store,
+                        int direct);
+void sp_reader_free(SpReader *r);
+const char *sp_reader_folder(const SpReader *r);
+void sp_reader_poll(SpReader *r, int found, const SpTicket *ticket,
+                    const char *why, double now, double mono,
+                    double if_absent, SpStep *step);
+void sp_reader_folder_is(SpReader *r, int exists, double mono, SpStep *step);
+void sp_reader_connected(SpReader *r);
+void sp_reader_lost(SpReader *r, const char *why, double mono, SpStep *step);
+void sp_reader_close(SpReader *r);
+int sp_reader_state(const SpReader *r);
+const char *sp_reader_state_name(int state);
+const char *sp_reader_reason(const SpReader *r);
+const char *sp_reader_run(const SpReader *r);
+int sp_reader_message(SpReader *r, char *msg, size_t msglen);
 """)
 
 
@@ -439,3 +462,96 @@ class Store:
     @property
     def files(self):
         return lib.sp_store_files(self._s)
+
+
+# ---- the reader (core/sp.h: THE READER) ----------------------------------
+
+FOUND_NONE, FOUND_TICKET, FOUND_LOCAL, FOUND_UNREADABLE = 0, 1, 2, 3
+DO_WAIT, DO_CONNECT, DO_LOCAL, DO_LIST, DO_FAIL = 0, 1, 2, 3, 4
+LOG_INFO, LOG_WARNING, LOG_ERROR = 1, 2, 3
+
+
+class Step:
+    """One step of a reader: what to do (DO_*), the state's name after
+    it, whether to drop the ring in hand first, and for DO_WAIT how
+    long."""
+    __slots__ = ("action", "state", "fresh_ring", "wait_seconds")
+
+    def __init__(self, st):
+        self.action = st.action
+        self.state = ffi.string(lib.sp_reader_state_name(st.state)).decode()
+        self.fresh_ring = bool(st.fresh_ring)
+        self.wait_seconds = st.wait_seconds
+
+
+class Reader:
+    """A reader's rules: where it finds the writer, when it waits, when
+    it starts again. One thread makes the calls (the reader's own); the
+    properties may be read from any. `now` is time.time(), `mono`
+    time.monotonic()."""
+
+    def __init__(self, who, name, store, direct):
+        self._r = ffi.gc(
+            lib.sp_reader_new(who.encode(), name.encode(),
+                              str(store).encode() if store is not None
+                              else ffi.NULL, 1 if direct else 0),
+            lib.sp_reader_free)
+        if self._r == ffi.NULL:
+            raise MemoryError("reader")
+        self._st = ffi.new("SpStep *")
+
+    @property
+    def folder(self):
+        return ffi.string(lib.sp_reader_folder(self._r)).decode()
+
+    def poll(self, found, ticket, why, now, mono, if_absent):
+        t = (_from_dict(ticket) if found == FOUND_TICKET and ticket is not None
+             else ffi.NULL)
+        lib.sp_reader_poll(self._r, found, t,
+                           str(why).encode("utf-8", "replace")
+                           if why is not None else ffi.NULL,
+                           now, mono, if_absent, self._st)
+        return Step(self._st)
+
+    def folder_is(self, exists, mono):
+        lib.sp_reader_folder_is(self._r, 1 if exists else 0, mono, self._st)
+        return Step(self._st)
+
+    def connected(self):
+        lib.sp_reader_connected(self._r)
+
+    def lost(self, why, mono):
+        lib.sp_reader_lost(self._r,
+                           str(why).encode("utf-8", "replace")
+                           if why is not None else ffi.NULL, mono, self._st)
+        return Step(self._st)
+
+    def close(self):
+        lib.sp_reader_close(self._r)
+
+    @property
+    def state(self):
+        return ffi.string(lib.sp_reader_state_name(
+            lib.sp_reader_state(self._r))).decode()
+
+    @property
+    def reason(self):
+        """Why the reader is not streaming, in words; None while it is."""
+        text = ffi.string(lib.sp_reader_reason(self._r)).decode(
+            "utf-8", "replace")
+        return text or None
+
+    @property
+    def run(self):
+        p = lib.sp_reader_run(self._r)
+        return ffi.string(p).decode() if p != ffi.NULL else None
+
+    def messages(self):
+        """The lines for the log since the last call: [(LOG_*, text)]."""
+        out = []
+        msg = ffi.new("char[]", _MSGLEN)
+        while True:
+            level = lib.sp_reader_message(self._r, msg, _MSGLEN)
+            if not level:
+                return out
+            out.append((level, ffi.string(msg).decode("utf-8", "replace")))

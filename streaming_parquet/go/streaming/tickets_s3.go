@@ -98,6 +98,24 @@ func (s *s3Store) delete(name string) error {
 	return err
 }
 
+// hasFolder asks for one key under each of the folder's two prefixes:
+// at most two small list requests.
+func (s *s3Store) hasFolder(folder string) (bool, error) {
+	for _, prefix := range []string{s.prefix + "tickets/" + folder + "/",
+		s.prefix + "streams/" + folder + "/"} {
+		out, err := s.client.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
+			Bucket: aws.String(s.bucket), Prefix: aws.String(prefix),
+			MaxKeys: aws.Int32(1)})
+		if err != nil {
+			return false, err
+		}
+		if len(out.Contents) > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (s *s3Store) list() ([]string, error) {
 	var names []string
 	base := s.prefix + "tickets/"

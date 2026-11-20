@@ -10,6 +10,11 @@ connect() (in __init__) returns an Attached either way:
             _StreamData ring via append_batch (the C memcpy ingest).
             One feeder per attach; closing the Attached stops it.
 
+A feeder's rules (where the writer is, when to wait, when to start
+again on a fresh ring, what to log) are the stream core's: core/sp.h,
+THE READER. A waiting feeder looks among this process's streams at
+every poll, before the store, and reads one it finds in place.
+
 The read surface is identical in both cases because both cases ARE a
 ring, and a Stream reads through the same face. Consumers poll;
 nothing calls them back (house polling idiom).
@@ -416,18 +421,28 @@ class _Feeder:
     """
 
     def __init__(self, name, ticket=None, store=None, capacity=5000,
-                 columns=None, segment_bytes=None):
+                 columns=None, segment_bytes=None, local=None, who=None):
+        from . import _core
         self.name = name
         self._capacity = capacity
         self._columns = columns          # top-level field subset or None
         self._segment_bytes = segment_bytes
+        self._direct = ticket            # the caller's ticket, or None
         self._ticket = ticket
         self._store = store              # None for direct-ticket connects
-        self._root_error_logged = False
+        # () -> (a stream of this name in this process or None, True
+        # when this process has a stream in the name's folder)
+        self._local = local
+        # the rules: where the writer is, when to wait, when to start
+        # again (core/sp.h: THE READER). This thread makes its calls;
+        # _state, _reason and _run are what it said last.
+        self._core = _core.Reader(who or f"connect({name!r})", name, store,
+                                  ticket is not None)
+        self._state = self._core.state
         self._reason = None              # why not streaming, in words
-        self._run = None                 # the publisher run streamed from
+        self._run = None                 # the writer's run streamed from
+        self._local_stream = None        # the local stream read in place
         self.data = None                 # _StreamData, built on first connect
-        self._state = "no-ticket" if ticket is None else "connecting"
         self._closed = False
         self._client = None
         self._reader = None
@@ -437,6 +452,12 @@ class _Feeder:
         self.ticket_revision = None
         self._revision_cond = threading.Condition()
         self._stop_event = threading.Event()
+        # The first poll is made here, by connect()'s caller: a name
+        # whose folder does not exist is refused now, not waited for.
+        self._first = self._poll()
+        if self._first.action == _core.DO_FAIL:
+            self._closed = True
+            raise ValueError(self._reason)
         self._lifecycle = threading.Thread(target=self._lifecycle_loop,
                                            daemon=True)
         self._lifecycle.start()
@@ -487,79 +508,99 @@ class _Feeder:
                 pass
         if threading.current_thread() is not self._lifecycle:
             self._lifecycle.join(timeout=1.0)
-        if self.data is not None:
+        if self.data is not None and self._local_stream is None:
             self.data.mark_closed()
 
-    def _refresh_ticket(self):
-        """Re-read the ticket from the discovery root (no-op for
-        direct-ticket attaches). Returns True when the root was
-        readable (or there is no root to read)."""
-        if self._store is None:
-            return True
-        try:
-            t = _tickets.get_ticket(self._store, self.name)
-        except Exception as e:
-            self._reason = f"store {self._store} unreadable: {e}"
-            if not self._root_error_logged:
-                _diag.error(f"[{self.name}] STORE UNREADABLE: "
-                            f"{self._store}: {e}")
-                self._root_error_logged = True
-            return False
-        if self._root_error_logged:
-            _diag.info(f"[{self.name}] store readable again: "
-                       f"{self._store}")
-            self._root_error_logged = False
-        self._ticket = t                 # None = publisher closed/absent
-        return True
+    def _took(self, step):
+        """Note what the core said, and log its lines."""
+        from . import _core
+        self._state = "closed" if self._closed else step.state
+        self._reason = self._core.reason
+        self._run = (self._local_stream._run if self._local_stream is not None
+                     else self._core.run)
+        for level, text in self._core.messages():
+            (_diag.error if level == _core.LOG_ERROR else
+             _diag.warning if level == _core.LOG_WARNING else _diag.info)(text)
+        return step
+
+    def _poll(self):
+        """Look for the stream, in this process and then in the store,
+        and take the core's step for what was found."""
+        from . import _core
+        now, mono = time.time(), time.monotonic()
+        local, local_folder = (self._local() if self._local is not None
+                               else (None, False))
+        if local is not None:
+            self._local_stream = local
+            return self._took(self._core.poll(_core.FOUND_LOCAL, None, None,
+                                              now, mono, 0.0))
+        self._local_stream = None
+        if self._direct is not None:
+            found, ticket, why = _core.FOUND_TICKET, self._direct, None
+        else:
+            try:
+                ticket = _tickets.get_ticket(self._store, self.name)
+                found = (_core.FOUND_TICKET if ticket is not None
+                         else _core.FOUND_NONE)
+                why = None
+            except Exception as e:
+                found, ticket, why = _core.FOUND_UNREADABLE, None, e
+        self._ticket = ticket            # None = the writer closed, or none
+        step = self._core.poll(
+            found, ticket, why, now, mono,
+            _tickets.stale_after(ticket) if ticket is not None else 0.0)
+        if step.action == _core.DO_LIST:
+            try:
+                exists = (local_folder or _tickets.has_folder(
+                    self._store, self._core.folder))
+            except Exception as e:
+                step = self._core.poll(_core.FOUND_UNREADABLE, None, e,
+                                       now, mono, 0.0)
+            else:
+                step = self._core.folder_is(exists, mono)
+        return self._took(step)
+
+    def _drop_ring(self):
+        old, self.data = self.data, None
+        if old is not None and self._local_stream is None:
+            old.mark_closed()            # a holder fails loudly, it does
+                                         # not read a run that is over
 
     def _lifecycle_loop(self):
-        backoff = 0.5
+        from . import _core
+        step, self._first = self._first, None
         while not self._closed:
-            root_ok = self._refresh_ticket()
-            if self._closed:
-                break
-            if self._ticket is None:
-                if root_ok:
-                    self._reason = (f"no ticket for {self.name} under "
-                                    f"{self._store}: no publisher is up")
-                self._state = "no-ticket" if root_ok else "root-unreachable"
-                self._stop_event.wait(timeout=TICKET_POLL_INTERVAL)
+            if step is None:
+                step = self._poll()
+                if self._closed:
+                    break
+            if step.fresh_ring and step.action != _core.DO_LOCAL:
+                self._drop_ring()
+            if step.action == _core.DO_WAIT:
+                self._stop_event.wait(timeout=step.wait_seconds)
+                step = None
+                continue
+            if step.action == _core.DO_LOCAL:
+                # read the writer's own ring in place, until it closes
+                local = self._local_stream
+                if self.data is not None and self.data is not local._data:
+                    self.data.mark_closed()
+                self.data = local._data
+                while not self._closed and not local._data.closed:
+                    self._stop_event.wait(timeout=TICKET_POLL_INTERVAL)
+                if self._closed:
+                    break
+                self._local_stream = None
+                self.data = None         # the ring was the writer's
+                step = self._took(self._core.lost(None, time.monotonic()))
                 continue
 
+            # DO_CONNECT. A fresh ring (above) when the writer started
+            # again: its row numbers start again at 0, and appending
+            # them to the old ring is the livelock (the ring rightly
+            # refuses a row number that goes back).
             ticket = self._ticket
-            ts = ticket.get("ts")
-            if ts is not None and (time.time() - ts) > _tickets.stale_after(ticket):
-                self._reason = (f"ticket stale: the publisher at "
-                                f"{ticket.get('host')}:{ticket.get('port')} last "
-                                f"beat {time.time() - ts:.0f} s ago (stale after "
-                                f"{_tickets.stale_after(ticket):.0f} s)")
-                self._state = "waiting"
-                self._stop_event.wait(timeout=TICKET_POLL_INTERVAL)
-                continue
-
-            # A new run: the publisher respawned and its seq axis
-            # restarted. Resync on a FRESH ring -- appending the new
-            # axis into the old ring is the livelock (the core rightly
-            # refuses seq regression). The old ring is closed so
-            # anything still holding it fails loudly instead of
-            # reading a dead run. (The epochs step of V2B keeps the
-            # reader's rows across this instead.)
-            run = ticket.get("run")
-            if (self.data is not None and self._run is not None
-                    and run != self._run):
-                _diag.error(
-                    f"[{self.name}] PUBLISHER RESTARTED: the ticket at "
-                    f"{ticket.get('host')}:{ticket.get('port')} names run "
-                    f"{run}, this reader streamed run {self._run}; "
-                    f"resyncing on a fresh ring. Rows from the previous "
-                    f"run are discarded here (the archive keeps them); "
-                    f"re-create any relations over this attach.")
-                old = self.data
-                self.data = None
-                old.mark_closed()
-            self._run = run
-
-            self._state = "connecting"
+            why = None
             try:
                 self._client = flight.connect(
                     f"grpc://{ticket['host']}:{ticket['port']}")
@@ -578,24 +619,21 @@ class _Feeder:
                         self.name, schema, capacity=self._capacity,
                         segment_bytes=self._segment_bytes)
 
-                self._state = "streaming"
-                backoff = 0.5
+                self._core.connected()
+                self._state, self._reason = "streaming", None
                 # TotalRecords is the committed row count: the first
                 # request starts at the newest row
                 self._receive(self._client, ticket_str, info.total_records)
             except Exception as e:
                 if self._closed:
                     break
-                self._reason = (f"connect to {ticket.get('host')}:"
-                                f"{ticket.get('port')} failed: {e}")
-                _diag.error(f"[{self.name}] FEEDER LIFECYCLE ERROR: {e}")
-
+                why = (f"connect to {ticket.get('host')}:"
+                       f"{ticket.get('port')} failed: {e}")
             if self._closed:
                 break
-            self._state = "reconnecting"
-            self._stop_event.wait(timeout=backoff)
-            backoff = min(backoff * 2, 10.0)
+            step = self._took(self._core.lost(why, time.monotonic()))
 
+        self._core.close()
         self._state = "closed"
 
     def _receive(self, client, ticket_str, from_seq):

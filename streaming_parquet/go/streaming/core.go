@@ -418,3 +418,126 @@ func (st *storeState) fill(t *Ticket, where string) error {
 	t.KeepSeconds, t.Files = got.KeepSeconds, got.Files
 	return nil
 }
+
+// ---- the reader (sp.h: THE READER) ----------------------------------------
+
+// What a poll found, and a reader's next step: the core's values.
+const (
+	foundNone       = int(C.SP_FOUND_NONE)
+	foundTicket     = int(C.SP_FOUND_TICKET)
+	foundLocal      = int(C.SP_FOUND_LOCAL)
+	foundUnreadable = int(C.SP_FOUND_UNREADABLE)
+
+	doWait    = int(C.SP_DO_WAIT)
+	doConnect = int(C.SP_DO_CONNECT)
+	doLocal   = int(C.SP_DO_LOCAL)
+	doList    = int(C.SP_DO_LIST)
+	doFail    = int(C.SP_DO_FAIL)
+)
+
+// readerStep is one step of a reader: what to do, the state's name
+// after it, whether to drop the ring in hand first, and for doWait how
+// long.
+type readerStep struct {
+	action    int
+	state     string
+	freshRing bool
+	wait      time.Duration
+}
+
+// readerRules is the core's reader: where the writer is, when to wait,
+// when to start again. The reader's own goroutine makes its calls.
+type readerRules struct{ r *C.SpReader }
+
+func newReaderRules(who, name, store string, direct bool) (*readerRules, error) {
+	cw, cn := C.CString(who), C.CString(name)
+	defer C.free(unsafe.Pointer(cw))
+	defer C.free(unsafe.Pointer(cn))
+	var cs *C.char
+	if store != "" {
+		cs = C.CString(store)
+		defer C.free(unsafe.Pointer(cs))
+	}
+	d := C.int(0)
+	if direct {
+		d = 1
+	}
+	r := C.sp_reader_new(cw, cn, cs, d)
+	if r == nil {
+		return nil, fmt.Errorf("%s: out of memory", who)
+	}
+	rr := &readerRules{r: r}
+	runtime.SetFinalizer(rr, func(rr *readerRules) { C.sp_reader_free(rr.r) })
+	return rr, nil
+}
+
+func readerStepOf(st *C.SpStep) readerStep {
+	return readerStep{action: int(st.action),
+		state:     C.GoString(C.sp_reader_state_name(st.state)),
+		freshRing: st.fresh_ring != 0,
+		wait:      time.Duration(float64(st.wait_seconds) * float64(time.Second))}
+}
+
+func (rr *readerRules) folder() string { return C.GoString(C.sp_reader_folder(rr.r)) }
+
+// poll tells the core what a poll found. ticket: for foundTicket. why:
+// the error for foundUnreadable.
+func (rr *readerRules) poll(found int, ticket *Ticket, why error) readerStep {
+	var ct *C.SpTicket
+	if found == foundTicket && ticket != nil {
+		var err error
+		if ct, err = coreTicket(ticket); err != nil {
+			found, why = foundUnreadable, err
+		} else {
+			defer C.sp_ticket_free(ct)
+		}
+	}
+	var cw *C.char
+	if why != nil {
+		cw = C.CString(why.Error())
+		defer C.free(unsafe.Pointer(cw))
+	}
+	var st C.SpStep
+	C.sp_reader_poll(rr.r, C.int(found), ct, cw,
+		C.double(float64(time.Now().UnixNano())/1e9), C.double(monoNow()),
+		C.double(pqc.DeadAfter(0).Seconds()), &st)
+	return readerStepOf(&st)
+}
+
+func (rr *readerRules) folderIs(exists bool) readerStep {
+	e := C.int(0)
+	if exists {
+		e = 1
+	}
+	var st C.SpStep
+	C.sp_reader_folder_is(rr.r, e, C.double(monoNow()), &st)
+	return readerStepOf(&st)
+}
+
+func (rr *readerRules) connected() { C.sp_reader_connected(rr.r) }
+
+// lost: the connection ended (why nil: without an error, or the local
+// stream closed).
+func (rr *readerRules) lost(why error) readerStep {
+	var cw *C.char
+	if why != nil {
+		cw = C.CString(why.Error())
+		defer C.free(unsafe.Pointer(cw))
+	}
+	var st C.SpStep
+	C.sp_reader_lost(rr.r, cw, C.double(monoNow()), &st)
+	return readerStepOf(&st)
+}
+
+func (rr *readerRules) close()         { C.sp_reader_close(rr.r) }
+func (rr *readerRules) reason() string { return C.GoString(C.sp_reader_reason(rr.r)) }
+
+// messages are the lines for the log since the last call.
+func (rr *readerRules) messages() []string {
+	var out []string
+	var msg [coreMsgLen]C.char
+	for C.sp_reader_message(rr.r, &msg[0], coreMsgLen) != 0 {
+		out = append(out, C.GoString(&msg[0]))
+	}
+	return out
+}

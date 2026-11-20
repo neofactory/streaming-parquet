@@ -67,6 +67,10 @@ type ticketStore interface {
 	get(name string) (*Ticket, error) // nil, nil = no ticket there
 	delete(name string) error
 	list() ([]string, error)
+	// hasFolder: does the store hold anything in the folder, a ticket
+	// under tickets/<folder>/ or a file under streams/<folder>/? What a
+	// reader asks before it waits for a name in that folder.
+	hasFolder(folder string) (bool, error)
 }
 
 func newTicketStore(root string) (ticketStore, error) {
@@ -130,6 +134,20 @@ func (f *fileStore) delete(name string) error {
 		return nil
 	}
 	return err
+}
+
+func (f *fileStore) hasFolder(folder string) (bool, error) {
+	for _, dir := range []string{filepath.Join(f.base, folder),
+		filepath.Join(filepath.Dir(f.base), "streams", folder)} {
+		st, err := os.Stat(dir)
+		if err == nil && st.IsDir() {
+			return true, nil
+		}
+		if err != nil && !os.IsNotExist(err) {
+			return false, err
+		}
+	}
+	return false, nil
 }
 
 func (f *fileStore) list() ([]string, error) {

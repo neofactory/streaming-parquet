@@ -2860,6 +2860,102 @@ def _():
     assert not _core.ticket_is_stale(old, 34.9, 30.0)
 
 
+print("\n--- the reader's rules (core/sp.h: THE READER) ---")
+
+
+class _Lines:
+    """The log lines of the library while the block runs."""
+
+    def __enter__(self):
+        import logging
+        self.lines = []
+        outer = self
+
+        class H(logging.Handler):
+            def emit(self, record):
+                outer.lines.append((record.levelname, record.getMessage()))
+        self._h = H()
+        logging.getLogger("telemetry.diag").addHandler(self._h)
+        return self.lines
+
+    def __exit__(self, *exc):
+        import logging
+        logging.getLogger("telemetry.diag").removeHandler(self._h)
+
+
+@test("connect: a name whose folder does not exist is an error at once")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        t0 = time.monotonic()
+        try:
+            sp.connect("no/such/place", store=tmp)
+        except ValueError as e:
+            assert "connect('no/such/place'): no stream no/such/place is under" in str(e), e
+            assert "the folder no/such" in str(e) and "check the path" in str(e), e
+        else:
+            raise AssertionError("connect waited for a name in no folder")
+        assert time.monotonic() - t0 < 1.0
+        # a name with no folder is in the store itself: it waits
+        a = sp.connect("alone", store=tmp)
+        assert a.state == "no-ticket", a.state
+        a.close()
+
+
+@test("connect: a name in a folder that exists waits, and says so once")
+def _():
+    flat = pa.schema([F('n', pa.int64(), nullable=False)])
+    with tempfile.TemporaryDirectory() as tmp:
+        s = sp.create_stream("rd/shop/one", flat, store=tmp)
+        try:
+            with _Lines() as lines:
+                # the folder rd/shop has a ticket: a wrong last part waits
+                a = sp.connect("rd/shop/two", store=tmp + "/")      # another store text: not the local path
+                assert a.state == "no-ticket", a.state
+                assert "no ticket for rd/shop/two" in a.standing()[0], a.standing()
+                time.sleep(2.3)                                     # two more polls
+                said = [m for _lvl, m in lines if "rd/shop/two" in m]
+                assert len(said) == 1 and said[0].endswith("no writer is up: waiting for a writer"), said
+                a.close()
+        finally:
+            s.close()
+        # the folder has files and no ticket now: still waits
+        os.makedirs(os.path.join(tmp, "streams", "rd", "old", "x"))
+        a = sp.connect("rd/old/y", store=tmp)
+        assert a.state == "no-ticket"
+        a.close()
+
+
+@test("connect: a waiting reader finds a stream this process creates later, and waits again when it closes")
+def _():
+    flat = pa.schema([F('n', pa.int64(), nullable=False)])
+    with tempfile.TemporaryDirectory() as tmp:
+        other = sp.create_stream("rd/late/other", flat, publish=False)    # the folder exists in this process alone
+        a = sp.connect("rd/late/s", store=tmp)
+        assert a.state == "no-ticket", a.state
+        s = sp.create_stream("rd/late/s", flat, store=tmp, publish=False) # internal: no ticket, no Flight
+        s.append(pa.record_batch([pa.array(range(10))], schema=flat))
+        s.commit()
+        wait_for(lambda: a.state == "streaming", what="the reader finds the local stream")
+        assert a.standing() == []
+        assert a.arrow_table().num_rows == 10
+        cur = a.cursor()
+        s.append(pa.record_batch([pa.array(range(10, 15))], schema=flat))
+        s.commit()
+        assert [r.n for r in cur] == [10, 11, 12, 13, 14]
+        s.close()
+        wait_for(lambda: a.state == "no-ticket", what="the reader waits again")
+        # a new stream of the name: found again, a fresh ring
+        s = sp.create_stream("rd/late/s", flat, store=tmp, publish=False)
+        s.append(pa.record_batch([pa.array(range(3))], schema=flat))
+        s.commit()
+        wait_for(lambda: a.state == "streaming" and a.arrow_table().num_rows == 3,
+                 what="the reader finds the new local stream")
+        a.close()
+        assert s.arrow_table().num_rows == 3            # the reader's close leaves the writer's ring
+        s.close()
+        other.close()
+
+
 # ---------------------------------------------------------------------------
 print(f"\n{'=' * 50}")
 print(f"Results: {passed} passed, {failed} failed")

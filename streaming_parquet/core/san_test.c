@@ -482,6 +482,199 @@ int main(void) {
         sp_store_free(st);
     }
 
+    /* ---- the reader ---- */
+    {
+        SpStep st;
+        char msg[700];
+        const double T0 = 1762979473.5;       /* full_ticket's ts */
+        SpTicket *k = full_ticket();          /* run ...12.123456Z, stale after 45 */
+
+        /* the folder above the name */
+        SpReader *r = sp_reader_new("connect('a/b/c')", "a/b/c", "/data", 0);
+        CHECK(r && strcmp(sp_reader_folder(r), "a/b") == 0);
+        CHECK(sp_reader_state(r) == SP_R_NO_TICKET);
+        CHECK(strcmp(sp_reader_state_name(SP_R_ROOT_UNREACHABLE), "root-unreachable") == 0);
+        CHECK(sp_reader_state_name(99) == NULL && sp_reader_state_name(-1) == NULL);
+
+        /* no ticket at the first poll: look for the folder; none: fail */
+        sp_reader_poll(r, SP_FOUND_NONE, NULL, NULL, T0, 100, 30, &st);
+        CHECK(st.action == SP_DO_LIST && st.state == SP_R_NO_TICKET);
+        CHECK(sp_reader_message(r, msg, sizeof msg) == 0);
+        sp_reader_folder_is(r, 0, 100, &st);
+        CHECK(st.action == SP_DO_FAIL && st.state == SP_R_CLOSED);
+        CHECK(strstr(sp_reader_reason(r), "connect('a/b/c'): no stream a/b/c is under /data") != NULL);
+        CHECK(strstr(sp_reader_reason(r), "the folder a/b") != NULL);
+        sp_reader_free(r);
+
+        /* the folder exists: wait, one line at the start, one warning at 30 s */
+        r = sp_reader_new("connect('a/b/c')", "a/b/c", "/data", 0);
+        sp_reader_poll(r, SP_FOUND_NONE, NULL, NULL, T0, 100, 30, &st);
+        CHECK(st.action == SP_DO_LIST);
+        sp_reader_folder_is(r, 1, 100, &st);
+        CHECK(st.action == SP_DO_WAIT && st.state == SP_R_NO_TICKET && st.wait_seconds == SP_READER_POLL_SECONDS);
+        CHECK(sp_reader_message(r, msg, sizeof msg) == SP_LOG_INFO);
+        CHECK(strcmp(msg, "[a/b/c] no ticket for a/b/c under /data: no writer is up: waiting for a writer") == 0);
+        CHECK(sp_reader_message(r, msg, sizeof msg) == 0);
+        for (int i = 1; i < 30; i++) {
+            sp_reader_poll(r, SP_FOUND_NONE, NULL, NULL, T0 + i, 100 + i, 30, &st);
+            CHECK(st.action == SP_DO_WAIT);             /* not asked again */
+            CHECK(sp_reader_message(r, msg, sizeof msg) == 0);
+        }
+        sp_reader_poll(r, SP_FOUND_NONE, NULL, NULL, T0 + 30, 130, 30, &st);
+        CHECK(sp_reader_message(r, msg, sizeof msg) == SP_LOG_WARNING);
+        CHECK(strstr(msg, "connect('a/b/c') has waited 30 s for a writer") != NULL);
+        for (int i = 31; i < 200; i++) {                /* one warning for a wait */
+            sp_reader_poll(r, SP_FOUND_NONE, NULL, NULL, T0 + i, 100 + i, 30, &st);
+            CHECK(sp_reader_message(r, msg, sizeof msg) == 0);
+        }
+
+        /* a ticket: connect; connected: streaming, no reason */
+        sp_reader_poll(r, SP_FOUND_TICKET, k, NULL, T0 + 1, 300, 30, &st);
+        CHECK(st.action == SP_DO_CONNECT && st.state == SP_R_CONNECTING && !st.fresh_ring);
+        CHECK(strcmp(sp_reader_run(r), "2026-11-12T20:31:12.123456Z") == 0);
+        sp_reader_connected(r);
+        CHECK(sp_reader_state(r) == SP_R_STREAMING && sp_reader_reason(r)[0] == 0);
+
+        /* lost: 0.5 s, then twice as long, up to 10 s; a connection sets it back */
+        double want[] = {0.5, 1, 2, 4, 8, 10, 10};
+        for (int i = 0; i < 7; i++) {
+            sp_reader_lost(r, "refused", 301, &st);
+            CHECK(st.action == SP_DO_WAIT && st.state == SP_R_RECONNECTING && st.wait_seconds == want[i]);
+            CHECK(sp_reader_message(r, msg, sizeof msg) == SP_LOG_ERROR);
+            CHECK(strcmp(msg, "[a/b/c] READER CONNECTION: refused") == 0);
+            sp_reader_poll(r, SP_FOUND_TICKET, k, NULL, T0 + 2, 302, 30, &st);
+            CHECK(st.action == SP_DO_CONNECT && !st.fresh_ring);     /* the same run */
+        }
+        sp_reader_connected(r);
+        sp_reader_lost(r, NULL, 303, &st);
+        CHECK(st.wait_seconds == 0.5 && sp_reader_message(r, msg, sizeof msg) == 0);
+
+        /* the ticket goes stale: wait, a line; a new wait, so a new warning */
+        sp_reader_poll(r, SP_FOUND_TICKET, k, NULL, T0 + 45, 400, 30, &st);
+        CHECK(st.action == SP_DO_WAIT && st.state == SP_R_WAITING);
+        CHECK(sp_reader_message(r, msg, sizeof msg) == SP_LOG_INFO);
+        CHECK(strstr(msg, "ticket stale: the writer at 10.0.0.5:8815 last wrote it 45 s ago (stale after 45 s): waiting for a writer") != NULL);
+        sp_reader_poll(r, SP_FOUND_TICKET, k, NULL, T0 + 80, 435, 30, &st);
+        CHECK(sp_reader_message(r, msg, sizeof msg) == SP_LOG_WARNING);
+
+        /* the writer started again: a fresh ring, once */
+        char err[128];
+        CHECK(sp_ticket_set_text(k, SP_T_RUN, "2026-11-12T21:00:00.000000Z", err, sizeof err) == 0);
+        sp_reader_poll(r, SP_FOUND_TICKET, k, NULL, T0 + 1, 500, 30, &st);
+        CHECK(st.action == SP_DO_CONNECT && st.fresh_ring == 1);
+        CHECK(sp_reader_message(r, msg, sizeof msg) == SP_LOG_ERROR);
+        CHECK(strstr(msg, "WRITER RESTARTED") && strstr(msg, "names run 2026-11-12T21:00:00.000000Z") && strstr(msg, "streamed run 2026-11-12T20:31:12.123456Z"));
+        sp_reader_poll(r, SP_FOUND_TICKET, k, NULL, T0 + 1, 501, 30, &st);
+        CHECK(st.action == SP_DO_CONNECT && st.fresh_ring == 0);     /* no ring yet */
+        CHECK(sp_reader_message(r, msg, sizeof msg) == 0);
+        sp_reader_connected(r);
+
+        /* the store cannot be read: one error, then a line when it can */
+        sp_reader_lost(r, NULL, 600, &st);
+        sp_reader_poll(r, SP_FOUND_UNREADABLE, NULL, "timed out", T0, 600, 30, &st);
+        CHECK(st.action == SP_DO_WAIT && st.state == SP_R_ROOT_UNREACHABLE);
+        CHECK(sp_reader_message(r, msg, sizeof msg) == SP_LOG_ERROR);
+        CHECK(strcmp(msg, "[a/b/c] STORE UNREADABLE: /data: timed out") == 0);
+        sp_reader_poll(r, SP_FOUND_UNREADABLE, NULL, "timed out", T0, 601, 30, &st);
+        CHECK(sp_reader_message(r, msg, sizeof msg) == 0);
+        CHECK(strcmp(sp_reader_reason(r), "store /data unreadable: timed out") == 0);
+        sp_reader_poll(r, SP_FOUND_UNREADABLE, NULL, "timed out", T0, 631, 30, &st);
+        CHECK(sp_reader_message(r, msg, sizeof msg) == SP_LOG_WARNING);
+        sp_reader_poll(r, SP_FOUND_TICKET, k, NULL, T0 + 1, 632, 30, &st);
+        CHECK(st.action == SP_DO_CONNECT && st.fresh_ring == 0);
+        CHECK(sp_reader_message(r, msg, sizeof msg) == SP_LOG_INFO);
+        CHECK(strcmp(msg, "[a/b/c] store readable again: /data") == 0);
+        sp_reader_connected(r);
+
+        /* a local stream wins: the ring in hand is dropped; it closes: poll again */
+        sp_reader_lost(r, NULL, 700, &st);
+        sp_reader_poll(r, SP_FOUND_LOCAL, NULL, NULL, T0, 700, 30, &st);
+        CHECK(st.action == SP_DO_LOCAL && st.state == SP_R_STREAMING && st.fresh_ring == 1);
+        CHECK(sp_reader_run(r) == NULL && sp_reader_reason(r)[0] == 0);
+        sp_reader_lost(r, NULL, 701, &st);
+        CHECK(st.action == SP_DO_WAIT && st.wait_seconds == 0 && st.fresh_ring == 1);
+        CHECK(strcmp(sp_reader_reason(r), "the stream a/b/c of this process closed") == 0);
+        sp_reader_poll(r, SP_FOUND_TICKET, k, NULL, T0 + 1, 702, 30, &st);
+        CHECK(st.action == SP_DO_CONNECT && st.fresh_ring == 0);
+        CHECK(sp_reader_message(r, msg, sizeof msg) == 0);
+
+        /* closed: every step is a wait in the closed state */
+        sp_reader_close(r);
+        sp_reader_poll(r, SP_FOUND_TICKET, k, NULL, T0, 800, 30, &st);
+        CHECK(st.action == SP_DO_WAIT && st.state == SP_R_CLOSED);
+        sp_reader_lost(r, "x", 800, &st);
+        CHECK(st.state == SP_R_CLOSED);
+        sp_reader_folder_is(r, 0, 800, &st);
+        CHECK(st.state == SP_R_CLOSED && st.action == SP_DO_WAIT);
+        sp_reader_connected(r);
+        CHECK(sp_reader_state(r) == SP_R_CLOSED);
+        sp_reader_free(r);
+
+        /* an unreadable store at the first poll says nothing of the folder */
+        r = sp_reader_new("connect('a/b/c')", "a/b/c", "/data", 0);
+        sp_reader_poll(r, SP_FOUND_UNREADABLE, NULL, "down", T0, 0, 30, &st);
+        CHECK(st.action == SP_DO_WAIT);
+        sp_reader_poll(r, SP_FOUND_NONE, NULL, NULL, T0, 1, 30, &st);
+        CHECK(st.action == SP_DO_LIST);
+        sp_reader_free(r);
+
+        /* a name with no folder waits at once */
+        r = sp_reader_new(NULL, "events", "s3://b", 0);
+        CHECK(sp_reader_folder(r)[0] == 0);
+        sp_reader_poll(r, SP_FOUND_NONE, NULL, NULL, T0, 0, 30, &st);
+        CHECK(st.action == SP_DO_WAIT);
+        sp_reader_free(r);
+
+        /* a direct ticket is never stale; a ticket with no ts is not stale */
+        r = sp_reader_new("connect(ticket=...)", "a/b/c", NULL, 1);
+        CHECK(sp_reader_state(r) == SP_R_CONNECTING);
+        sp_reader_poll(r, SP_FOUND_TICKET, k, NULL, T0 + 1e6, 0, 30, &st);
+        CHECK(st.action == SP_DO_CONNECT);
+        sp_reader_free(r);
+        r = sp_reader_new("connect('x')", "x", "/data", 0);
+        sp_ticket_clear(k, SP_T_TS);
+        sp_reader_poll(r, SP_FOUND_TICKET, k, NULL, T0 + 1e6, 0, 30, &st);
+        CHECK(st.action == SP_DO_CONNECT);
+        /* a ticket with no run after one with a run: the writer started again */
+        sp_reader_connected(r);
+        sp_ticket_clear(k, SP_T_RUN);
+        sp_reader_poll(r, SP_FOUND_TICKET, k, NULL, T0, 0, 30, &st);
+        CHECK(st.fresh_ring == 1 && sp_reader_run(r) == NULL);
+        while (sp_reader_message(r, msg, sizeof msg)) {}
+        /* more lines than the reader keeps: the newest stay, nothing breaks */
+        for (int i = 0; i < 20; i++) sp_reader_lost(r, "again", 0, &st);
+        int n = 0;
+        while (sp_reader_message(r, msg, sizeof msg)) n++;
+        CHECK(n == 4);
+        /* a very long reason is cut, not overrun */
+        char big[4000];
+        memset(big, 'x', sizeof big - 1);
+        big[sizeof big - 1] = 0;
+        sp_reader_poll(r, SP_FOUND_UNREADABLE, NULL, big, T0, 0, 30, &st);
+        CHECK(sp_reader_message(r, msg, sizeof msg) == SP_LOG_ERROR && strlen(msg) < sizeof msg);
+        CHECK(sp_reader_message(r, NULL, 0) == 0);
+        sp_reader_free(r);
+
+        /* NULL is taken everywhere */
+        CHECK(sp_reader_new("w", NULL, "/d", 0) == NULL);
+        sp_reader_poll(NULL, SP_FOUND_NONE, NULL, NULL, 0, 0, 30, &st);
+        sp_reader_poll(NULL, SP_FOUND_NONE, NULL, NULL, 0, 0, 30, NULL);
+        sp_reader_folder_is(NULL, 1, 0, &st);
+        sp_reader_lost(NULL, NULL, 0, &st);
+        sp_reader_connected(NULL);
+        sp_reader_close(NULL);
+        sp_reader_free(NULL);
+        CHECK(sp_reader_state(NULL) == SP_R_CLOSED && sp_reader_run(NULL) == NULL);
+        CHECK(sp_reader_reason(NULL)[0] == 0 && sp_reader_folder(NULL)[0] == 0);
+        CHECK(sp_reader_message(NULL, msg, sizeof msg) == 0);
+        r = sp_reader_new("w", "a/b", "/d", 0);
+        sp_reader_poll(r, SP_FOUND_TICKET, NULL, NULL, 0, 0, 30, NULL);   /* no ticket, no step */
+        sp_reader_lost(r, NULL, 0, NULL);
+        sp_reader_folder_is(r, 1, 0, NULL);
+        sp_reader_free(r);
+        sp_ticket_free(k);
+    }
+
     if (failures == 0) printf("san_test: all checks passed\n");
     return failures ? 1 : 0;
 }

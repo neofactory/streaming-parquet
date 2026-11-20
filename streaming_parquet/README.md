@@ -556,6 +556,23 @@ reader connected at an `unpublish()` sees what it sees when a writer
 closes. In `connect(name)` a stream this process writes is found first,
 so a local name wins over the same name in the store.
 
+**Where a reader looks, and when it waits.** `connect(name)` returns at
+once, and the reader looks for its writer once a second until it has
+one: first among this process's own streams, then in the store. So a
+reader may start before its writer, and it finds a stream this process
+creates later. It waits for a name only when the folder above the name
+exists: `connect("plant/line-1/press")` waits when the store holds anything
+under `plant/line-1` (a ticket or a file) or this process has a stream
+there, and a name with no folder always waits. A name in a folder that
+does not exist is a wrong path, and `connect` raises `ValueError` at
+once. A reader that waits says so: one log line when the wait starts,
+one warning when it has waited 30 seconds, and `standing()` gives the
+reason at any time. When the writer starts again (a new run in the
+ticket) the reader starts on a fresh ring, since row numbers start
+again at 0. Go has the same rules: `Attach` returns the error, and
+`Reason()` is `standing()`. These rules are in the stream core
+(`core/sp.h`, THE READER), once, for both languages.
+
 **One writer per stream.** A stream takes its writer lock the first time
 it is published or starts a file, and holds it until it closes. An
 internal stream with no parquet holds none, so several processes can
