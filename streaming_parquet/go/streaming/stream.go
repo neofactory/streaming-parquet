@@ -58,6 +58,8 @@ type Stream struct {
 	// the ticket's goroutine to write it at once: the store changed.
 	store     *storeState
 	ticketNow chan struct{}
+	// counts this run's writes of the ticket; every Flight answer carries it
+	ticketRevision atomic.Int64
 
 	// The writer lock (owner.go): taken the first time the stream is
 	// published or starts a file, held until Close.
@@ -396,9 +398,8 @@ func (s *Stream) heartbeat(stop chan struct{}) {
 	defer s.hbDone.Done()
 	tick := time.NewTicker(heartbeatInterval)
 	defer tick.Stop()
-	var revision int64
 	pub := func() {
-		revision++
+		revision := s.ticketRevision.Load() + 1
 		t := Ticket{
 			Name: s.Name, Host: localIP(), Port: s.tel.flight.port,
 			Ts:          float64(time.Now().UnixNano()) / 1e9,
@@ -426,6 +427,8 @@ func (s *Stream) heartbeat(stop chan struct{}) {
 			fmt.Fprintf(os.Stderr, "[%s] ticket publish error: %v\n",
 				s.Name, err)
 		}
+		// after the write: a reader told of a revision finds it in the store
+		s.ticketRevision.Store(revision)
 	}
 	pub()
 	for {
@@ -565,6 +568,12 @@ func (s *Stream) StopParquet() error {
 // first seq before anything landed, and 0 on a stream that never wrote
 // a file.
 func (s *Stream) Durable() int64 { return s.durable.Load() }
+
+func (s *Stream) isClosed() bool {
+	s.pubMu.Lock()
+	defer s.pubMu.Unlock()
+	return s.closed
+}
 
 // Close ends the stream: the goroutine stops, the open parquet file is
 // finished with every committed row in it, the ticket is cleared, and

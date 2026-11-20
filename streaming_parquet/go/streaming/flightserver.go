@@ -65,6 +65,17 @@ type flightStream struct {
 	closed bool
 }
 
+// sideData is what each answer carries beside its rows: the stream row
+// number of its first row and the writer's ticket revision, 16 bytes
+// little-endian. A reader that sees the revision change reads the
+// ticket again: that is how a view learns at once what the store holds.
+func sideData(firstRow, revision int64) [16]byte {
+	var meta [16]byte
+	binary.LittleEndian.PutUint64(meta[:8], uint64(firstRow))
+	binary.LittleEndian.PutUint64(meta[8:], uint64(revision))
+	return meta
+}
+
 func (fs *flightStream) notify() {
 	fs.mu.Lock()
 	close(fs.wake)
@@ -229,8 +240,8 @@ func (f *flightFace) DoGet(tkt *flight.Ticket,
 	if committed <= from {
 		empty := array.NewRecordBatch(schema, emptyColumns(schema), 0)
 		defer empty.Release()
-		var meta [8]byte
-		binary.LittleEndian.PutUint64(meta[:], ^uint64(0)) // -1: no rows
+		// -1: no rows. The answer still carries the ticket revision.
+		meta := sideData(-1, fs.stream.ticketRevision.Load())
 		return w.WriteWithAppMetadata(empty, meta[:])
 	}
 	// Pin the rows this answer carries, and no others; released once
@@ -260,8 +271,7 @@ func (f *flightFace) DoGet(tkt *flight.Ticket,
 		if cols != nil {
 			out = selectColumns(rec, cols)
 		}
-		var meta [8]byte
-		binary.LittleEndian.PutUint64(meta[:], uint64(pos))
+		meta := sideData(pos, fs.stream.ticketRevision.Load())
 		err = w.WriteWithAppMetadata(out, meta[:])
 		if cols != nil {
 			out.Release()
