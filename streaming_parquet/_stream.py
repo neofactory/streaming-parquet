@@ -766,6 +766,10 @@ class Stream:
                                   f"catalog pass running, {n} of {total} "
                                   f"file(s) registered")
             if done:
+                # an upload still running after this close may finish
+                # later: it must not start a pass the process then exits
+                # inside
+                cat.stop()
                 step("catalog", t0)
             else:
                 n, total = cat.progress
