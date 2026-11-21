@@ -853,6 +853,97 @@ int main(void) {
         sp_ticket_free(t);
     }
 
+    /* ---- the catalog ---- */
+    {
+        char err[512];
+        size_t len = 0, flen = 0, nlen = 0;
+        static uint8_t flat[1 << 16], nested[1 << 16];
+        FILE *fp = fopen("corpus/flat.footer", "rb");
+        if (fp) { flen = fread(flat, 1, sizeof flat, fp); fclose(fp); }
+        fp = fopen("corpus/nested.footer", "rb");
+        if (fp) { nlen = fread(nested, 1, sizeof nested, fp); fclose(fp); }
+        CHECK(flen > 0 && nlen > 0);
+
+        /* the footer's place in a file */
+        uint8_t tail[8] = {0x83, 0x07, 0, 0, 'P', 'A', 'R', '1'};
+        CHECK(sp_parquet_footer_length(tail, 8, err, sizeof err) == 0x783);
+        tail[7] = 'X';
+        CHECK(sp_parquet_footer_length(tail, 8, err, sizeof err) == -1 && strstr(err, "PAR1"));
+        CHECK(sp_parquet_footer_length(tail, 3, err, sizeof err) == -1);
+        CHECK(sp_parquet_footer_length(NULL, 0, NULL, 0) == -1);
+
+        /* a new catalog; a file; the bytes open again and list it */
+        SpCatalog *c = sp_catalog_open(NULL, 0, "/d/", 1000.5, err, sizeof err);
+        CHECK(c && sp_catalog_files(c) == 0 && !sp_catalog_lists(c, "/d/a.parquet"));
+        CHECK(sp_catalog_add(c, "/d/a.parquet", 4000, flat, flen, err, sizeof err) == 0);
+        CHECK(sp_catalog_lists(c, "/d/a.parquet") && sp_catalog_staged(c) == 1);
+        /* listed already: left as it is */
+        CHECK(sp_catalog_add(c, "/d/a.parquet", 4000, flat, flen, err, sizeof err) == 0);
+        CHECK(sp_catalog_files(c) == 1 && sp_catalog_staged(c) == 1);
+        uint8_t *bytes = sp_catalog_bytes(c, 1001.0, &len, err, sizeof err);
+        CHECK(bytes && len > 4096 && memcmp(bytes, "SQLite format 3", 15) == 0);
+        CHECK(sp_catalog_staged(c) == 0);
+        sp_catalog_free(c);
+        c = sp_catalog_open(bytes, len, "/d/", 1002.0, err, sizeof err);
+        CHECK(c && sp_catalog_files(c) == 1);
+        char *path = sp_catalog_file(c, 0);
+        CHECK(path && strcmp(path, "/d/a.parquet") == 0);
+        sp_free(path);
+        CHECK(sp_catalog_file(c, 1) == NULL && sp_catalog_file(c, -1) == NULL);
+
+        /* a file with other columns adds them */
+        CHECK(sp_catalog_add(c, "/d/b.parquet", 5000, nested, nlen, err, sizeof err) == 0);
+        CHECK(sp_catalog_files(c) == 2);
+
+        /* bytes that are no footer: refused, and nothing changes */
+        CHECK(sp_catalog_add(c, "/d/c.parquet", 10, (const uint8_t *)"nonsense", 8,
+                             err, sizeof err) == -1);
+        CHECK(strstr(err, "/d/c.parquet") && strstr(err, "not a parquet footer"));
+        CHECK(sp_catalog_add(c, "/d/c.parquet", 10, flat, flen / 2, err, sizeof err) == -1);
+        CHECK(sp_catalog_files(c) == 2 && sp_catalog_staged(c) == 1);
+
+        /* a column whose type changed: the "n" of flat (int64) as text */
+        {
+            /* the nested footer's column "u" (uint64) renamed "n" would
+             * be a type change; made here by a catalog that has "n" as
+             * the nested file's "b" is not possible without a writer, so
+             * the check is: flat's footer with n's physical type byte
+             * changed is refused or a type change, never listed twice */
+            uint8_t *bad = malloc(flen);
+            memcpy(bad, flat, flen);
+            int refused = 0;
+            for (size_t at = 0; at < flen && at < 64; at++) {
+                uint8_t was = bad[at];
+                bad[at] ^= 0x0c;
+                char p[32];
+                snprintf(p, sizeof p, "/d/x%zu.parquet", at);
+                if (sp_catalog_add(c, p, 10, bad, flen, err, sizeof err) != 0) {
+                    refused++;
+                    CHECK(!sp_catalog_lists(c, p));
+                }
+                bad[at] = was;
+            }
+            CHECK(refused > 0);
+            free(bad);
+        }
+        sp_free(bytes);
+        bytes = sp_catalog_bytes(c, 1003.0, &len, err, sizeof err);
+        CHECK(bytes != NULL);
+        sp_free(bytes);
+        sp_catalog_free(c);
+
+        /* bytes that are no catalog */
+        CHECK(sp_catalog_open((const uint8_t *)"not a database at all", 21, "/d/", 1,
+                              err, sizeof err) == NULL && strstr(err, "not a stream's catalog"));
+        CHECK(sp_catalog_open(NULL, 0, NULL, 1, err, sizeof err) == NULL);
+        /* NULL is taken everywhere */
+        CHECK(sp_catalog_add(NULL, "p", 1, flat, flen, err, sizeof err) == -1);
+        CHECK(sp_catalog_bytes(NULL, 1, &len, err, sizeof err) == NULL);
+        CHECK(sp_catalog_files(NULL) == 0 && !sp_catalog_lists(NULL, "p")
+              && sp_catalog_staged(NULL) == 0 && sp_catalog_file(NULL, 0) == NULL);
+        sp_catalog_free(NULL);
+    }
+
     if (failures == 0) printf("san_test: all checks passed\n");
     return failures ? 1 : 0;
 }

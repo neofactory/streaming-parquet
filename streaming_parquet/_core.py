@@ -146,6 +146,22 @@ double sp_view_wait_seconds(const SpView *v, double now);
 double sp_view_failed(SpView *v, const char *why);
 void sp_view_followed(SpView *v);
 int sp_view_message(SpView *v, char *msg, size_t msglen);
+typedef struct SpCatalog SpCatalog;
+int64_t sp_parquet_footer_length(const uint8_t *tail, size_t len,
+                                 char *err, size_t errlen);
+SpCatalog *sp_catalog_open(const uint8_t *bytes, size_t len,
+                           const char *data_path, double now,
+                           char *err, size_t errlen);
+void sp_catalog_free(SpCatalog *c);
+int sp_catalog_lists(const SpCatalog *c, const char *path);
+int64_t sp_catalog_files(const SpCatalog *c);
+char *sp_catalog_file(const SpCatalog *c, int64_t index);
+int sp_catalog_add(SpCatalog *c, const char *path, int64_t file_size,
+                   const uint8_t *footer, size_t footer_len,
+                   char *err, size_t errlen);
+int64_t sp_catalog_staged(const SpCatalog *c);
+uint8_t *sp_catalog_bytes(SpCatalog *c, double now, size_t *out_len,
+                          char *err, size_t errlen);
 """)
 
 
@@ -681,3 +697,75 @@ class View:
             if not level:
                 return out
             out.append((level, ffi.string(msg).decode("utf-8", "replace")))
+
+
+# ---- the catalog (core/sp.h: THE CATALOG) ----------------------------------
+
+class CatalogError(ValueError):
+    """The core refused a catalog's bytes or a file."""
+
+
+_CATERR = 512
+
+
+def footer_length(tail):
+    """The length of a parquet file's footer, from its last 8 bytes or
+    more: the footer is that many bytes before those 8."""
+    err = ffi.new("char[]", _CATERR)
+    n = lib.sp_parquet_footer_length(tail, len(tail), err, _CATERR)
+    if n < 0:
+        raise CatalogError(ffi.string(err).decode(errors="replace"))
+    return n
+
+
+class Catalog:
+    """A stream's catalog of finished files, in memory: opened from the
+    bytes the store holds (b"": a new one), given each new file's
+    footer, written back as bytes. One thread at a time."""
+
+    def __init__(self, data, data_path, now):
+        err = ffi.new("char[]", _CATERR)
+        self._c = ffi.gc(lib.sp_catalog_open(data or ffi.NULL, len(data or b""),
+                                             data_path.encode(), now, err,
+                                             _CATERR), lib.sp_catalog_free)
+        if self._c == ffi.NULL:
+            raise CatalogError(ffi.string(err).decode(errors="replace"))
+
+    def lists(self, path):
+        return bool(lib.sp_catalog_lists(self._c, path.encode()))
+
+    def files(self):
+        """The full paths of the files the catalog lists."""
+        out = []
+        for i in range(lib.sp_catalog_files(self._c)):
+            p = lib.sp_catalog_file(self._c, i)
+            if p == ffi.NULL:
+                break
+            out.append(ffi.string(p).decode())
+            lib.sp_free(p)
+        return out
+
+    def add(self, path, file_size, footer):
+        """List a finished file; CatalogError when it is refused (the
+        catalog is as it was)."""
+        err = ffi.new("char[]", _CATERR)
+        if lib.sp_catalog_add(self._c, path.encode(), file_size, footer,
+                              len(footer), err, _CATERR) != 0:
+            raise CatalogError(ffi.string(err).decode(errors="replace"))
+
+    @property
+    def staged(self):
+        return lib.sp_catalog_staged(self._c)
+
+    def to_bytes(self, now):
+        """The catalog's bytes, the files added since the last call in
+        one snapshot."""
+        err = ffi.new("char[]", _CATERR)
+        n = ffi.new("size_t *")
+        p = lib.sp_catalog_bytes(self._c, now, n, err, _CATERR)
+        if p == ffi.NULL:
+            raise CatalogError(ffi.string(err).decode(errors="replace"))
+        try:
+            return bytes(ffi.buffer(p, n[0]))
+        finally:
+            lib.sp_free(p)

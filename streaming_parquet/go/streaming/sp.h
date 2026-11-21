@@ -634,11 +634,11 @@ typedef enum {
 
 typedef enum {
     SP_CATALOG_NONE = 0, SP_CATALOG_EXACT, SP_CATALOG_CURRENT
-} SpCatalog;
+} SpViewCatalog;
 
 typedef struct {
     int build;                /* 1: the text must change */
-    int catalog;              /* SpCatalog */
+    int catalog;              /* SpViewCatalog */
     int64_t seam;
     int use_ring;
 } SpViewPlan;
@@ -700,6 +700,84 @@ void sp_view_followed(SpView *v);
 
 /* As sp_reader_message. */
 int sp_view_message(SpView *v, char *msg, size_t msglen);
+
+/* THE CATALOG
+ *
+ * The list of a stream's finished files: one object in the store,
+ * <store>/streams/<name>/catalog.sqlite. It is a SQLite database that
+ * holds a DuckLake 1.0 catalog with one table, `data`, whose files are
+ * the stream's finished parquet files, each by its full path. DuckDB
+ * reads it with ATTACH 'ducklake:sqlite:<file>' and opens only the
+ * files a query needs: the catalog holds each file's row count and each
+ * column's minimum and maximum. The core writes it; no writer needs
+ * DuckDB.
+ *
+ * The host does the reads and writes: it brings the catalog's bytes
+ * (none: a new catalog), brings each new file's footer, takes the new
+ * bytes, and stores them (on a bucket: only if the stored object is
+ * still the version it read). The files are the source of truth: a pass
+ * adds every finished file the catalog does not list.
+ *
+ * A pass:
+ *   sp_catalog_open     from the stored bytes
+ *   sp_catalog_lists    for each finished file in the store: listed?
+ *   read the file's last 8 bytes; sp_parquet_footer_length; read the
+ *   footer; sp_catalog_add
+ *   sp_catalog_bytes    the new catalog, with one snapshot for the pass
+ *
+ * What a file adds: its row in the list (path, rows, size), each
+ * column's value count, null count, minimum and maximum as text DuckDB
+ * casts back to the column's type, the table's totals, and, in the
+ * core's own table sp_file, the file's run and the stream row number of
+ * its first row (the footer's keys sp_run and sp_base_seq).
+ *
+ * The columns of `data` are those of the files: a file with a column
+ * the catalog lacks adds it (earlier files read as null in it); a file
+ * that lacks a column reads as null in it. A column whose type differs
+ * from the catalog's refuses the file, with both types in the error.
+ * Types taken: boolean, the integers, float32, float64, varchar, blob,
+ * date, time, the timestamps, decimal, and lists and structs of them.
+ */
+typedef struct SpCatalog SpCatalog;
+
+/* The length of the footer of a parquet file, from the file's last 8
+ * bytes or more (`tail`, `len`): the footer is the `length` bytes
+ * before those 8. -1 with the reason for bytes that do not end a
+ * parquet file. */
+int64_t sp_parquet_footer_length(const uint8_t *tail, size_t len,
+                                 char *err, size_t errlen);
+
+/* A catalog from the bytes the store holds; len 0: a new one. data_path:
+ * the stream's folder in the store, ending in '/'. now: the host's wall
+ * clock. NULL with the reason for bytes that are not a stream's catalog. */
+SpCatalog *sp_catalog_open(const uint8_t *bytes, size_t len,
+                           const char *data_path, double now,
+                           char *err, size_t errlen);
+void sp_catalog_free(SpCatalog *c);
+
+/* 1 when the catalog lists the file of this full path. */
+int sp_catalog_lists(const SpCatalog *c, const char *path);
+
+/* How many files the catalog lists, and the path of the index-th (from
+ * 0): sp_free it; NULL past the last. */
+int64_t sp_catalog_files(const SpCatalog *c);
+char *sp_catalog_file(const SpCatalog *c, int64_t index);
+
+/* List a finished file. footer: the footer's bytes (not the 8 after
+ * it). A file already listed is left as it is. Returns 0, or -1 with
+ * the reason; a refused file changes nothing. */
+int sp_catalog_add(SpCatalog *c, const char *path, int64_t file_size,
+                   const uint8_t *footer, size_t footer_len,
+                   char *err, size_t errlen);
+
+/* Files added since the last sp_catalog_bytes. */
+int64_t sp_catalog_staged(const SpCatalog *c);
+
+/* The catalog as bytes, for the host to store: sp_free them. The files
+ * added since the last call are in one snapshot, of the time `now`.
+ * NULL with the reason on failure. */
+uint8_t *sp_catalog_bytes(SpCatalog *c, double now, size_t *out_len,
+                          char *err, size_t errlen);
 
 void sp_free(void *p);
 

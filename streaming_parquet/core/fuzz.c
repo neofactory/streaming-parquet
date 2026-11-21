@@ -29,8 +29,84 @@ static const char *SEEDS[] = {
     "{}",
 };
 
+/* The catalog reads parquet footers from the store: mutate real footers
+ * (argv[2..]: files of footer bytes) and list each in a catalog. */
+static int fuzz_footers(long iters, int n_seeds, char **seeds) {
+    long taken = 0;
+    size_t image_len = 0;
+    char err[256];
+    SpCatalog *base = sp_catalog_open(NULL, 0, "/d/", 1.0, err, sizeof err);
+    uint8_t **seed = calloc((size_t)n_seeds, sizeof *seed);
+    size_t *seed_len = calloc((size_t)n_seeds, sizeof *seed_len);
+    for (int i = 0; i < n_seeds; i++) {
+        FILE *f = fopen(seeds[i], "rb");
+        if (!f) { fprintf(stderr, "FAIL: no seed %s\n", seeds[i]); return 1; }
+        seed[i] = malloc(1 << 20);
+        seed_len[i] = fread(seed[i], 1, 1 << 20, f);
+        fclose(f);
+        char path[32];
+        snprintf(path, sizeof path, "/d/seed%d.parquet", i);
+        if (i == 0 && sp_catalog_add(base, path, 1000, seed[i], seed_len[i],
+                                     err, sizeof err) != 0) {
+            fprintf(stderr, "FAIL: the seed %s is refused: %s\n", seeds[i], err);
+            return 1;
+        }
+    }
+    /* a catalog with the first seed listed: where every round starts */
+    uint8_t *image = sp_catalog_bytes(base, 2.0, &image_len, err, sizeof err);
+    sp_catalog_free(base);
+    if (!image) { fprintf(stderr, "FAIL: %s\n", err); return 1; }
+    SpCatalog *c = sp_catalog_open(image, image_len, "/d/", 3.0, err, sizeof err);
+    for (long i = 0; i < iters; i++) {
+        int which = (int)(rnd() % (uint32_t)n_seeds);
+        size_t n = seed_len[which];
+        uint8_t *buf = malloc(n + 1);
+        memcpy(buf, seed[which], n);
+        int edits = 1 + (int)(rnd() % 4);
+        for (int e = 0; e < edits && n > 0; e++) {
+            size_t at = rnd() % n;
+            switch (rnd() % 5) {
+            case 0: buf[at] = (uint8_t)rnd(); break;
+            case 1: buf[at] ^= (uint8_t)(1u << (rnd() % 8)); break;
+            case 2: memmove(buf + at, buf + at + 1, n - at - 1); n--; break;
+            case 3: buf[at] = (uint8_t)(rnd() % 2 ? 0xff : 0x7f); break;
+            default: n = at; break;
+            }
+        }
+        uint8_t *exact = malloc(n ? n : 1);   /* a read past the end is caught */
+        memcpy(exact, buf, n);
+        char path[32];
+        snprintf(path, sizeof path, "/d/f%ld.parquet", i);
+        if (sp_catalog_add(c, path, 1000, exact, n, err, sizeof err) == 0) taken++;
+        free(exact);
+        free(buf);
+        if (i % 2000 == 1999) {           /* the catalog stays one that opens */
+            size_t len;
+            uint8_t *out = sp_catalog_bytes(c, 4.0, &len, err, sizeof err);
+            if (!out) { fprintf(stderr, "FAIL: no bytes: %s\n", err); return 1; }
+            sp_catalog_free(c);
+            c = sp_catalog_open(out, len, "/d/", 5.0, err, sizeof err);
+            sp_free(out);
+            if (!c) {
+                fprintf(stderr, "FAIL: wrote a catalog it cannot open: %s\n", err);
+                return 1;
+            }
+            sp_catalog_free(c);           /* and start again from the seed's */
+            c = sp_catalog_open(image, image_len, "/d/", 3.0, err, sizeof err);
+        }
+    }
+    sp_catalog_free(c);
+    sp_free(image);
+    for (int i = 0; i < n_seeds; i++) free(seed[i]);
+    free(seed);
+    free(seed_len);
+    printf("fuzz: %ld footers, %ld listed, no fault\n", iters, taken);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     long iters = argc > 1 ? atol(argv[1]) : 300000;
+    if (argc > 2 && fuzz_footers(iters / 3, argc - 2, argv + 2) != 0) return 1;
     static const char JUNK[] = "{}[]\",:\\ue0123456789.-+ntfa\x00\xff\x80";
     long read_ok = 0;
     for (long i = 0; i < iters; i++) {
