@@ -60,6 +60,24 @@ int main(int argc, char **argv) {
             read_ok++;
             sp_ownership("w", "n", "s", t, "10.0.0.9", 1762979480.0, 30,
                          held, sizeof held);
+            /* the view's rules take any ticket that reads */
+            int64_t window[3] = {(int64_t)(rnd() % 2000), (int64_t)(rnd() % 3000),
+                                 (int64_t)(rnd() % 1000)};
+            SpView *v = sp_view_new("v", "n", rnd() % 2 ? "m" : NULL,
+                                    rnd() % 2 ? "e" : NULL);
+            SpViewPlan plan;
+            for (int k = 0; k < 2; k++) {
+                sp_view_plan(v, t, NULL, "2026-11-12T20:31:12.123456Z",
+                             rnd() % 4 ? window : NULL, 1762979480.0 + k * 40,
+                             (double)k, 30, 600, &plan);
+                char *sql = sp_view_sql(v, rnd() % 2 ? "c" : NULL, held, sizeof held);
+                if (sql) sp_view_built(v);
+                sp_free(sql);
+                sp_view_wait_seconds(v, 1762979480.0);
+                window[1] += 100;
+            }
+            while (sp_view_message(v, held, sizeof held)) {}
+            sp_view_free(v);
             size_t len;
             char *text = sp_ticket_write(t, &len);
             SpTicket *back = sp_ticket_read(text, len, err, sizeof err);

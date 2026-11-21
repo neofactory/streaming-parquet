@@ -553,6 +553,154 @@ const char *sp_reader_run(const SpReader *r);
  * msg, or 0 when there is none. Call until 0 after each step. */
 int sp_reader_message(SpReader *r, char *msg, size_t msglen);
 
+/* THE VIEW
+ *
+ * One SQL view over a stream: the store's rows up to one row, the
+ * ring's rows after it. One SpView per view holds the rules' state.
+ * The host reads the ticket, fetches and attaches the catalog, runs
+ * the SQL and the thread; the view decides what the text names, writes
+ * the text, and says when to look again. It does no I/O and has no
+ * clock: `now` is the host's wall clock, `mono` its monotonic clock.
+ *
+ * What the text reads, all named by one ticket, so a query never mixes
+ * two states:
+ *
+ *   finished files    the catalog version the ticket names
+ *   unfinished files  the checkpoint versions the ticket lists, each up
+ *                     to the seam
+ *   the ring          the rows after the seam (a view with a ring, of
+ *                     the ticket's run)
+ *
+ * THE SEAM is the row where the view changes from the store to the
+ * ring. To the extent that rows are in the ring, the view uses them:
+ * the seam is the oldest row boundary the store has (the start of an
+ * unfinished file, the end of its finished row groups, the stored row)
+ * that the ring covers and that is above the ring's oldest quarter.
+ * The oldest quarter is the time a running query has before the writer
+ * reuses the rows after its seam. When no boundary is there:
+ *
+ *   SP_SEAM_TIGHT  the ring reaches the stored row: the seam is the
+ *                  stored row, and a running query has less than a
+ *                  quarter of the ring
+ *   SP_SEAM_SHORT  the ring is full and begins after the stored row:
+ *                  too short for the store's lag. No ring piece.
+ *   SP_SEAM_LATE   the ring is not full and begins after the stored row
+ *                  (a reader that connected after the ticket's
+ *                  checkpoint). No ring piece; a later ticket ends it.
+ *
+ * A view with no ring, or of another run than the ring's, or of a
+ * writer that is not live, has its seam at the stored row.
+ *
+ * A LIVE writer's ticket (not stale, with a revision) names the catalog
+ * version to read (SP_CATALOG_EXACT) or none (SP_CATALOG_NONE). No
+ * ticket, or one that is not live, vouches for none: the view reads the
+ * store's current catalog (SP_CATALOG_CURRENT), and is made again at
+ * every look.
+ *
+ * THE TEXT changes when what it names changes: the seam, the catalog,
+ * the run, or a checkpoint version. A file keeps the checkpoint version
+ * the text names until the seam moves, or until a newer version has
+ * been seen for SP_VIEW_REPOINT_SHARE of the ticket's keep_seconds (a
+ * replaced version is deleted keep_seconds after).
+ *
+ * A host's look:
+ *   read the ticket
+ *   sp_view_plan        what the text must name; build = 0: nothing to do
+ *   get the catalog     the version sp_view_catalog_etag names, or the
+ *                       current one. Gone: read the ticket, plan again.
+ *   sp_view_sql         the statement; run it
+ *   sp_view_built       the view's text is the plan's
+ *   sp_view_followed    the look worked (sp_view_failed: it did not)
+ *   sp_view_wait_seconds  until the next look, or sooner when the
+ *                       connection shows a new ticket revision
+ *
+ * The ring's relation, as the host registers it under `memory`, has the
+ * stream's columns and two more: _seq, each row's number, and _first,
+ * the number of the first row the scan delivered. A query whose scan of
+ * the ring begins past the row after the seam fails; it does not answer
+ * short.
+ */
+typedef struct SpView SpView;
+
+#define SP_VIEW_POLL_DEFAULT_SECONDS 15.0  /* no beat, or no live writer */
+#define SP_VIEW_POLL_MIN_SECONDS 0.5
+#define SP_VIEW_POLL_MARGIN_SECONDS 1.0    /* after the ticket's next write */
+#define SP_VIEW_RING_MARGIN_SHARE 0.25
+#define SP_VIEW_REPOINT_SHARE 0.5
+
+typedef enum {
+    SP_SEAM_AS_WANTED = 0, SP_SEAM_TIGHT, SP_SEAM_SHORT, SP_SEAM_LATE
+} SpSeam;
+
+typedef enum {
+    SP_CATALOG_NONE = 0, SP_CATALOG_EXACT, SP_CATALOG_CURRENT
+} SpCatalog;
+
+typedef struct {
+    int build;                /* 1: the text must change */
+    int catalog;              /* SpCatalog */
+    int64_t seam;
+    int use_ring;
+} SpViewPlan;
+
+/* The seam for a ticket (NULL: none) and a ring's window: {oldest row,
+ * newest row, capacity}, NULL for no ring. *use_ring: the view reads
+ * the ring after the seam. *why: SpSeam. */
+int64_t sp_view_seam(const SpTicket *t, const int64_t *window, int *use_ring,
+                     int *why);
+
+/* view: the view's name in SQL. stream: the stream's name, for the
+ * messages. memory: the name the ring's relation is registered under,
+ * NULL for a view with no ring. empty: the name of a relation with the
+ * stream's columns and no rows, NULL when the host does not know the
+ * columns. NULL when memory is out or a name is missing. */
+SpView *sp_view_new(const char *view, const char *stream, const char *memory,
+                    const char *empty);
+void sp_view_free(SpView *v);
+
+/* Plan the text for a ticket (NULL: the store has none). files: for
+ * each of the ticket's files, in order, the path of the file its
+ * checkpoint belongs to (the checkpoint core's rule); NULL when the
+ * ticket has none. ring_run: the run of the ring's rows, NULL for none.
+ * window: as sp_view_seam. if_absent: as sp_ticket_is_stale.
+ * keep_if_absent: the keep time of a ticket that names none. Returns
+ * 0, or -1 when memory is out. */
+int sp_view_plan(SpView *v, const SpTicket *t, const char *const *files,
+                 const char *ring_run, const int64_t *window, double now,
+                 double mono, double if_absent, double keep_if_absent,
+                 SpViewPlan *out);
+
+/* The catalog version the plan names (SP_CATALOG_EXACT), else NULL. */
+const char *sp_view_catalog_etag(const SpView *v);
+
+/* The statement that makes the planned view: sp_free it. catalog: the
+ * name the host attached the catalog under, NULL for none. NULL with
+ * the reason in err when there is nothing to read the columns from. */
+char *sp_view_sql(const SpView *v, const char *catalog, char *err,
+                  size_t errlen);
+
+/* The host ran the statement. */
+void sp_view_built(SpView *v);
+
+/* The seam of the view as built; -1 before. */
+int64_t sp_view_seam_row(const SpView *v);
+
+/* Why the ring is not used as wanted, in words; "" when it is. */
+const char *sp_view_ring_note(const SpView *v);
+
+/* Seconds until the next look: a live writer's next write of the
+ * ticket and a margin, never under SP_VIEW_POLL_MIN_SECONDS; with no
+ * live writer, SP_VIEW_POLL_DEFAULT_SECONDS. */
+double sp_view_wait_seconds(const SpView *v, double now);
+
+/* A look failed (why: the host's error): returns the seconds to wait
+ * before the next. sp_view_followed: a look worked. */
+double sp_view_failed(SpView *v, const char *why);
+void sp_view_followed(SpView *v);
+
+/* As sp_reader_message. */
+int sp_view_message(SpView *v, char *msg, size_t msglen);
+
 void sp_free(void *p);
 
 #ifdef __cplusplus

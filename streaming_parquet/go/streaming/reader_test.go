@@ -33,8 +33,9 @@ func TestAttachFolderRule(t *testing.T) {
 	if err == nil {
 		t.Fatal("Attach waited for a name in no folder")
 	}
-	for _, part := range []string{`Attach("no/such/place"): no stream no/such/place is under`,
-		"the folder no/such", "check the path"} {
+	for _, part := range []string{`Attach("no/such/place"): the folder no/such does not exist in the store`,
+		"made the first time a writer of a stream under no/such runs",
+		"check the path"} {
 		if !strings.Contains(err.Error(), part) {
 			t.Fatalf("the refusal %q lacks %q", err, part)
 		}

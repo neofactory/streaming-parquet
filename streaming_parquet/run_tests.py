@@ -2196,7 +2196,13 @@ print("\n--- views and the ring ---")
 @test("the seam: the oldest row boundary the store has that is above the "
       "ring's oldest quarter")
 def _():
-    from streaming_parquet._views import choose_seam, _ticket_files
+    from streaming_parquet import _core
+
+    def choose_seam(stored_row, files, window):
+        return _core.view_seam(
+            {"stored_row": stored_row,
+             "files": [dict(f, checkpoint=f"d/{k}.parquet.000001.ckpt")
+                       for k, f in enumerate(files)]}, window)
     one = [{"first_row": 500, "final_rows": 250, "rows": 480}]
     full = (600, 999, 400)               # a full ring: rows 600 to 999
     # above the oldest quarter: row 700 and up
@@ -2221,11 +2227,10 @@ def _():
     # unfinished file comes from the ring, nothing of it from the store
     young = [{"first_row": 0, "final_rows": 0, "rows": 90}]
     assert choose_seam(90, young, (0, 100, 400)) == (-1, True, None)
-    # a ticket from a writer before `files`: paths alone, stored_row only
-    old = _ticket_files({"unfinished": ["d/x.parquet.000003.ckpt"]})
-    assert old == [{"checkpoint": "d/x.parquet.000003.ckpt",
-                    "first_row": None, "final_rows": None, "rows": None}]
+    # a file whose place on the row numbers is not known: stored_row only
+    old = [{"first_row": None, "final_rows": None, "rows": None}]
     assert choose_seam(990, old, full) == (990, True, None)
+    assert _core.view_seam(None, full) == (-1, False, 'short'), "no ticket"
 
 
 @test("the ticket says where each unfinished file is: its first row, the "
@@ -2378,14 +2383,66 @@ def _():
             v = s.duckdb_all(con)
             wait_for(lambda: v.seam == 599,
                      what="the seam at the end of the third row group")
-            with v._lock:
-                v._note_ring('short', 10)
-                assert "too short for the store's lag" in v.ring_note, v.ring_note
-                assert "MemoryOptions(lookback=" in v.ring_note, v.ring_note
-            wait_for(lambda: v.ring_note is None, what="the note cleared")
+            assert v.ring_note is None, v.ring_note
             v.close()
         finally:
             s.close()
+    # the rule, with a ring that begins 190 rows after the store ends
+    from streaming_parquet import _core
+    rules = _core.View("sp_x", "v2test/ringshort", "__mem", "__empty")
+    t = {"name": "v2test/ringshort", "run": "r1", "revision": 3,
+         "ts": 1000.0, "stale_after": 45.0, "stored_row": 10, "files": []}
+
+    def look(window):
+        rules.plan(t, [], "r1", window, 1001.0, 5.0, 30.0, 600.0)
+        return rules.messages()
+    said = look((200, 599, 400))
+    assert "too short for the store's lag of 589 rows" in rules.ring_note, rules.ring_note
+    assert "MemoryOptions(lookback=786)" in rules.ring_note, rules.ring_note
+    assert [lv for lv, _ in said] == [_core.LOG_WARNING] and \
+        said[0][1] == f"[v2test/ringshort] view sp_x: {rules.ring_note}", said
+    assert look((200, 599, 400)) == [], "said once"
+    said = look((0, 20, 400))
+    assert rules.ring_note is None and [lv for lv, _ in said] == [_core.LOG_INFO] \
+        and "the ring is in use again" in said[0][1], said
+
+
+@test("a view lives until view.close(): after its stream closes it still "
+      "answers every row, and its thread waits")
+def _():
+    flat = pa.schema([F('n', pa.int64(), nullable=False)])
+    with tempfile.TemporaryDirectory() as tmp:
+        s = sp.create_stream("v2test/outlive", flat, store=tmp,
+                             memory=MemoryOptions(lookback=400),
+                             parquet=ParquetOptions(checkpoint_seconds=0.05,
+                                             row_group_rows=200))
+        con = view_con()
+        views = []
+        try:
+            for k in range(0, 450, 10):
+                s.append(pa.record_batch([pa.array(range(k, k + 10))],
+                                         schema=flat))
+                time.sleep(0.01)
+            views = [s.duckdb_all(con), s.duckdb_archive(con), s.duckdb_live(con)]
+        finally:
+            s.close()
+        try:
+            cpu = time.process_time()
+            time.sleep(1.5)
+            cpu = time.process_time() - cpu
+            for v in views:
+                n = con.sql(f"SELECT count(*), count(DISTINCT n) FROM {v.name}").fetchall()[0]
+                # memory alone holds the ring's 400 rows
+                want = 400 if v is views[2] else 450
+                assert n == (want, want), (v.name, n)
+            assert cpu < 0.5, f"{cpu:.2f} s of CPU in 1.5 s after the close"
+            assert views[0].error is None and views[1].error is None
+        finally:
+            for v in views:
+                v.close()
+        names = {r[0] for r in con.sql("SELECT view_name FROM duckdb_views() "
+                                       "WHERE NOT internal").fetchall()}
+        assert not names & {v.name for v in views[:2]}, names
 
 
 @test("a file is cut when its row groups reach FILE_CUT_BYTES: the next "
@@ -2890,7 +2947,8 @@ def _():
         try:
             sp.connect("no/such/place", store=tmp)
         except ValueError as e:
-            assert "connect('no/such/place'): no stream no/such/place is under" in str(e), e
+            assert "connect('no/such/place'): the folder no/such does not exist in the store " in str(e), e
+            assert "made the first time a writer of a stream under no/such runs" in str(e), e
             assert "the folder no/such" in str(e) and "check the path" in str(e), e
         else:
             raise AssertionError("connect waited for a name in no folder")

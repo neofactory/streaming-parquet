@@ -502,7 +502,7 @@ int main(void) {
         CHECK(sp_reader_message(r, msg, sizeof msg) == 0);
         sp_reader_folder_is(r, 0, 100, &st);
         CHECK(st.action == SP_DO_FAIL && st.state == SP_R_CLOSED);
-        CHECK(strstr(sp_reader_reason(r), "connect('a/b/c'): no stream a/b/c is under /data") != NULL);
+        CHECK(strstr(sp_reader_reason(r), "connect('a/b/c'): the folder a/b does not exist in the store /data: ") != NULL);
         CHECK(strstr(sp_reader_reason(r), "the folder a/b") != NULL);
         sp_reader_free(r);
 
@@ -673,6 +673,184 @@ int main(void) {
         sp_reader_folder_is(r, 1, 0, NULL);
         sp_reader_free(r);
         sp_ticket_free(k);
+    }
+
+    /* ---- the view ---- */
+    {
+        char err[256], msg[2048];
+        int use, why;
+        int64_t full[3] = {600, 999, 400}, none[3] = {0, -1, 400};
+        SpTicket *t = sp_ticket_new();
+        int64_t first = 500, final = 250, rows = 480;
+        sp_ticket_set_text(t, SP_T_RUN, "r1", err, sizeof err);
+        sp_ticket_set_integer(t, SP_T_REVISION, 3, err, sizeof err);
+        sp_ticket_set_number(t, SP_T_TS, 1000.0, err, sizeof err);
+        sp_ticket_set_number(t, SP_T_STALE_AFTER, 45.0, err, sizeof err);
+        sp_ticket_set_number(t, SP_T_BEAT_SECONDS, 10.0, err, sizeof err);
+        sp_ticket_set_number(t, SP_T_KEEP_SECONDS, 100.0, err, sizeof err);
+        sp_ticket_set_integer(t, SP_T_STORED_ROW, 990, err, sizeof err);
+        sp_ticket_set_text(t, SP_T_CATALOG_ETAG, "e1", err, sizeof err);
+        sp_ticket_add_file(t, "/d/a.parquet.000003.ckpt", &first, &final, &rows,
+                           err, sizeof err);
+
+        /* the seam */
+        CHECK(sp_view_seam(t, NULL, &use, &why) == 990 && !use && why == SP_SEAM_AS_WANTED);
+        CHECK(sp_view_seam(t, none, &use, &why) == 990 && use);
+        CHECK(sp_view_seam(t, full, &use, &why) == 749 && use && why == SP_SEAM_AS_WANTED);
+        CHECK(sp_view_seam(NULL, full, &use, &why) == -1 && !use && why == SP_SEAM_SHORT);
+        CHECK(sp_view_seam(NULL, NULL, NULL, NULL) == -1);
+        {
+            SpTicket *k = sp_ticket_new();
+            sp_ticket_set_integer(k, SP_T_STORED_ROW, 650, err, sizeof err);
+            CHECK(sp_view_seam(k, full, &use, &why) == 650 && use && why == SP_SEAM_TIGHT);
+            sp_ticket_set_integer(k, SP_T_STORED_ROW, 500, err, sizeof err);
+            CHECK(sp_view_seam(k, full, &use, &why) == 500 && !use && why == SP_SEAM_SHORT);
+            int64_t part[3] = {600, 700, 400};
+            CHECK(sp_view_seam(k, part, &use, &why) == 500 && !use && why == SP_SEAM_LATE);
+            sp_ticket_free(k);
+        }
+
+        /* a view with a ring, of the ticket's run */
+        const char *files[1] = {"/d/a.parquet"};
+        SpView *v = sp_view_new("sp_x", "a/b", "__mem", "__empty");
+        SpViewPlan p;
+        CHECK(sp_view_seam_row(v) == -1);
+        CHECK(sp_view_plan(v, t, files, "r1", full, 1001, 50, 30, 600, &p) == 0);
+        CHECK(p.build && p.catalog == SP_CATALOG_EXACT && p.seam == 749 && p.use_ring);
+        CHECK(strcmp(sp_view_catalog_etag(v), "e1") == 0);
+        char *sql = sp_view_sql(v, "cat1", err, sizeof err);
+        CHECK(sql && strstr(sql, "CREATE OR REPLACE VIEW \"sp_x\" AS (SELECT * FROM \"cat1\".data)"
+                                 " UNION ALL BY NAME (SELECT * EXCLUDE (file_row_number) FROM "
+                                 "read_parquet('pqc:///d/a.parquet.000003.ckpt', file_row_number=true) "
+                                 "WHERE file_row_number <= 249) UNION ALL BY NAME "
+                                 "(SELECT * EXCLUDE (_seq, _first) FROM \"__mem\" WHERE _seq > 749 "
+                                 "AND CASE WHEN _first > 750 THEN error('sp_x: the ring does not hold "
+                                 "row 750; it begins at row ' || _first || '. This query read the rows "
+                                 "up to 749 from the store.") == sql);
+        sp_free(sql);
+        sp_view_built(v);
+        CHECK(sp_view_seam_row(v) == 749);
+        /* the next write is due at ts + beat + margin */
+        CHECK(sp_view_wait_seconds(v, 1001) == 10.0);
+        CHECK(sp_view_wait_seconds(v, 1010.5) == 0.5);
+        CHECK(sp_view_wait_seconds(v, 900) == 11.0);
+
+        /* the same facts: nothing to do */
+        CHECK(sp_view_plan(v, t, files, "r1", full, 1002, 51, 30, 600, &p) == 0 && !p.build);
+
+        /* a newer checkpoint version, the seam where it was: the text
+         * keeps the version it names for half the keep time */
+        const char *text2 = "{\"run\":\"r1\",\"revision\":4,\"ts\":1003,"
+            "\"stale_after\":45,\"beat_seconds\":10,\"keep_seconds\":100,\"stored_row\":995,"
+            "\"catalog_etag\":\"e1\",\"files\":[{\"checkpoint\":\"/d/a.parquet.000004.ckpt\","
+            "\"first_row\":500,\"final_rows\":250,\"rows\":496}]}";
+        SpTicket *t2 = sp_ticket_read(text2, strlen(text2), err, sizeof err);
+        CHECK(t2 != NULL);
+        CHECK(sp_view_plan(v, t2, files, "r1", full, 1003, 52, 30, 600, &p) == 0 && !p.build);
+        CHECK(sp_view_plan(v, t2, files, "r1", full, 1003, 101.9, 30, 600, &p) == 0 && !p.build);
+        CHECK(sp_view_plan(v, t2, files, "r1", full, 1003, 102, 30, 600, &p) == 0 && p.build);
+        sql = sp_view_sql(v, "cat1", err, sizeof err);
+        CHECK(sql && strstr(sql, "a.parquet.000004.ckpt") && !strstr(sql, "000003"));
+        sp_free(sql);
+        sp_view_built(v);
+        /* the seam moves: the newest version at once */
+        int64_t later[3] = {900, 1299, 400};
+        CHECK(sp_view_plan(v, t, files, "r1", later, 1003, 103, 30, 600, &p) == 0);
+        CHECK(p.build && p.seam == 990 && p.use_ring);
+        sql = sp_view_sql(v, "cat1", err, sizeof err);
+        CHECK(sql && strstr(sql, "000003.ckpt") && strstr(sql, "file_row_number <= 490"));
+        sp_free(sql);
+
+        /* another run in the ring: no ring piece, the seam at stored_row */
+        CHECK(sp_view_plan(v, t, files, "r0", full, 1003, 104, 30, 600, &p) == 0);
+        CHECK(p.build && p.seam == 990 && !p.use_ring);
+        CHECK(sp_view_plan(v, t, files, NULL, full, 1003, 104, 30, 600, &p) == 0 && !p.use_ring);
+
+        /* a stale ticket: the store's current catalog, built at every look */
+        CHECK(sp_view_plan(v, t, files, "r1", full, 1045, 105, 30, 600, &p) == 0);
+        CHECK(p.build && p.catalog == SP_CATALOG_CURRENT && !p.use_ring
+              && sp_view_catalog_etag(v) == NULL);
+        sp_view_built(v);
+        CHECK(sp_view_plan(v, t, files, "r1", full, 1046, 106, 30, 600, &p) == 0 && p.build);
+        CHECK(sp_view_wait_seconds(v, 1046) == SP_VIEW_POLL_DEFAULT_SECONDS);
+
+        /* no ticket: the catalog alone, or the empty relation */
+        CHECK(sp_view_plan(v, NULL, NULL, "r1", full, 1046, 107, 30, 600, &p) == 0);
+        CHECK(p.build && p.catalog == SP_CATALOG_CURRENT && p.seam == -1);
+        sql = sp_view_sql(v, NULL, err, sizeof err);
+        CHECK(sql && strcmp(sql, "CREATE OR REPLACE VIEW \"sp_x\" AS (SELECT * FROM \"__empty\")") == 0);
+        sp_free(sql);
+        sql = sp_view_sql(v, "c", err, sizeof err);
+        CHECK(sql && strcmp(sql, "CREATE OR REPLACE VIEW \"sp_x\" AS (SELECT * FROM \"c\".data)") == 0);
+        sp_free(sql);
+        CHECK(sp_view_wait_seconds(v, 1046) == SP_VIEW_POLL_DEFAULT_SECONDS);
+        while (sp_view_message(v, msg, sizeof msg)) {}
+
+        /* the ring too short: said once, and once when it ends */
+        sp_ticket_set_integer(t, SP_T_STORED_ROW, 10, err, sizeof err);
+        int64_t shortw[3] = {200, 599, 400}, good[3] = {0, 20, 400};
+        sp_view_plan(v, t, files, "r1", shortw, 1001, 108, 30, 600, &p);
+        CHECK(!p.use_ring && strstr(sp_view_ring_note(v), "lag of 589 rows")
+              && strstr(sp_view_ring_note(v), "lookback=786"));
+        CHECK(sp_view_message(v, msg, sizeof msg) == SP_LOG_WARNING
+              && strstr(msg, "[a/b] view sp_x: the ring holds rows 200 to 599") == msg);
+        sp_view_plan(v, t, files, "r1", shortw, 1001, 109, 30, 600, &p);
+        CHECK(sp_view_message(v, msg, sizeof msg) == 0);
+        sp_view_plan(v, t, files, "r1", good, 1001, 110, 30, 600, &p);
+        CHECK(sp_view_ring_note(v)[0] == 0 && p.use_ring);
+        CHECK(sp_view_message(v, msg, sizeof msg) == SP_LOG_INFO
+              && strstr(msg, "the ring is in use again"));
+
+        /* a look that fails is said once; then that it works again */
+        CHECK(sp_view_failed(v, "no route") == SP_VIEW_POLL_MIN_SECONDS);
+        sp_view_failed(v, "no route");
+        CHECK(sp_view_message(v, msg, sizeof msg) == SP_LOG_ERROR
+              && strcmp(msg, "[a/b] view sp_x could not follow the ticket: no route") == 0);
+        CHECK(sp_view_message(v, msg, sizeof msg) == 0);
+        sp_view_followed(v);
+        sp_view_followed(v);
+        CHECK(sp_view_message(v, msg, sizeof msg) == SP_LOG_INFO
+              && strcmp(msg, "[a/b] view sp_x current again") == 0);
+        CHECK(sp_view_message(v, msg, sizeof msg) == 0);
+        sp_view_free(v);
+
+        /* no ring, columns not known: nothing to read is an error; a
+         * quote in a path is doubled; a file of unknown place is read whole */
+        v = sp_view_new("v", "it's", NULL, NULL);
+        CHECK(sp_view_plan(v, NULL, NULL, NULL, NULL, 0, 0, 30, 600, &p) == 0 && p.build);
+        CHECK(sp_view_sql(v, NULL, err, sizeof err) == NULL
+              && strcmp(err, "v: 'it's' has no catalog, no unfinished file and no memory "
+                             "yet; nothing to read the columns from") == 0);
+        SpTicket *q = sp_ticket_new();
+        sp_ticket_set_integer(q, SP_T_REVISION, 1, err, sizeof err);
+        sp_ticket_set_number(q, SP_T_TS, 1000.0, err, sizeof err);
+        sp_ticket_add_file(q, "/d/o'x.parquet.000001.ckpt", NULL, NULL, NULL, err, sizeof err);
+        CHECK(sp_view_plan(v, q, NULL, "r1", full, 1001, 1, 30, 600, &p) == 0);
+        CHECK(p.build && p.catalog == SP_CATALOG_NONE && !p.use_ring && p.seam == -1);
+        sql = sp_view_sql(v, NULL, err, sizeof err);
+        CHECK(sql && strcmp(sql, "CREATE OR REPLACE VIEW \"v\" AS (SELECT * FROM "
+                                 "read_parquet('pqc:///d/o''x.parquet.000001.ckpt'))") == 0);
+        sp_free(sql);
+        sp_view_free(v);
+        sp_ticket_free(q);
+
+        /* NULL is taken everywhere */
+        CHECK(sp_view_new(NULL, "s", NULL, NULL) == NULL && sp_view_new("v", NULL, NULL, NULL) == NULL);
+        CHECK(sp_view_plan(NULL, t, files, "r1", full, 0, 0, 30, 600, &p) == -1);
+        CHECK(sp_view_sql(NULL, NULL, err, sizeof err) == NULL);
+        CHECK(sp_view_catalog_etag(NULL) == NULL && sp_view_seam_row(NULL) == -1);
+        CHECK(sp_view_ring_note(NULL)[0] == 0 && sp_view_message(NULL, msg, sizeof msg) == 0);
+        CHECK(sp_view_wait_seconds(NULL, 0) == SP_VIEW_POLL_DEFAULT_SECONDS);
+        sp_view_failed(NULL, NULL);
+        sp_view_followed(NULL);
+        sp_view_built(NULL);
+        sp_view_free(NULL);
+        v = sp_view_new("v", "s", "m", NULL);
+        CHECK(sp_view_plan(v, t, NULL, "r1", full, 1001, 0, 30, 600, NULL) == 0);
+        sp_view_failed(v, NULL);
+        sp_view_free(v);
+        sp_ticket_free(t2);
+        sp_ticket_free(t);
     }
 
     if (failures == 0) printf("san_test: all checks passed\n");

@@ -1521,11 +1521,12 @@ void sp_reader_folder_is(SpReader *r, int exists, double mono, SpStep *step) {
     r->asked_folder = 0;
     if (!exists && !r->folder_known) {
         reader_reason(r,
-            "%s: no stream %s is under %s, and nothing is in the folder %s "
-            "there: no ticket, no file, and no stream of this process. A "
-            "reader waits for a writer only when the folder above the name "
-            "exists; check the path.",
-            r->who, r->name, reader_store(r), r->folder);
+            "%s: the folder %s does not exist in the store %s: the store "
+            "holds no ticket and no file under %s, and this process has no "
+            "stream there. The folder is made the first time a writer of a "
+            "stream under %s runs. Start the writer first, or check the "
+            "path.",
+            r->who, r->folder, reader_store(r), r->folder, r->folder);
         step_set(r, step, SP_DO_FAIL, SP_R_CLOSED, 0);
         return;
     }
@@ -1570,4 +1571,510 @@ void sp_reader_lost(SpReader *r, const char *why, double mono, SpStep *step) {
 
 void sp_reader_close(SpReader *r) {
     if (r) r->state = SP_R_CLOSED;
+}
+
+/* ---- the view ----------------------------------------------------------- */
+
+#define VIEW_TEXT 1024
+#define VIEW_MESSAGES 4
+
+/* One unfinished file the text reads: the checkpoint version named,
+ * and the file's last row to read (unknown: the whole file). */
+typedef struct {
+    char *path;
+    int64_t last_row;
+    int has_last_row;
+} ViewPiece;
+
+/* The checkpoint version the text names for a file, and when a newer
+ * one was first seen. */
+typedef struct {
+    char *file;
+    char *path;
+    double since;
+    int has_since;
+} ViewNamed;
+
+typedef struct {
+    int live;
+    char *etag;
+    char *run;
+    int64_t seam;
+    int use_ring;
+    ViewPiece *pieces;
+    int32_t n_pieces;
+} ViewFacts;
+
+struct SpView {
+    char *name, *stream, *memory, *empty;
+    ViewNamed *named;
+    int32_t n_named;
+    int64_t named_seam;
+    int has_named_seam;
+    ViewFacts plan;           /* what the next text names */
+    ViewFacts built;          /* what the view's text names now */
+    int is_built;
+    int has_ticket, has_ts;   /* of the ticket last planned from */
+    double ts, beat;
+    int failed;
+    char note[VIEW_TEXT];
+    int n_messages;
+    struct { int level; char text[VIEW_TEXT]; } messages[VIEW_MESSAGES];
+};
+
+static void facts_clear(ViewFacts *f) {
+    free(f->etag);
+    free(f->run);
+    for (int32_t i = 0; i < f->n_pieces; i++) free(f->pieces[i].path);
+    free(f->pieces);
+    memset(f, 0, sizeof *f);
+}
+
+static int text_same(const char *a, const char *b) {
+    if (!a || !b) return a == b;
+    return strcmp(a, b) == 0;
+}
+
+static int facts_same(const ViewFacts *a, const ViewFacts *b) {
+    if (a->live != b->live || a->seam != b->seam
+        || a->use_ring != b->use_ring || a->n_pieces != b->n_pieces
+        || !text_same(a->etag, b->etag) || !text_same(a->run, b->run))
+        return 0;
+    for (int32_t i = 0; i < a->n_pieces; i++) {
+        const ViewPiece *x = &a->pieces[i], *y = &b->pieces[i];
+        if (strcmp(x->path, y->path) != 0
+            || x->has_last_row != y->has_last_row
+            || (x->has_last_row && x->last_row != y->last_row))
+            return 0;
+    }
+    return 1;
+}
+
+static void view_say(SpView *v, int level, const char *fmt, ...) {
+    if (v->n_messages == VIEW_MESSAGES) {         /* keep the newest */
+        memmove(&v->messages[0], &v->messages[1],
+                (VIEW_MESSAGES - 1) * sizeof v->messages[0]);
+        v->n_messages--;
+    }
+    v->messages[v->n_messages].level = level;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(v->messages[v->n_messages].text, VIEW_TEXT, fmt, ap);
+    va_end(ap);
+    v->n_messages++;
+}
+
+int sp_view_message(SpView *v, char *msg, size_t msglen) {
+    if (msg && msglen) msg[0] = 0;
+    if (!v || v->n_messages == 0) return 0;
+    int level = v->messages[0].level;
+    fail(msg, msglen, "%s", v->messages[0].text);
+    v->n_messages--;
+    memmove(&v->messages[0], &v->messages[1],
+            (size_t)v->n_messages * sizeof v->messages[0]);
+    return level;
+}
+
+SpView *sp_view_new(const char *view, const char *stream, const char *memory,
+                    const char *empty) {
+    if (!view || !stream) return NULL;
+    SpView *v = calloc(1, sizeof(SpView));
+    if (!v) return NULL;
+    v->name = copy_text(view, strlen(view));
+    v->stream = copy_text(stream, strlen(stream));
+    v->memory = memory ? copy_text(memory, strlen(memory)) : NULL;
+    v->empty = empty ? copy_text(empty, strlen(empty)) : NULL;
+    if (!v->name || !v->stream || (memory && !v->memory)
+        || (empty && !v->empty)) {
+        sp_view_free(v);
+        return NULL;
+    }
+    v->plan.seam = v->built.seam = -1;
+    return v;
+}
+
+static void named_clear(ViewNamed *named, int32_t n) {
+    for (int32_t i = 0; i < n; i++) {
+        free(named[i].file);
+        free(named[i].path);
+    }
+    free(named);
+}
+
+void sp_view_free(SpView *v) {
+    if (!v) return;
+    free(v->name);
+    free(v->stream);
+    free(v->memory);
+    free(v->empty);
+    named_clear(v->named, v->n_named);
+    facts_clear(&v->plan);
+    facts_clear(&v->built);
+    free(v);
+}
+
+int64_t sp_view_seam(const SpTicket *t, const int64_t *window, int *use_ring,
+                     int *why) {
+    int64_t stored = -1;
+    int ring = 0, reason = SP_SEAM_AS_WANTED;
+    if (t) sp_ticket_integer(t, SP_T_STORED_ROW, &stored);
+    int64_t seam = stored;
+    if (window) {
+        int64_t oldest = window[0], newest = window[1], capacity = window[2];
+        if (newest < oldest) {                    /* the ring holds no rows yet */
+            ring = 1;
+        } else {
+            /* the first row above the oldest quarter of a full ring: the
+             * writer reuses row r once it has written row r + capacity */
+            int64_t above = newest + 1 - capacity
+                + (int64_t)((double)capacity * SP_VIEW_RING_MARGIN_SHARE);
+            int found = 0;
+            int64_t best = 0;
+#define SEAM_CANDIDATE(c) do { \
+                int64_t c_ = (c); \
+                if (c_ <= stored && c_ + 1 >= oldest && c_ + 1 >= above \
+                    && (!found || c_ < best)) { found = 1; best = c_; } \
+            } while (0)
+            SEAM_CANDIDATE(stored);
+            for (int32_t i = 0; t && i < t->n_files; i++) {
+                const TicketFile *f = &t->files[i];
+                if (!f->has_first_row) continue;
+                SEAM_CANDIDATE(f->first_row - 1);
+                if (f->has_final_rows)
+                    SEAM_CANDIDATE(f->first_row + f->final_rows - 1);
+            }
+#undef SEAM_CANDIDATE
+            if (found) {
+                seam = best;
+                ring = 1;
+            } else if (oldest <= stored + 1) {
+                ring = 1;
+                reason = SP_SEAM_TIGHT;
+            } else {
+                reason = (newest - oldest + 1 >= capacity) ? SP_SEAM_SHORT
+                                                           : SP_SEAM_LATE;
+            }
+        }
+    }
+    if (use_ring) *use_ring = ring;
+    if (why) *why = reason;
+    return seam;
+}
+
+/* Say, once for each change, why the ring is not used as wanted.
+ * SP_SEAM_LATE is not said: a later ticket ends it. */
+static void view_note_ring(SpView *v, int why, int64_t stored,
+                           const int64_t *window) {
+    char note[VIEW_TEXT];
+    note[0] = 0;
+    if (why == SP_SEAM_SHORT || why == SP_SEAM_TIGHT) {
+        int64_t oldest = window ? window[0] : 0;
+        int64_t newest = window ? window[1] : -1;
+        int64_t capacity = window ? window[2] : 0;
+        int64_t behind = newest - stored;
+        int64_t want = (int64_t)((double)behind
+                                 / (1 - SP_VIEW_RING_MARGIN_SHARE)) + 1;
+        if (why == SP_SEAM_SHORT)
+            snprintf(note, sizeof note,
+                "the ring holds rows %lld to %lld and the store ends at row "
+                "%lld: the ring is too short for the store's lag of %lld "
+                "rows, so the view reads the files only and is that far "
+                "behind. Connect with MemoryOptions(lookback=%lld) or more "
+                "(now %lld).",
+                (long long)oldest, (long long)newest, (long long)stored,
+                (long long)behind, (long long)want, (long long)capacity);
+        else
+            snprintf(note, sizeof note,
+                "the store is %lld rows behind a ring of %lld: a running "
+                "query has less than a quarter of the ring to reach memory. "
+                "Connect with MemoryOptions(lookback=%lld) or more.",
+                (long long)behind, (long long)capacity, (long long)want);
+    }
+    if ((note[0] == 0) != (v->note[0] == 0)) {
+        if (note[0])
+            view_say(v, SP_LOG_WARNING, "[%s] view %s: %s", v->stream,
+                     v->name, note);
+        else
+            view_say(v, SP_LOG_INFO, "[%s] view %s: the ring is in use again",
+                     v->stream, v->name);
+    }
+    memcpy(v->note, note, sizeof note);
+}
+
+int sp_view_plan(SpView *v, const SpTicket *t, const char *const *files,
+                 const char *ring_run, const int64_t *window, double now,
+                 double mono, double if_absent, double keep_if_absent,
+                 SpViewPlan *out) {
+    if (out) memset(out, 0, sizeof *out);
+    if (!v) return -1;
+    int64_t revision, stored = -1;
+    double keep = 0;
+    /* A live writer's ticket names the catalog version to read. No
+     * ticket (a clean close deletes it), a stale one (a dead writer) or
+     * one without a revision (an older writer) vouches for none: the
+     * view reads the store's current catalog. */
+    int live = t && sp_ticket_integer(t, SP_T_REVISION, &revision)
+        && !sp_ticket_is_stale(t, now, if_absent);
+    const char *etag = live ? sp_ticket_text(t, SP_T_CATALOG_ETAG) : NULL;
+    const char *run = t ? sp_ticket_text(t, SP_T_RUN) : NULL;
+    if (t) sp_ticket_integer(t, SP_T_STORED_ROW, &stored);
+    v->has_ticket = t != NULL;
+    v->has_ts = t && sp_ticket_number(t, SP_T_TS, &v->ts);
+    if (!t || !sp_ticket_number(t, SP_T_BEAT_SECONDS, &v->beat)
+        || v->beat == 0)
+        v->beat = SP_VIEW_POLL_DEFAULT_SECONDS;
+
+    int64_t seam = stored;
+    int use_ring = 0, why = SP_SEAM_AS_WANTED;
+    if (v->memory && live && run && ring_run && strcmp(run, ring_run) == 0)
+        seam = sp_view_seam(t, window, &use_ring, &why);
+    view_note_ring(v, why, stored, window);
+    if (!t || !sp_ticket_number(t, SP_T_KEEP_SECONDS, &keep) || keep == 0)
+        keep = keep_if_absent;
+    double repoint = keep * SP_VIEW_REPOINT_SHARE;
+
+    /* The unfinished files the text reads: those that begin at or
+     * before the seam, each up to the seam. A file keeps the checkpoint
+     * version the text already names until the seam moves or that
+     * version has been replaced for `repoint` seconds: every version
+     * holds the rows up to the seam it was named for. */
+    int32_t n = t ? t->n_files : 0;
+    ViewFacts next;
+    memset(&next, 0, sizeof next);
+    ViewNamed *keeps = n ? calloc((size_t)n, sizeof *keeps) : NULL;
+    next.pieces = n ? calloc((size_t)n, sizeof *next.pieces) : NULL;
+    int32_t n_keeps = 0;
+    int oom = n && (!keeps || !next.pieces);
+    int moved = !v->has_named_seam || seam != v->named_seam;
+    for (int32_t i = 0; !oom && i < n; i++) {
+        const TicketFile *f = &t->files[i];
+        if (f->has_first_row && f->first_row > seam)
+            continue;                     /* after the seam: the ring has it */
+        const char *key = (files && files[i]) ? files[i] : f->checkpoint;
+        const char *path = f->checkpoint;
+        double since = 0;
+        int has_since = 0;
+        const ViewNamed *old = NULL;
+        for (int32_t k = 0; k < v->n_named; k++)
+            if (strcmp(v->named[k].file, key) == 0) old = &v->named[k];
+        if (old && !moved && strcmp(old->path, path) != 0) {
+            since = old->has_since ? old->since : mono;
+            if (mono - since < repoint) {
+                path = old->path;         /* still there: keep naming it */
+                has_since = 1;
+            }
+        }
+        ViewNamed *kept = NULL;
+        for (int32_t k = 0; k < n_keeps; k++)
+            if (strcmp(keeps[k].file, key) == 0) kept = &keeps[k];
+        char *mine = copy_text(path, strlen(path));
+        if (kept) {
+            if (mine) { free(kept->path); kept->path = mine; }
+        } else {
+            kept = &keeps[n_keeps];
+            kept->file = copy_text(key, strlen(key));
+            kept->path = mine;
+            if (kept->file) n_keeps++;
+        }
+        kept->since = since;
+        kept->has_since = has_since;
+        ViewPiece *p = &next.pieces[next.n_pieces];
+        p->path = copy_text(path, strlen(path));
+        p->has_last_row = f->has_first_row;
+        p->last_row = f->has_first_row ? seam - f->first_row : 0;
+        if (!mine || !kept->file || !p->path) {
+            if (!kept->file) free(mine);
+            free(p->path);
+            p->path = NULL;
+            oom = 1;
+            break;
+        }
+        next.n_pieces++;
+    }
+    next.live = live;
+    next.seam = seam;
+    next.use_ring = use_ring;
+    if (!oom && etag && !(next.etag = copy_text(etag, strlen(etag)))) oom = 1;
+    if (!oom && run && !(next.run = copy_text(run, strlen(run)))) oom = 1;
+    if (oom) {
+        named_clear(keeps, n_keeps);
+        facts_clear(&next);
+        return -1;
+    }
+    named_clear(v->named, v->n_named);
+    v->named = keeps;
+    v->n_named = n_keeps;
+    v->named_seam = seam;
+    v->has_named_seam = 1;
+    facts_clear(&v->plan);
+    v->plan = next;
+    if (out) {
+        /* a view of no live writer is made again at every look: the
+         * store's current catalog may be another */
+        out->build = !(live && v->is_built && facts_same(&v->plan, &v->built));
+        out->catalog = !live ? SP_CATALOG_CURRENT
+            : (etag ? SP_CATALOG_EXACT : SP_CATALOG_NONE);
+        out->seam = seam;
+        out->use_ring = use_ring;
+    }
+    return 0;
+}
+
+const char *sp_view_catalog_etag(const SpView *v) {
+    return v ? v->plan.etag : NULL;
+}
+
+/* SQL text in single quotes: each quote doubled. */
+static void text_sql_quoted(Text *b, const char *s) {
+    for (; *s; s++) {
+        if (*s == '\'') text_put(b, "''", 2);
+        else text_put(b, s, 1);
+    }
+}
+
+char *sp_view_sql(const SpView *v, const char *catalog, char *err,
+                  size_t errlen) {
+    if (!v) { fail(err, errlen, "no view"); return NULL; }
+    const ViewFacts *f = &v->plan;
+    Text b = {0};
+    int pieces = 0;
+#define PIECE() do { \
+        text_str(&b, pieces++ ? " UNION ALL BY NAME (" : "("); } while (0)
+    text_str(&b, "CREATE OR REPLACE VIEW \"");
+    text_str(&b, v->name);
+    text_str(&b, "\" AS ");
+    if (catalog) {
+        PIECE();
+        text_str(&b, "SELECT * FROM \"");
+        text_str(&b, catalog);
+        text_str(&b, "\".data)");
+    }
+    for (int32_t i = 0; i < f->n_pieces; i++) {
+        PIECE();
+        if (!f->pieces[i].has_last_row) {
+            text_str(&b, "SELECT * FROM read_parquet('pqc://");
+            text_sql_quoted(&b, f->pieces[i].path);
+            text_str(&b, "'))");
+        } else {
+            /* the file up to the seam: DuckDB opens no object of the
+             * file past that row */
+            text_str(&b, "SELECT * EXCLUDE (file_row_number) FROM "
+                         "read_parquet('pqc://");
+            text_sql_quoted(&b, f->pieces[i].path);
+            text_str(&b, "', file_row_number=true) "
+                         "WHERE file_row_number <= ");
+            text_integer(&b, f->pieces[i].last_row);
+            text_str(&b, ")");
+        }
+    }
+    if (f->use_ring && v->memory) {
+        /* The view reads the store up to the seam and the ring after
+         * it. If the ring begins past the row after the seam, rows are
+         * in neither: the query fails, it does not answer short. */
+        PIECE();
+        text_str(&b, "SELECT * EXCLUDE (_seq, _first) FROM \"");
+        text_str(&b, v->memory);
+        text_str(&b, "\" WHERE _seq > ");
+        text_integer(&b, f->seam);
+        text_str(&b, " AND CASE WHEN _first > ");
+        text_integer(&b, f->seam + 1);
+        text_str(&b, " THEN error('");
+        text_sql_quoted(&b, v->name);
+        text_str(&b, ": the ring does not hold row ");
+        text_integer(&b, f->seam + 1);
+        text_str(&b, "; it begins at row ' || _first || '. This query read "
+                     "the rows up to ");
+        text_integer(&b, f->seam);
+        text_str(&b, " from the store. Either it reached the ring after the "
+                     "stream had written more rows than the ring keeps for "
+                     "a running query, or this reader connected a moment "
+                     "ago and the store has not reached its first row yet. "
+                     "Run it again; for longer queries connect with a "
+                     "larger MemoryOptions(lookback=...).') ELSE true END)");
+    }
+    if (!pieces) {
+        if (!v->empty) {
+            free(b.p);
+            fail(err, errlen, "%s: '%s' has no catalog, no unfinished file "
+                 "and no memory yet; nothing to read the columns from",
+                 v->name, v->stream);
+            return NULL;
+        }
+        PIECE();
+        text_str(&b, "SELECT * FROM \"");
+        text_str(&b, v->empty);
+        text_str(&b, "\")");
+    }
+#undef PIECE
+    if (b.oom) {
+        free(b.p);
+        fail(err, errlen, "%s: memory is out", v->name);
+        return NULL;
+    }
+    return b.p;
+}
+
+void sp_view_built(SpView *v) {
+    if (!v) return;
+    ViewFacts copy;
+    memset(&copy, 0, sizeof copy);
+    const ViewFacts *f = &v->plan;
+    copy.live = f->live;
+    copy.seam = f->seam;
+    copy.use_ring = f->use_ring;
+    int oom = 0;
+    if (f->etag && !(copy.etag = copy_text(f->etag, strlen(f->etag)))) oom = 1;
+    if (f->run && !(copy.run = copy_text(f->run, strlen(f->run)))) oom = 1;
+    if (f->n_pieces) {
+        copy.pieces = calloc((size_t)f->n_pieces, sizeof *copy.pieces);
+        if (!copy.pieces) oom = 1;
+    }
+    for (int32_t i = 0; !oom && i < f->n_pieces; i++) {
+        copy.pieces[i] = f->pieces[i];
+        copy.pieces[i].path = copy_text(f->pieces[i].path,
+                                        strlen(f->pieces[i].path));
+        if (!copy.pieces[i].path) oom = 1;
+        else copy.n_pieces++;
+    }
+    facts_clear(&v->built);
+    if (oom) {                            /* the next look builds again */
+        facts_clear(&copy);
+        v->is_built = 0;
+        return;
+    }
+    v->built = copy;
+    v->is_built = 1;
+}
+
+int64_t sp_view_seam_row(const SpView *v) {
+    return (v && v->is_built) ? v->built.seam : -1;
+}
+
+const char *sp_view_ring_note(const SpView *v) { return v ? v->note : ""; }
+
+double sp_view_wait_seconds(const SpView *v, double now) {
+    /* no live writer: nothing says when the store changes next */
+    if (!v || !v->has_ticket || !v->plan.live)
+        return SP_VIEW_POLL_DEFAULT_SECONDS;
+    double due = (v->has_ts ? v->ts : 0) + v->beat
+        + SP_VIEW_POLL_MARGIN_SECONDS - now;
+    if (due < SP_VIEW_POLL_MIN_SECONDS) due = SP_VIEW_POLL_MIN_SECONDS;
+    double most = v->beat + SP_VIEW_POLL_MARGIN_SECONDS;
+    return due < most ? due : most;
+}
+
+double sp_view_failed(SpView *v, const char *why) {
+    if (v && !v->failed) {
+        v->failed = 1;
+        view_say(v, SP_LOG_ERROR, "[%s] view %s could not follow the "
+                 "ticket: %s", v->stream, v->name, why ? why : "?");
+    }
+    return SP_VIEW_POLL_MIN_SECONDS;
+}
+
+void sp_view_followed(SpView *v) {
+    if (!v || !v->failed) return;
+    v->failed = 0;
+    view_say(v, SP_LOG_INFO, "[%s] view %s current again", v->stream,
+             v->name);
 }

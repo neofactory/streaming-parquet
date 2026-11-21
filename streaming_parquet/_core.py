@@ -125,6 +125,27 @@ const char *sp_reader_state_name(int state);
 const char *sp_reader_reason(const SpReader *r);
 const char *sp_reader_run(const SpReader *r);
 int sp_reader_message(SpReader *r, char *msg, size_t msglen);
+typedef struct SpView SpView;
+typedef struct { int build; int catalog; int64_t seam; int use_ring; } SpViewPlan;
+int64_t sp_view_seam(const SpTicket *t, const int64_t *window, int *use_ring,
+                     int *why);
+SpView *sp_view_new(const char *view, const char *stream, const char *memory,
+                    const char *empty);
+void sp_view_free(SpView *v);
+int sp_view_plan(SpView *v, const SpTicket *t, const char *const *files,
+                 const char *ring_run, const int64_t *window, double now,
+                 double mono, double if_absent, double keep_if_absent,
+                 SpViewPlan *out);
+const char *sp_view_catalog_etag(const SpView *v);
+char *sp_view_sql(const SpView *v, const char *catalog, char *err,
+                  size_t errlen);
+void sp_view_built(SpView *v);
+int64_t sp_view_seam_row(const SpView *v);
+const char *sp_view_ring_note(const SpView *v);
+double sp_view_wait_seconds(const SpView *v, double now);
+double sp_view_failed(SpView *v, const char *why);
+void sp_view_followed(SpView *v);
+int sp_view_message(SpView *v, char *msg, size_t msglen);
 """)
 
 
@@ -552,6 +573,111 @@ class Reader:
         msg = ffi.new("char[]", _MSGLEN)
         while True:
             level = lib.sp_reader_message(self._r, msg, _MSGLEN)
+            if not level:
+                return out
+            out.append((level, ffi.string(msg).decode("utf-8", "replace")))
+
+
+# ---- the view (core/sp.h: THE VIEW) ---------------------------------------
+
+SEAM_WHY = (None, 'tight', 'short', 'late')
+CATALOG_NONE, CATALOG_EXACT, CATALOG_CURRENT = 0, 1, 2
+
+
+def _window(window):
+    return ffi.new("int64_t[3]", list(window)) if window is not None else ffi.NULL
+
+
+def view_seam(ticket, window):
+    """(seam, use_ring, why) for a ticket dict (or None) and a ring's
+    (oldest row, newest row, capacity) (or None): where a view changes
+    from the store to the ring. why: None, 'tight', 'short' or 'late'."""
+    use, why = ffi.new("int *"), ffi.new("int *")
+    seam = lib.sp_view_seam(_from_dict(ticket) if ticket is not None
+                            else ffi.NULL, _window(window), use, why)
+    return seam, bool(use[0]), SEAM_WHY[why[0]]
+
+
+class ViewPlan:
+    """What a look decided: build (the text must change), catalog
+    (CATALOG_*), etag (for CATALOG_EXACT), seam, use_ring."""
+    __slots__ = ("build", "catalog", "etag", "seam", "use_ring")
+
+
+class View:
+    """A view's rules: what its text names, the text, when to look
+    again. The calls are made under the host's lock for the view."""
+
+    def __init__(self, view, stream, memory, empty):
+        def text(s):
+            return s.encode() if s is not None else ffi.NULL
+        self._v = ffi.gc(lib.sp_view_new(view.encode(), stream.encode(),
+                                         text(memory), text(empty)),
+                         lib.sp_view_free)
+        if self._v == ffi.NULL:
+            raise MemoryError("view")
+        self._plan = ffi.new("SpViewPlan *")
+
+    def plan(self, ticket, files, ring_run, window, now, mono, if_absent,
+             keep_if_absent):
+        """files: for each of the ticket's files, the path of the file
+        its checkpoint belongs to."""
+        keys = [ffi.new("char[]", f.encode()) for f in files]
+        if lib.sp_view_plan(
+                self._v,
+                _from_dict(ticket) if ticket is not None else ffi.NULL,
+                ffi.new("const char *[]", keys) if keys else ffi.NULL,
+                ring_run.encode() if ring_run is not None else ffi.NULL,
+                _window(window), now, mono, if_absent, keep_if_absent,
+                self._plan) != 0:
+            raise MemoryError("view plan")
+        out = ViewPlan()
+        out.build = bool(self._plan.build)
+        out.catalog = self._plan.catalog
+        e = lib.sp_view_catalog_etag(self._v)
+        out.etag = ffi.string(e).decode() if e != ffi.NULL else None
+        out.seam = self._plan.seam
+        out.use_ring = bool(self._plan.use_ring)
+        return out
+
+    def sql(self, catalog):
+        """The statement for the plan; ValueError when there is nothing
+        to read the columns from."""
+        err = _err()
+        p = lib.sp_view_sql(self._v, catalog.encode() if catalog is not None
+                            else ffi.NULL, err, _ERRLEN)
+        if p == ffi.NULL:
+            raise ValueError(ffi.string(err).decode(errors="replace"))
+        try:
+            return ffi.string(p).decode()
+        finally:
+            lib.sp_free(p)
+
+    def built(self):
+        lib.sp_view_built(self._v)
+
+    @property
+    def seam(self):
+        return lib.sp_view_seam_row(self._v)
+
+    @property
+    def ring_note(self):
+        return ffi.string(lib.sp_view_ring_note(self._v)).decode() or None
+
+    def wait_seconds(self, now):
+        return lib.sp_view_wait_seconds(self._v, now)
+
+    def failed(self, why):
+        return lib.sp_view_failed(self._v, str(why).encode("utf-8", "replace"))
+
+    def followed(self):
+        lib.sp_view_followed(self._v)
+
+    def messages(self):
+        out = []
+        msg = ffi.new("char[]", _MSGLEN)
+        while True:
+            level = lib.sp_view_message(self._v, msg, _MSGLEN)
             if not level:
                 return out
             out.append((level, ffi.string(msg).decode("utf-8", "replace")))

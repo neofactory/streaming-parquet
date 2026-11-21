@@ -1020,7 +1020,7 @@ def _ring_sizes(name, ring_rows, row_group_rows):
         the next quarter     the store's lag: a view reads from the
                              ring every row the store does not have yet
         the oldest quarter   the time a running query has: a view does
-                             not start in it (_views.RING_MARGIN_SHARE)
+                             not start in it (SP_VIEW_RING_MARGIN_SHARE, core/sp.h)
 
     Given neither size, DuckDB's row group; given one, the other
     follows; given both, a ring under two row groups is refused."""

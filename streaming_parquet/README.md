@@ -104,8 +104,8 @@ One margin for each hazard:
 
 | What it guards | Margin | Where |
 |---|---|---|
-| A reader and the ring | A quarter of the ring | `_views.RING_MARGIN_SHARE` |
-| A reader and the store | 10 minutes: the store keeps an object that long after the list stops naming it, and a view looks again every 5 | `parquet_checkpoint.SUPERSEDED_KEEP_S`, `_views.REPOINT_SHARE` |
+| A reader and the ring | A quarter of the ring | `SP_VIEW_RING_MARGIN_SHARE` (core/sp.h) |
+| A reader and the store | 10 minutes: the store keeps an object that long after the list stops naming it, and a view looks again every 5 | `parquet_checkpoint.SUPERSEDED_KEEP_S`, `SP_VIEW_REPOINT_SHARE` (core/sp.h) |
 | A dead writer | Three beats, at least 30 seconds | `pqc_dead_after` in the C core (`parquet_checkpoint.dead_after`, Go `pqc.DeadAfter`) |
 
 A beat is the longest time between two writes of the writer's ticket
@@ -225,6 +225,14 @@ extension, so the connection is opened with
 `allow_unsigned_extensions`), and memory: the ring's rows after the
 seam, same run only. `duckdb_archive(con)` is the files alone;
 `duckdb_live(con)` is memory alone.
+
+**How long a view lives.** Until `view.close()`, or the end of the
+process. Closing the stream or the reader it was made from does not
+close it: the view goes on answering from what is there (the store's
+files; for `duckdb_live`, the rows the ring held), and with no live
+writer it looks at the store every 15 seconds. The rules of the view
+(the seam, the versions its text names, the text, when it looks again)
+are in the stream core (`core/sp.h`, THE VIEW).
 
 **The seam.** To the extent that rows are in the ring, the view uses
 them. The seam is the oldest row boundary the store has that is above
@@ -565,7 +573,9 @@ exists: `connect("plant/line-1/press")` waits when the store holds anything
 under `plant/line-1` (a ticket or a file) or this process has a stream
 there, and a name with no folder always waits. A name in a folder that
 does not exist is a wrong path, and `connect` raises `ValueError` at
-once. A reader that waits says so: one log line when the wait starts,
+once; the error names the folder. A folder is made the first time a
+writer of a stream under it runs, so in a new store the writer starts
+before its readers. A reader that waits says so: one log line when the wait starts,
 one warning when it has waited 30 seconds, and `standing()` gives the
 reason at any time. When the writer starts again (a new run in the
 ticket) the reader starts on a fresh ring, since row numbers start
