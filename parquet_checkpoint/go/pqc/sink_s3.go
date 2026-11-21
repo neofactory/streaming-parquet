@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
 
 const (
@@ -253,4 +254,44 @@ func IsNotFound(err error) bool {
 	var nk *types.NoSuchKey
 	var nf *types.NotFound
 	return errors.As(err, &nk) || errors.As(err, &nf)
+}
+
+// GetVersion: the object and its ETag.
+func (s *S3Sink) GetVersion(name string) ([]byte, string, error) {
+	out, err := s.client.GetObject(s.ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.Bucket), Key: aws.String(s.key(name))})
+	if err != nil {
+		if IsNotFound(err) {
+			return nil, "", nil
+		}
+		return nil, "", fmt.Errorf("s3 get %s: %w", name, err)
+	}
+	defer out.Body.Close()
+	b, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("s3 get %s: %w", name, err)
+	}
+	return b, aws.ToString(out.ETag), nil
+}
+
+// PutIfVersion: a put conditioned on the ETag (If-Match), or on there
+// being no object (If-None-Match: *).
+func (s *S3Sink) PutIfVersion(name string, data []byte, version string) (string, error) {
+	in := &s3.PutObjectInput{
+		Bucket: aws.String(s.Bucket), Key: aws.String(s.key(name)), Body: bytes.NewReader(data)}
+	if version == "" {
+		in.IfNoneMatch = aws.String("*")
+	} else {
+		in.IfMatch = aws.String(version)
+	}
+	out, err := s.client.PutObject(s.ctx, in)
+	if err != nil {
+		var ae smithy.APIError
+		if errors.As(err, &ae) && (ae.ErrorCode() == "PreconditionFailed" ||
+			ae.ErrorCode() == "ConditionalRequestConflict") {
+			return "", fmt.Errorf("s3://%s/%s: %w", s.Bucket, s.key(name), ErrChanged)
+		}
+		return "", fmt.Errorf("s3 put %s: %w", name, err)
+	}
+	return aws.ToString(out.ETag), nil
 }

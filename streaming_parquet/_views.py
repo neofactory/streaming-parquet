@@ -377,7 +377,8 @@ class StoreView:
                 wait = self._rules.wait_seconds(time.time())
             if src.revisions is not None:
                 seen = self._seen_revision
-                got = src.revisions.wait_ticket_revision(seen, wait)
+                got = src.revisions.wait_ticket_revision(
+                    seen, wait, self._stop.is_set)
                 if got is not None and got == seen:
                     # the source closed: no revision comes from it again
                     self._stop.wait(wait)

@@ -2402,6 +2402,30 @@ def _():
         and "the ring is in use again" in said[0][1], said
 
 
+@test("view.close() returns at once and ends the view's thread, also "
+      "when the stream has no live writer and the view's next look is "
+      "15 seconds away")
+def _():
+    flat = pa.schema([("n", pa.int64())])
+    with tempfile.TemporaryDirectory() as root:
+        _catalog_writer_run(root, flat, [[pa.array(range(10))]],
+                            name="v2test/vclose")
+        con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+        a = sp.connect("v2test/vclose", store=root)
+        view = a.duckdb_archive(con)
+        try:
+            assert con.sql(f"SELECT count(*) FROM {view.name}").fetchall() == [(10,)]
+            time.sleep(0.3)             # the thread is in its wait
+            t0 = time.monotonic()
+        finally:
+            view.close()
+        took = time.monotonic() - t0
+        a.close()
+        con.close()
+        assert took < 1.0, f"view.close() took {took:.1f} s"
+        assert not view._thread.is_alive(), "the view's thread is still alive"
+
+
 @test("a view lives until view.close(): after its stream closes it still "
       "answers every row, and its thread waits")
 def _():

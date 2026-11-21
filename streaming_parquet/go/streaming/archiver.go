@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -38,6 +39,7 @@ type archiver struct {
 	label      string
 	wp         *writePlan
 	store      *storeState // what the store holds, for the ticket; the owner's
+	cat        *catalog    // the catalog of the finished files; nil = none is kept
 	lostBefore int64       // rows lost under this stream's earlier options
 
 	// The writes owed, oldest first: each a row range, pinned when it
@@ -111,7 +113,12 @@ func ringSizes(name string, ringRows, rowGroupRows int64) (int64, int64, error) 
 // newArchiver takes o.RowGroupRows as settled by ringSizes.
 // store is the owner's record of what the store holds, which outlives
 // one archiver; nil makes one for this archiver alone.
-func newArchiver(r *ring.Ring, name, run string, o ParquetOptions, store *storeState) (*archiver, error) {
+//
+// catFor answers the catalog of the files in a folder; nil (a reader
+// that writes files) keeps none: a finished file's checkpoints are
+// deleted at once, and no ticket names the file after it.
+func newArchiver(r *ring.Ring, name, run string, o ParquetOptions, store *storeState,
+	catFor func(sink pqc.Sink, folder string) *catalog) (*archiver, error) {
 	if store == nil {
 		store = newStoreState(pqc.SupersededKeep)
 	}
@@ -158,8 +165,14 @@ func newArchiver(r *ring.Ring, name, run string, o ParquetOptions, store *storeS
 		compression:     comp,
 		dictionary:      o.Dictionary,
 	}
+	if catFor != nil {
+		a.cat = catFor(sink, strings.TrimSuffix(location, "/")+"/")
+	}
 	if err := a.bootSweep(); err != nil {
 		return nil, err
+	}
+	if a.cat != nil {
+		a.cat.poke() // the start's pass: every finished file the catalog lacks
 	}
 	return a, nil
 }
@@ -187,8 +200,31 @@ func (a *archiver) bootSweep() error {
 	}
 	swept := map[string]bool{}
 	for _, n := range names {
-		if final, _, ok := pqc.ParseCkptObject(n); ok && !swept[final] {
+		if final, version, ok := pqc.ParseCkptObject(n); ok && !swept[final] {
 			swept[final] = true
+			if a.cat != nil {
+				// A file whose final copy is beside its checkpoints was
+				// finished before a crash; either way the checkpoints
+				// stay until the catalog lists the file.
+				status := "kept"
+				if !a.sink.Exists(final) {
+					if status, err = pqc.FinalizeKeep(final, a.sink); err != nil {
+						return fmt.Errorf("boot sweep %s: %w", final, err)
+					}
+				}
+				vs, err := pqc.CkptVersions(a.sink, final)
+				if err != nil {
+					return fmt.Errorf("boot sweep %s: %w", final, err)
+				}
+				if len(vs) > 0 {
+					_, version, _ = pqc.ParseCkptObject(vs[len(vs)-1].Object)
+					a.store.kept(final, version, vs[len(vs)-1].Object)
+				}
+				a.cat.await(final)
+				fmt.Fprintf(os.Stderr, "[%s] boot sweep: %s %s\n",
+					a.name, status, a.location+"/"+final)
+				continue
+			}
 			status, err := pqc.Finalize(final, a.sink)
 			if err != nil {
 				return fmt.Errorf("boot sweep %s: %w", final, err)
@@ -263,6 +299,12 @@ func (a *archiver) noteStored() {
 	_, version, _ := pqc.ParseCkptObject(ck)
 	a.store.stored(a.fileName, version, ck, int64(a.w.RowsFinal()),
 		int64(a.w.RowsCheckpointed()))
+	if a.cat != nil {
+		// a step that writes to the store: a failed pass tries again,
+		// and checkpoints kept long enough are deleted
+		a.cat.poke()
+		a.cat.discardDue()
+	}
 }
 
 // work is one write the archiver owes: the rows [lo, hi), held by a
@@ -545,10 +587,27 @@ func (a *archiver) rotate() error {
 	if err != nil {
 		return err
 	}
-	err = a.w.Close(empty)
-	// finished in the store, or (on an error) left for the next start's
-	// sweep: no ticket of this run names it again
-	a.store.finished(a.fileName)
+	if a.cat != nil {
+		// finished with its checkpoints kept: the file stays in the
+		// ticket until the catalog lists it
+		rows := int64(a.w.RowsFinal())
+		if err = a.w.CloseKeep(empty); err == nil {
+			// the ticket names the last version, the one the file was made from
+			if vs, verr := pqc.CkptVersions(a.sink, a.fileName); verr == nil && len(vs) > 0 {
+				obj := vs[len(vs)-1].Object
+				_, version, _ := pqc.ParseCkptObject(obj)
+				a.store.stored(a.fileName, version, obj, rows, rows)
+			}
+			a.cat.await(a.fileName)
+		} else {
+			a.store.finished(a.fileName) // left for the next start's sweep
+		}
+	} else {
+		err = a.w.Close(empty)
+		// finished in the store, or (on an error) left for the next start's
+		// sweep: no ticket of this run names it again
+		a.store.finished(a.fileName)
+	}
 	a.w = nil
 	a.fileName = ""
 	return err

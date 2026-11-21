@@ -124,6 +124,18 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.mu.Lock()
+		// the conditional put: If-Match an ETag, or If-None-Match: *
+		have, exists := f.objects[bucket+"/"+key]
+		if m := r.Header.Get("If-Match"); m != "" && (!exists || etag(have) != m) {
+			f.mu.Unlock()
+			f.fail(w, http.StatusPreconditionFailed, "PreconditionFailed", key)
+			return
+		}
+		if r.Header.Get("If-None-Match") == "*" && exists {
+			f.mu.Unlock()
+			f.fail(w, http.StatusPreconditionFailed, "PreconditionFailed", key)
+			return
+		}
 		f.objects[bucket+"/"+key] = body // atomic replace
 		f.mu.Unlock()
 		w.Header().Set("ETag", etag(body))

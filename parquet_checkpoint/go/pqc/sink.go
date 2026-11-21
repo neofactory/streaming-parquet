@@ -3,6 +3,7 @@ package pqc
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -32,6 +33,24 @@ type Sink interface {
 	PartMin() uint64
 	Sub(prefix string) Sink // the same sink rooted deeper (streams/<name>/)
 	URI() string            // where this sink's names resolve, for tickets and logs
+}
+
+// ErrChanged: the object is not the version the caller named.
+var ErrChanged = errors.New("the object changed since it was read")
+
+// Versioned is a sink that reads an object with its version and
+// replaces it only if it is still that version. A stream's catalog is
+// published this way. A version is text the sink makes; a directory's
+// is the file's size and modification time ("<size>-<mtime ns>", the
+// same text the Python host makes), a bucket's is the object's ETag.
+type Versioned interface {
+	// GetVersion: the object's bytes and version; a nil error and ""
+	// for the version when there is no such object.
+	GetVersion(name string) ([]byte, string, error)
+	// PutIfVersion writes the object if it is still `version` (""
+	// means: if there is none) and answers the new version;
+	// ErrChanged when it is another.
+	PutIfVersion(name string, data []byte, version string) (string, error)
 }
 
 // DirSink is a local directory: atomic replace via rename, assembly
@@ -189,4 +208,55 @@ func (d *DirSink) Assemble(dest string, sources []Source) error {
 		}
 		return nil
 	})
+}
+
+func (d *DirSink) version(p string) (string, error) {
+	st, err := os.Stat(p)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%d-%d", st.Size(), st.ModTime().UnixNano()), nil
+}
+
+// GetVersion: one writer per stream makes the size and time enough.
+func (d *DirSink) GetVersion(name string) ([]byte, string, error) {
+	p := filepath.Join(d.Root, name)
+	f, err := os.Open(p)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, "", nil
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	defer f.Close()
+	st, err := f.Stat() // the version of the file opened
+	if err != nil {
+		return nil, "", err
+	}
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return nil, "", err
+	}
+	return b, fmt.Sprintf("%d-%d", st.Size(), st.ModTime().UnixNano()), nil
+}
+
+func (d *DirSink) PutIfVersion(name string, data []byte, version string) (string, error) {
+	p, err := d.path(name)
+	if err != nil {
+		return "", err
+	}
+	have, err := d.version(p)
+	if err != nil {
+		return "", err
+	}
+	if have != version {
+		return "", fmt.Errorf("%s: %w", p, ErrChanged)
+	}
+	if err := d.Put(name, data); err != nil {
+		return "", err
+	}
+	return d.version(p)
 }

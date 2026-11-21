@@ -387,6 +387,69 @@ func (st *storeState) finished(file string) {
 	C.sp_store_finished(st.p, cf)
 }
 
+// kept: a file an earlier run finished, found beside its checkpoint
+// version; readers may have been told of it.
+func (st *storeState) kept(file string, version int, checkpoint string) {
+	cf, cc := C.CString(file), C.CString(checkpoint)
+	defer C.free(unsafe.Pointer(cf))
+	defer C.free(unsafe.Pointer(cc))
+	wall := float64(time.Now().UnixNano()) / 1e9
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	C.sp_store_stored(st.p, cf, C.int64_t(version), cc, 0, C.double(wall))
+}
+
+// awaits: the file is finished in the store with its checkpoints kept;
+// it stays in the ticket until the catalog lists it.
+func (st *storeState) awaits(file string) {
+	cf := C.CString(file)
+	defer C.free(unsafe.Pointer(cf))
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	C.sp_store_awaits(st.p, cf)
+}
+
+// listed: a published catalog lists the file. True when the file was
+// awaiting that: it now leaves the ticket.
+func (st *storeState) listed(file string) bool {
+	cf := C.CString(file)
+	defer C.free(unsafe.Pointer(cf))
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return C.sp_store_listed(st.p, cf) == 1
+}
+
+// dropped: the ticket without the listed files is written.
+func (st *storeState) dropped() {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	C.sp_store_dropped(st.p, C.double(monoNow()))
+}
+
+// due: the files whose checkpoints are due for deletion now.
+func (st *storeState) due() []string {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	var out []string
+	now := C.double(monoNow())
+	for i := 0; ; i++ {
+		p := C.sp_store_due(st.p, now, C.int32_t(i))
+		if p == nil {
+			return out
+		}
+		out = append(out, C.GoString(p))
+	}
+}
+
+// discarded: the file's checkpoints are deleted.
+func (st *storeState) discarded(file string) {
+	cf := C.CString(file)
+	defer C.free(unsafe.Pointer(cf))
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	C.sp_store_discarded(st.p, cf)
+}
+
 // fill puts what the store holds into t: the stored row and when, the
 // keep time, the files. where is the stream's folder, ending in "/".
 func (st *storeState) fill(t *Ticket, where string) error {

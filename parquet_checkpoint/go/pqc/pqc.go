@@ -372,7 +372,14 @@ func (w *Writer) FileBytes() uint64 { return uint64(C.pqc_logical_end(w.w)) }
 // Close publishes a final checkpoint of the final rows (empty writers
 // get a valid empty file via an empty mini) and finalizes. The writer
 // is freed.
-func (w *Writer) Close(emptyMini []byte) error {
+func (w *Writer) Close(emptyMini []byte) error { return w.close(emptyMini, false) }
+
+// CloseKeep is Close, but the file's chunks and checkpoint versions
+// stay beside the finished file, for readers that were told of them:
+// DiscardCheckpoints deletes them later.
+func (w *Writer) CloseKeep(emptyMini []byte) error { return w.close(emptyMini, true) }
+
+func (w *Writer) close(emptyMini []byte, keep bool) error {
 	defer w.Free()
 	w.DropUnfinished()
 	var empty []byte
@@ -382,7 +389,7 @@ func (w *Writer) Close(emptyMini []byte) error {
 	if _, err := w.checkpoint(empty); err != nil {
 		return err
 	}
-	_, err := Finalize(w.name, w.sink)
+	_, err := finalize(w.name, w.sink, keep)
 	return err
 }
 
@@ -480,7 +487,58 @@ func (r *Reader) AssemblyPlan(ckptName string) []Source {
 // holds, versions deleted last, crash-orphaned chunks swept. Same
 // refusals as the Python finalize (both-exist, mispaired,
 // missing/wrong-size chunk).
-func Finalize(name string, sink Sink) (string, error) {
+func Finalize(name string, sink Sink) (string, error) { return finalize(name, sink, false) }
+
+// FinalizeKeep is Finalize, but the chunks and checkpoint versions stay
+// beside the finished file (the Python finalize(keep_checkpoints=True)):
+// DiscardCheckpoints deletes them later.
+func FinalizeKeep(name string, sink Sink) (string, error) { return finalize(name, sink, true) }
+
+// DiscardCheckpoints deletes a finished file's chunks and checkpoint
+// versions, kept while readers were told of them. It refuses unless the
+// finished file exists: the checkpoints would be its only copy.
+func DiscardCheckpoints(name string, sink Sink) error {
+	if !sink.Exists(name) {
+		return fmt.Errorf("DiscardCheckpoints(%q): the final file does not "+
+			"exist -- the checkpoints are its only copy", name)
+	}
+	versions, err := CkptVersions(sink, name)
+	if err != nil {
+		return err
+	}
+	used := ""
+	if len(versions) > 0 {
+		used = versions[len(versions)-1].Object
+	}
+	return deleteCheckpoints(name, sink, versions, used)
+}
+
+// deleteCheckpoints: every chunk under the file's prefix, then every
+// version, the one named `used` last.
+func deleteCheckpoints(name string, sink Sink, versions []Version, used string) error {
+	chunks, err := sink.List(name + ".chunks/")
+	if err != nil {
+		return err
+	}
+	for _, c := range chunks {
+		if err := sink.Delete(c); err != nil {
+			return err
+		}
+	}
+	for _, v := range versions {
+		if v.Object != used {
+			if err := sink.Delete(v.Object); err != nil {
+				return err
+			}
+		}
+	}
+	if used != "" {
+		return sink.Delete(used) // last act
+	}
+	return nil
+}
+
+func finalize(name string, sink Sink, keep bool) (string, error) {
 	versions, err := CkptVersions(sink, name)
 	if err != nil {
 		return "", err
@@ -525,23 +583,10 @@ func Finalize(name string, sink Sink) (string, error) {
 	if err := sink.Assemble(name, r.AssemblyPlan(used)); err != nil {
 		return "", err
 	}
-	chunks, err := sink.List(name + ".chunks/")
-	if err != nil {
-		return "", err
+	if keep {
+		return "recovered", nil
 	}
-	for _, c := range chunks {
-		if err := sink.Delete(c); err != nil {
-			return "", err
-		}
-	}
-	for _, v := range versions {
-		if v.Object != used {
-			if err := sink.Delete(v.Object); err != nil {
-				return "", err
-			}
-		}
-	}
-	if err := sink.Delete(used); err != nil { // last act
+	if err := deleteCheckpoints(name, sink, versions, used); err != nil {
 		return "", err
 	}
 	return "recovered", nil

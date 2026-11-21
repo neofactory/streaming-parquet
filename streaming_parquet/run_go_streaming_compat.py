@@ -42,6 +42,7 @@ import streaming_parquet as sp
 # fails if they differ.
 import filecmp
 CORE_COPIES = [(os.path.join(PKG, 'core', 'sp.c'), os.path.join(GO, 'streaming', 'sp_core.c')),
+               (os.path.join(PKG, 'core', 'sp_catalog.c'), os.path.join(GO, 'streaming', 'sp_catalog.c')),
                (os.path.join(PKG, 'core', 'sp.h'), os.path.join(GO, 'streaming', 'sp.h'))]
 for src, dst in CORE_COPIES:
     if not os.path.exists(dst) or not filecmp.cmp(src, dst, shallow=False):
@@ -363,6 +364,59 @@ def _():
             con.close()
         child.wait(timeout=40)
         assert child.returncode == 0, child.stderr.read()
+
+
+@test("a Go writer's finished files reach a Python view through the "
+      "catalog the Go writer published: every row once, each file's run "
+      "and first row in it, and a Python writer then adds its file to "
+      "the same catalog")
+def _():
+    import duckdb
+    import sqlite3
+    d = os.path.join(ROOT, 'streams', 'x', 'gocat')
+    child = subprocess.run([BIN, 'serve', ROOT, 'x/gocat', '3000', '1', 'pq'],
+                           capture_output=True, text=True, timeout=60)
+    assert child.returncode == 0, child.stderr
+    assert 'catalog: listed' in child.stderr, child.stderr
+    files = sorted(n for n in os.listdir(d) if n.endswith('.parquet'))
+    assert files, os.listdir(d)
+    db = sqlite3.connect(os.path.join(d, 'catalog.sqlite'))
+    listed = db.execute("select path from ducklake_data_file order by path").fetchall()
+    runs = db.execute("select run, first_row from sp_file order by first_row").fetchall()
+    db.close()
+    assert [os.path.basename(p[0]) for p in listed] == files, (listed, files)
+    assert runs[0][1] == 0 and len({r[0] for r in runs}) == 1 and runs[0][0], runs
+    con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+    a = sp.connect('x/gocat', store=ROOT)       # no writer: the store alone
+    rel = a.duckdb_archive(con)
+    try:
+        got = con.sql(f"SELECT count(*), count(DISTINCT n), min(n), max(n) "
+                      f"FROM {rel.name}").fetchall()[0]
+        assert got == (3000, 3000, 0, 2999), got
+    finally:
+        rel.close()
+        a.close()
+    # a Python writer takes the stream over: its file joins the Go catalog
+    s = sp.create_stream('x/gocat', SCHEMA, store=ROOT,
+                         memory=sp.MemoryOptions(lookback=500),
+                         parquet=sp.ParquetOptions(checkpoint_seconds=0.05))
+    try:
+        s.append(pa.record_batch([pa.array([3000, 3001]), pa.array([0.5, 1.5]),
+                                  pa.array(['a', 'b'])], schema=SCHEMA))
+        s.cut()
+        deadline = time.time() + 20
+        while s._parquet.catalog.files != len(files) + 1:
+            assert s.archive_state().catalog_error is None, \
+                s.archive_state().catalog_error
+            assert time.time() < deadline, s._parquet.catalog.files
+            time.sleep(0.05)
+    finally:
+        s.close()
+    con.execute(f"ATTACH 'ducklake:sqlite:{os.path.join(d, 'catalog.sqlite')}' "
+                f"AS lk (READ_ONLY)")
+    got = con.sql("SELECT count(*), count(DISTINCT n), max(n) FROM lk.data").fetchall()[0]
+    con.close()
+    assert got == (3002, 3002, 3001), got
 
 
 @test("the Go package's copies of the stream core are the core")

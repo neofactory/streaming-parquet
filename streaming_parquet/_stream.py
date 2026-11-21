@@ -282,13 +282,16 @@ class Stream:
     def ticket_revision(self):
         return self._ticket_revision
 
-    def wait_ticket_revision(self, seen, timeout):
+    def wait_ticket_revision(self, seen, timeout, stopped=None):
         """Until this writer's ticket revision differs from `seen`
         (returns it) or `timeout` seconds pass (returns None) -- the
-        writer's own views follow its ticket this way, in memory."""
+        writer's own views follow its ticket this way, in memory.
+        `stopped`: the waiter's own "stop now"; it ends the wait when
+        the waiter notifies _revision_cond."""
         with self._revision_cond:
             if self._revision_cond.wait_for(
-                    lambda: self._ticket_revision != seen or self._closed,
+                    lambda: (self._ticket_revision != seen or self._closed
+                             or (stopped is not None and stopped())),
                     timeout):
                 return self._ticket_revision
         return None

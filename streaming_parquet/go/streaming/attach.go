@@ -390,7 +390,7 @@ func (a *Attached) receive(tk *Ticket) error {
 		}
 		a.ring, a.ownRing = r, true
 		if a.archOpt != nil {
-			arch, err := newArchiver(r, a.Name, tk.Run, *a.archOpt, nil)
+			arch, err := newArchiver(r, a.Name, tk.Run, *a.archOpt, nil, nil)
 			if err != nil {
 				a.mu.Unlock()
 				return err

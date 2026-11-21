@@ -60,6 +60,12 @@ type Stream struct {
 	ticketNow chan struct{}
 	// counts this run's writes of the ticket; every Flight answer carries it
 	ticketRevision atomic.Int64
+	ticketBegun    atomic.Int64 // the revision of the newest write begun
+	ticketStored   atomic.Int64 // the revision of the newest write that worked
+
+	// The catalogs of the stream's finished files, one for each folder
+	// it wrote files to (catalog.go). Under mu.
+	catalogs map[string]*catalog
 
 	// The writer lock (owner.go): taken the first time the stream is
 	// published or starts a file, held until Close.
@@ -318,6 +324,10 @@ type ArchiveState struct {
 	LostRows int64
 	Location string
 	File     string
+	// The catalog of the finished files: how many the published one
+	// lists, and its last pass's failure ("" when fine).
+	CatalogFiles int
+	CatalogError string
 }
 
 // ArchiveState answers the standing of the stream's parquet files: a
@@ -329,6 +339,9 @@ func (s *Stream) ArchiveState() ArchiveState {
 		Location: s.location.Load().(string), File: s.file}
 	if s.arch != nil {
 		st.LostRows = s.arch.lost()
+		if s.arch.cat != nil {
+			st.CatalogFiles, st.CatalogError = s.arch.cat.state()
+		}
 	}
 	return st
 }
@@ -394,12 +407,55 @@ func (s *Stream) unpublish() {
 	s.tel.flight.unregister(s.Name)
 }
 
+// catalogFor answers the catalog of the files in folder, made the first
+// time the stream writes there. The caller holds mu.
+func (s *Stream) catalogFor(sink pqc.Sink, folder string) *catalog {
+	if c := s.catalogs[folder]; c != nil {
+		return c
+	}
+	c := newCatalog(s.Name, folder, sink, s.store, s.ticketWritten)
+	if c != nil {
+		if s.catalogs == nil {
+			s.catalogs = map[string]*catalog{}
+		}
+		s.catalogs[folder] = c
+	}
+	return c
+}
+
+// ticketWritten has the ticket written now, and answers true once a
+// write that began after this call is in the store. A stream that is
+// not published, or that has no store for tickets, has no ticket: true
+// at once. False after 5 seconds.
+func (s *Stream) ticketWritten() bool {
+	s.pubMu.Lock()
+	published := s.published
+	s.pubMu.Unlock()
+	if !published || s.tel.tickets == nil {
+		return true
+	}
+	begun := s.ticketBegun.Load()
+	deadline := time.Now().Add(5 * time.Second)
+	for s.ticketStored.Load() <= begun {
+		select {
+		case s.ticketNow <- struct{}{}:
+		default:
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return true
+}
+
 func (s *Stream) heartbeat(stop chan struct{}) {
 	defer s.hbDone.Done()
 	tick := time.NewTicker(heartbeatInterval)
 	defer tick.Stop()
 	pub := func() {
 		revision := s.ticketRevision.Load() + 1
+		s.ticketBegun.Store(revision)
 		t := Ticket{
 			Name: s.Name, Host: localIP(), Port: s.tel.flight.port,
 			Ts:          float64(time.Now().UnixNano()) / 1e9,
@@ -410,11 +466,13 @@ func (s *Stream) heartbeat(stop chan struct{}) {
 			Archive:     s.location.Load().(string)}
 		s.mu.Lock()
 		where := ""
+		var cat *catalog
 		if s.arch != nil {
 			where = strings.TrimSuffix(s.arch.location, "/") + "/"
 			if s.arch.recording() {
 				t.CheckpointSeconds = s.arch.ckptSeconds
 			}
+			cat = s.arch.cat
 		}
 		s.mu.Unlock()
 		if where != "" {
@@ -423,9 +481,16 @@ func (s *Stream) heartbeat(stop chan struct{}) {
 				fmt.Fprintf(os.Stderr, "[%s] ticket: %v\n", s.Name, err)
 			}
 		}
+		if cat != nil {
+			// read after the files, as the Python host does: a file the
+			// ticket leaves out is in this catalog version
+			t.CatalogEtag = cat.version()
+		}
 		if err := s.tel.tickets.put(s.Name, t); err != nil {
 			fmt.Fprintf(os.Stderr, "[%s] ticket publish error: %v\n",
 				s.Name, err)
+		} else {
+			s.ticketStored.Store(revision)
 		}
 		// after the write: a reader told of a revision finds it in the store
 		s.ticketRevision.Store(revision)
@@ -490,7 +555,7 @@ func (s *Stream) StartParquet(label string, o *ParquetOptions) error {
 		}
 		lost = s.arch.lost()
 	}
-	arch, err := newArchiver(s.ring, s.Name, s.run, opts, s.store)
+	arch, err := newArchiver(s.ring, s.Name, s.run, opts, s.store, s.catalogFor)
 	if err != nil {
 		return err
 	}
@@ -599,8 +664,18 @@ func (s *Stream) Close() error {
 		s.wrote(err)
 		s.arch.abandon() // a store that is failing: the pins go with the ring
 	}
+	var cats []*catalog
+	for _, c := range s.catalogs {
+		cats = append(cats, c)
+	}
 	s.mu.Unlock()
 	s.io.Unlock()
+
+	// The catalog lists the last file before the stream goes, when it
+	// can in a few seconds; the ticket must still be there for it.
+	for _, c := range cats {
+		c.finish(catalogCloseWait)
+	}
 
 	s.pubMu.Lock()
 	s.unpublish()

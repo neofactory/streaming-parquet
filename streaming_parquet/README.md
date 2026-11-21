@@ -371,6 +371,13 @@ assumed role included). The files are the source of truth; the catalog
 can be rebuilt from their footers. A catalog of the earlier kind
 (`catalog.ducklake`, a DuckDB file) is not read and not changed.
 
+The Go writer keeps the same catalog in the same way (`go/streaming/catalog.go`):
+a Python view reads a Go writer's finished files through it, and a
+writer in either language adds to a catalog the other started. Both
+need the system's SQLite library (Ubuntu: `libsqlite3-dev` to build).
+A Go reader that writes files (`Attach` with parquet options) keeps no
+catalog.
+
 ## Parquet encodings
 
 The writer's defaults, the same in Python and Go, chosen for sensor

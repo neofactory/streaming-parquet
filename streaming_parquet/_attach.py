@@ -462,12 +462,15 @@ class _Feeder:
                                            daemon=True)
         self._lifecycle.start()
 
-    def wait_ticket_revision(self, seen, timeout):
+    def wait_ticket_revision(self, seen, timeout, stopped=None):
         """Until the ticket revision differs from `seen` (returns it) or
-        `timeout` seconds pass (returns None)."""
+        `timeout` seconds pass (returns None). `stopped`: the waiter's
+        own "stop now"; it ends the wait when the waiter notifies
+        _revision_cond."""
         with self._revision_cond:
             if self._revision_cond.wait_for(
-                    lambda: self.ticket_revision != seen or self._closed,
+                    lambda: (self.ticket_revision != seen or self._closed
+                             or (stopped is not None and stopped())),
                     timeout):
                 return self.ticket_revision
         return None
