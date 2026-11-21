@@ -61,7 +61,7 @@ class ParquetOptions:
     compression: dict forwarded to the parquet writer (compression,
             compression_level, use_dictionary, column_encoding).
     catalog_copy_seconds: the interval of the catalog's dated copies,
-            catalog.<YYYYMMDD-HHMMSS>.ducklake beside it, each made only
+            catalog.<YYYYMMDD-HHMMSS>.sqlite beside it, each made only
             if the catalog changed since the newest one. None = no copies.
     """
     checkpoint_seconds: Optional[float] = None

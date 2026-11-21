@@ -1,59 +1,54 @@
 """The catalog: one DuckLake catalog per stream, listing its finished files.
 
-    <store>/streams/<name>/catalog.ducklake
+    <store>/streams/<name>/catalog.sqlite
 
-A DuckDB database file in DuckLake's format. One table, `data`, whose
-files are the stream's finished parquet files, registered in place by
-their full path (DuckLake records the path as given). DuckDB reads only
-the files a query needs: the catalog holds each file's row count and
-each column's minimum and maximum.
+A SQLite database that holds a DuckLake 1.0 catalog (core/sp.h: THE
+CATALOG). One table, `data`, whose files are the stream's finished
+parquet files, each by its full path. DuckDB reads it with
+ATTACH 'ducklake:sqlite:<file>' and opens only the files a query needs:
+the catalog holds each file's row count and each column's minimum and
+maximum.
 
-The writer keeps a working copy on local disk and publishes the whole
-file after registering new files. On a bucket the upload succeeds only
-if the stored object's ETag is still the one this writer last saw (a
-create-only upload the first time); a refusal means someone else
-changed it, so the writer fetches it again, reconciles and retries. A
-directory store's catalog is replaced atomically (os.replace), so a
-reader holding the old file keeps reading the old file.
-
-The working copy has 16 KB blocks, DuckDB's smallest. With DuckDB's
-default 256 KB blocks the catalogs were 6.8-8.4 MB for 0.1-0.2 MB of
-rows, mostly part-used and free blocks; with 16 KB blocks the same
-catalogs are 0.4-0.7 MB, and every registration uploads the whole file
-(2026-11-03). A catalog published with other blocks is copied into
-16 KB blocks once, on its fetch, and published.
+The core writes the catalog; this module does the reads and writes. No
+writer needs DuckDB. A pass brings the catalog's bytes from the store,
+lists the stream's finished files, reads the footer of each file the
+catalog lacks (a file's last 64 KB in one read; a longer footer takes a
+second read), gives it to the core, and publishes the new bytes. On a
+bucket the upload succeeds only if the stored object's ETag is still
+the one this writer last saw (a create-only upload the first time); a
+refusal means someone else changed it, so the writer fetches it again,
+reconciles and retries. A directory store's catalog is replaced
+atomically (os.replace), so a reader holding the old file keeps reading
+the old file.
 
 The files are the source of truth. Every pass reconciles: it lists the
-stream's finished files in the store and registers each one the
-catalog lacks, so a crash between a file finishing and its catalog
-upload, a leftover finished at start, and the files already in a
-bucket all come out the same way.
+stream's finished files in the store and adds each one the catalog
+lacks, so a crash between a file finishing and its catalog upload, a
+leftover finished at start, and the files already in a bucket all come
+out the same way. A folder that holds only a catalog of the earlier
+kind (catalog.ducklake, a DuckDB file) gets a new catalog.sqlite from
+its files the same way; the earlier one is left as it is.
 
-Catalog work is slow (each registration reads a file's footer from the
-store; a first pass over a full bucket takes about a minute) so each
-pass runs on a thread of its own, never on the worker pool that carries
+A first pass over a full bucket reads one footer per file, so each pass
+runs on a thread of its own, never on the worker pool that carries
 Flight pushes and parquet writes. A stream has at most one pass queued
 or running; different streams' passes run at the same time (one thread
 for all of them made the streams' uploads wait on each other: 4 s of
-one publisher's exit on 2026-11-02). A
-pass with many files reports its progress every few seconds, on the
-console and in the log. A stream's close stops its pass between two
-files (stop()); the next start's reconcile finishes the work. The
-process must never exit while the catalog thread is inside DuckDB: a
-thread stopped there aborts the process ("terminate called ...
-exception not rethrown", 2026-10-27 on the box).
+one publisher's exit on 2026-11-02). A pass with many files reports its
+progress every few seconds, on the console and in the log. A stream's
+close stops its pass between two files (stop()); the next start's
+reconcile finishes the work.
 
-Dated copies, catalog.<YYYYMMDD-HHMMSS>.ducklake beside it, keep the
+Dated copies, catalog.<YYYYMMDD-HHMMSS>.sqlite beside it, keep the
 catalog's history: once the copy interval has passed since the newest
 copy, the next pass copies the published catalog, but only if it
 differs from that copy (a bucket copies the object itself; nothing is
 uploaded twice). The interval counts from the newest copy's own name,
 so a restart makes no extra copy.
 
-A file whose columns the table lacks gets them added first
-(ALTER TABLE ADD COLUMN), so no column is ever hidden; a file missing a
-column registers with nulls in it; a column whose type changed refuses
-the file, loudly, in archive_state().catalog_error.
+A file with a column the table lacks adds it, so no column is ever
+hidden; a file missing a column reads as null in it; a column whose
+type changed refuses the file, loudly, in archive_state().catalog_error.
 """
 
 import hashlib
@@ -63,11 +58,12 @@ import threading
 import time
 from datetime import datetime
 
+from . import _core
 from ._diag import _diag, console_print
 
-CATALOG = "catalog.ducklake"
+CATALOG = "catalog.sqlite"
 TABLE = "data"
-_COPY = re.compile(r"^catalog\.(\d{8}-\d{6})\.ducklake$")
+_COPY = re.compile(r"^catalog\.(\d{8}-\d{6})\.sqlite$")
 
 
 class Conflict(Exception):
@@ -82,8 +78,9 @@ class _Stopped(Exception):
         self.done, self.total = done, total
 
 
-#: The working copy's DuckDB block size: DuckDB's smallest.
-BLOCK_SIZE = 16 * 1024
+#: A file's footer is looked for in this many of its last bytes; a
+#: longer footer takes a second read.
+TAIL_BYTES = 64 * 1024
 
 #: A pass registering more files than this reports progress.
 PROGRESS_FILES = 10
@@ -106,39 +103,24 @@ class _S3Published:
         self._quick = _s3.client(_s3.QUICK)
         self._client_error = botocore.exceptions.ClientError
 
-    def duckdb_secret(self):
-        """(sql, values): CREATE SECRET for DuckDB's S3 reads, from boto3's credentials:
-        the ones this catalog's own S3 calls use. DuckDB's own credential
-        chain refuses an assume-role profile (role_arn + source_profile,
-        the box's): "Secret Validation Failure" (2026-10-27). boto3
-        assumes the role and renews it; each pass takes the current
-        set."""
-        c = self._session.get_credentials()
-        if c is None:
-            raise RuntimeError(
-                f"catalog s3://{self.bucket}/{self.key}: boto3 found no "
-                f"AWS credentials for DuckDB's S3 reads")
-        c = c.get_frozen_credentials()
-        token = f", SESSION_TOKEN '{c.token}'" if c.token else ""
-        return (f"CREATE SECRET (TYPE s3, KEY_ID '{c.access_key}', "
-                f"SECRET '{c.secret_key}'{token}, "
-                f"REGION '{self._quick.meta.region_name}')"), \
-            [v for v in (c.access_key, c.secret_key, c.token) if v]
+    def tail(self, path, n):
+        """(the file's size, its last `n` bytes or all of it)."""
+        key = path[len(f"s3://{self.bucket}/"):]
+        r = self._timed("get", key, lambda: self._transfer.get_object(
+            Bucket=self.bucket, Key=key, Range=f"bytes=-{n}"),
+            detail=f" last {n}B")
+        data = r["Body"].read()
+        size = int(r["ContentRange"].rsplit("/", 1)[1]) \
+            if r.get("ContentRange") else len(data)
+        return size, data
 
-    def give_duckdb(self, con):
-        """Run duckdb_secret() on `con`. A refusal is reported with the
-        credential values cut out: DuckDB quotes the failing SQL."""
-        import duckdb
-        sql, values = self.duckdb_secret()
-        try:
-            con.execute(sql)
-        except duckdb.Error as e:
-            msg = str(e)
-            for v in values:
-                msg = msg.replace(v, "<redacted>")
-            raise RuntimeError(
-                f"catalog s3://{self.bucket}/{self.key}: DuckDB refused "
-                f"the S3 secret made from boto3's credentials: {msg}") from None
+    def span(self, path, start, n):
+        """`n` bytes of the file from `start`."""
+        key = path[len(f"s3://{self.bucket}/"):]
+        r = self._timed("get", key, lambda: self._transfer.get_object(
+            Bucket=self.bucket, Key=key,
+            Range=f"bytes={start}-{start + n - 1}"), detail=f" {n}B")
+        return r["Body"].read()
 
     def get(self):
         """(bytes, etag), or None when there is no catalog yet."""
@@ -226,6 +208,17 @@ class _DirPublished:
         os.replace(tmp, self.path)
         return self._etag()
 
+    def tail(self, path, n):
+        with open(path, "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            f.seek(max(0, size - n))
+            return size, f.read()
+
+    def span(self, path, start, n):
+        with open(path, "rb") as f:
+            f.seek(start)
+            return f.read(n)
+
     def content_id(self, name):
         p = os.path.join(os.path.dirname(self.path), name)
         try:
@@ -249,15 +242,13 @@ class Catalog:
 
     folder:    the stream's folder in the store, ending in '/': a local
                directory, or s3://bucket/streams/<name>/.
-    work_path: the local working copy.
     retry_s:   after a failed pass, the next one waits this long.
     copy_s:    the dated copies' interval; None = no copies.
     """
 
-    def __init__(self, name, folder, work_path, retry_s, copy_s):
+    def __init__(self, name, folder, retry_s, copy_s):
         self.name = name
         self.folder = folder
-        self._work = work_path
         self._retry_s = retry_s
         self._copy_s = copy_s
         self._copies_scanned = False    # the folder's dated copies looked at once
@@ -274,7 +265,7 @@ class Catalog:
         self._lock = threading.Lock()
         self._wanted = True             # a pass is owed (start: reconcile)
         self._queued = False
-        self._fetched = False           # working copy == the published one
+        self._cat = None                # the core's catalog, from the published bytes
         self._failed_mono = None
         self._done = threading.Event()
         self.etag = None                # the published catalog's, after our last upload
@@ -351,7 +342,7 @@ class Catalog:
                 _COPY.match, self._published.list_names()) if m)
             self._copies_scanned = True
             if stamps:
-                self._newest_copy = f"catalog.{stamps[-1]}.ducklake"
+                self._newest_copy = f"catalog.{stamps[-1]}.sqlite"
                 self._copy_tw = time.mktime(
                     datetime.strptime(stamps[-1], "%Y%m%d-%H%M%S").timetuple())
         if not self._copy_due():
@@ -362,7 +353,7 @@ class Catalog:
             self._copy_seen = self.etag     # unchanged since that copy
             return
         now_tw = _clock_now()
-        name = f"catalog.{datetime.fromtimestamp(now_tw).strftime('%Y%m%d-%H%M%S')}.ducklake"
+        name = f"catalog.{datetime.fromtimestamp(now_tw).strftime('%Y%m%d-%H%M%S')}.sqlite"
         self._published.copy(name)
         self._newest_copy, self._copy_tw, self._copy_seen = name, now_tw, self.etag
         _diag.info(f"[{self.name}] catalog: dated copy {self.folder}{name}")
@@ -386,14 +377,14 @@ class Catalog:
                     _diag.warning(f"[{self.name}] catalog: {e} changed since "
                                   f"this writer's last upload; fetching it "
                                   f"again and reconciling")
-                    self._fetched = False
+                    self._cat = None
                 except _Stopped as e:
                     msg = (f"[{self.name}] catalog pass {e}; the next "
                            f"start's reconcile finishes it")
                     _diag.info(msg)
                     console_print(f"[streaming-parquet] {msg}")
-                    # registrations in the working copy, never published
-                    self._fetched = False
+                    # files added in memory, never published
+                    self._cat = None
                     break
             else:
                 raise RuntimeError("the published catalog changed under "
@@ -413,9 +404,9 @@ class Catalog:
                 _diag.error(f"[{self.name}] catalog failing: {e}")
             self.error = str(e)
             self._failed_mono = time.monotonic()
-            # the working copy may hold registrations never published:
+            # the catalog in memory may hold files never published:
             # the next pass starts again from the published catalog
-            self._fetched = False
+            self._cat = None
             with self._lock:
                 self._wanted = True
         finally:
@@ -431,111 +422,50 @@ class Catalog:
                 self._start()
 
     def _pass(self):
-        import duckdb
-        reblocked = False
-        if not self._fetched:
+        if self._cat is None:
             got = self._published.get()
-            os.makedirs(os.path.dirname(self._work), exist_ok=True)
-            for stale in (self._work, self._work + ".wal"):
-                if os.path.exists(stale):
-                    os.remove(stale)
-            if got is not None:
-                data, self.etag = got
-                with open(self._work, "wb") as f:
-                    f.write(data)
-            else:
-                self.etag = None
-            reblocked = self._small_blocks()
-            self._fetched = True
-        finished = self._list_finished()
-        con = duckdb.connect()
-        try:
-            if self._bucket is not None:
-                self._published.give_duckdb(con)
-            con.execute(f"ATTACH 'ducklake:{self._work}' AS lake "
-                        f"(DATA_PATH '{self.folder}')")
-            known = {r[0] for r in con.execute(
-                "SELECT path FROM __ducklake_metadata_lake.ducklake_data_file "
-                "WHERE end_snapshot IS NULL").fetchall()}
-            todo = [p for p in finished if p not in known]
-            self._register_all(con, todo)
-            listed = len(known) + len(todo)
-            names = {p.rsplit("/", 1)[-1] for p in known | set(todo)}
-            # recent changes sit in the database's write-ahead log until
-            # a checkpoint; the published copy is the main file alone
-            con.execute("CHECKPOINT __ducklake_metadata_lake")
-            con.execute("DETACH lake")
-        finally:
-            con.close()
-        if not todo and not reblocked:
-            self.files = listed
+            data, self.etag = got if got is not None else (b"", None)
+            try:
+                self._cat = _core.Catalog(data, self.folder, _clock_now())
+            except _core.CatalogError as e:
+                raise RuntimeError(f"{self.folder}{CATALOG} is not a "
+                                   f"catalog this library reads: {e}") from None
+        cat = self._cat
+        todo = [p for p in self._list_finished() if not cat.lists(p)]
+        self._register_all(cat, todo)
+        paths = cat.files()
+        names = {p.rsplit("/", 1)[-1] for p in paths}
+        if not todo:
+            self.files = len(paths)
             if self.etag is not None:   # a published catalog lists them
                 self._listed = names
             self._copy_pass()
             return
-        if os.path.exists(self._work + ".wal"):
-            raise RuntimeError(f"{self._work}.wal still exists after the "
-                               f"checkpoint: the main file would miss changes; "
-                               f"not publishing it")
-        with open(self._work, "rb") as f:
-            data = f.read()
+        data = cat.to_bytes(_clock_now())
         self.etag = self._published.put(data, self.etag)
-        self.files = listed             # what the PUBLISHED catalog lists
+        self.files = len(paths)         # what the PUBLISHED catalog lists
         self._listed = names
-        _diag.info(f"[{self.name}] catalog: registered {len(todo)} file(s), "
-                   f"{listed} in all; published "
+        _diag.info(f"[{self.name}] catalog: listed {len(todo)} file(s), "
+                   f"{len(paths)} in all; published "
                    f"{self.folder}{CATALOG} ({len(data) / 1e6:.1f} MB)")
         self._copy_pass()
 
-    def _small_blocks(self):
-        """Give the working copy BLOCK_SIZE blocks: a new one is created
-        with them; one with other blocks is copied into them. True when
-        it was copied (the published catalog must be replaced)."""
-        import duckdb
-        con = duckdb.connect()
-        try:
-            if not os.path.exists(self._work):
-                con.execute(f"ATTACH '{self._work}' AS new "
-                            f"(BLOCK_SIZE {BLOCK_SIZE})")
-                return False
-            con.execute(f"ATTACH '{self._work}' AS old (READ_ONLY)")
-            had = con.execute("SELECT block_size FROM pragma_database_size() "
-                              "WHERE database_name = 'old'").fetchone()[0]
-            if had == BLOCK_SIZE:
-                return False
-            tmp = self._work + ".blocks"
-            for stale in (tmp, tmp + ".wal"):
-                if os.path.exists(stale):
-                    os.remove(stale)
-            con.execute(f"ATTACH '{tmp}' AS new (BLOCK_SIZE {BLOCK_SIZE})")
-            con.execute("COPY FROM DATABASE old TO new")
-            con.execute("DETACH new")
-        finally:
-            con.close()
-        before = os.path.getsize(self._work)
-        os.replace(tmp, self._work)
-        _diag.info(f"[{self.name}] catalog: copied from {had // 1024} KB "
-                   f"blocks into {BLOCK_SIZE // 1024} KB blocks "
-                   f"({before / 1e6:.1f} MB -> "
-                   f"{os.path.getsize(self._work) / 1e6:.1f} MB); publishing it")
-        return True
-
-    def _register_all(self, con, todo):
-        """Register `todo` (full paths), stopping between files when the
-        stream closes; a long pass reports its progress."""
+    def _register_all(self, cat, todo):
+        """List `todo` (full paths) in `cat`, stopping between files
+        when the stream closes; a long pass reports its progress."""
         total = len(todo)
         self.progress = (0, total)
         loud = total > PROGRESS_FILES
         t0 = last = time.monotonic()
         if loud:
-            msg = (f"[{self.name}] catalog: registering {total} file(s) "
+            msg = (f"[{self.name}] catalog: listing {total} file(s) "
                    f"from {self.folder} (each file's footer is read)")
             _diag.info(msg)
             console_print(f"[streaming-parquet] {msg}")
         for i, path in enumerate(todo):
             if self._stop.is_set():
                 raise _Stopped(i, total)
-            self._register(con, path)
+            self._register(cat, path)
             self.progress = (i + 1, total)
             now = time.monotonic()
             if loud and now - last >= PROGRESS_S and i + 1 < total:
@@ -543,30 +473,27 @@ class Catalog:
                 took = now - t0
                 left = took / (i + 1) * (total - i - 1)
                 msg = (f"[{self.name}] catalog: {i + 1} of {total} "
-                       f"registered, {took:.0f} s so far, about "
+                       f"listed, {took:.0f} s so far, about "
                        f"{left:.0f} s left")
                 _diag.info(msg)
                 console_print(f"[streaming-parquet] {msg}")
 
-    def _register(self, con, path):
-        cols = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{path}')"
-                           ).fetchall()
-        have = {r[0]: r[1] for r in con.execute(
-            "SELECT column_name, data_type FROM duckdb_columns() "
-            f"WHERE database_name = 'lake' AND table_name = '{TABLE}'"
-        ).fetchall()}
-        if not have:
-            # explicit columns, not CREATE TABLE AS: that makes a
-            # main/data/ folder under the data path, the stream's folder
-            con.execute(f"CREATE TABLE lake.{TABLE} (" + ", ".join(
-                f'"{col}" {typ}' for col, typ, *_ in cols) + ")")
-        else:
-            for col, typ, *_ in cols:
-                if col not in have:
-                    con.execute(f'ALTER TABLE lake.{TABLE} ADD COLUMN '
-                                f'"{col}" {typ}')
-        con.execute(f"CALL ducklake_add_data_files('lake', '{TABLE}', "
-                    f"'{path}', allow_missing => true)")
+    def _register(self, cat, path):
+        """Read the footer of the file at `path` and list the file."""
+        try:
+            size, tail = self._published.tail(path, TAIL_BYTES)
+            n = _core.footer_length(tail)
+            if n + 8 <= len(tail):
+                footer = tail[len(tail) - 8 - n:len(tail) - 8]
+            else:
+                footer = self._published.span(path, size - 8 - n, n)
+                if len(footer) != n:
+                    raise _core.CatalogError(
+                        f"the footer is {n} bytes and the store gave "
+                        f"{len(footer)}")
+            cat.add(path, size, footer)
+        except _core.CatalogError as e:
+            raise RuntimeError(str(e)) from None
 
     def _list_finished(self):
         """Full paths of the stream's finished files in the store, by name."""

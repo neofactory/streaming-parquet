@@ -318,7 +318,7 @@ class StoreView:
         if exact and self._catalogs and self._catalogs[-1][0] == etag:
             return self._catalogs[-1][1]
         self._k += 1
-        path = os.path.join(self._tmp, f"catalog.{self._k}.ducklake")
+        path = os.path.join(self._tmp, f"catalog.{self._k}.sqlite")
         got = _fetch_catalog(self._source.folder, etag if exact else None, path)
         if got is None:
             if exact:
@@ -328,7 +328,7 @@ class StoreView:
             os.remove(path)
             return self._catalogs[-1][1]
         alias = f"__sp_cat_{self._sid}_{self._k}"
-        self._cur.execute(f"ATTACH 'ducklake:{path}' AS \"{alias}\" (READ_ONLY)")
+        self._cur.execute(f"ATTACH 'ducklake:sqlite:{path}' AS \"{alias}\" (READ_ONLY)")
         self._catalogs.append((got, alias, path))
         return alias
 

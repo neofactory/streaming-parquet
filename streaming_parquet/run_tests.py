@@ -1543,7 +1543,7 @@ def _():
 
 def _catalog_rows(folder, sql="SELECT count(*), min(n), max(n) FROM b.data"):
     c = duckdb.connect()
-    c.execute(f"ATTACH 'ducklake:{os.path.join(folder, 'catalog.ducklake')}' "
+    c.execute(f"ATTACH 'ducklake:sqlite:{os.path.join(folder, 'catalog.sqlite')}' "
               f"AS b (READ_ONLY)")
     try:
         return c.execute(sql).fetchall()
@@ -1601,7 +1601,7 @@ def _():
         _catalog_writer_run(root, flat, [[pa.array(range(0, 10))],
                                          [pa.array(range(10, 25))]])
         d = os.path.join(root, "streams", "v2test", "cat")
-        os.remove(os.path.join(d, "catalog.ducklake"))
+        os.remove(os.path.join(d, "catalog.sqlite"))
         s = sp.create_stream("v2test/cat", flat, store=root,
                                     memory=MemoryOptions(lookback=500),
                                     parquet=ParquetOptions(checkpoint_seconds=0.05))
@@ -1653,7 +1653,7 @@ def _():
             s.append(pa.record_batch([pa.array(range(10))], schema=flat))
             s.cut()
             wait_for(lambda: s._parquet.catalog.files == 1, what="first file")
-            pub = os.path.join(d, "catalog.ducklake")
+            pub = os.path.join(d, "catalog.sqlite")
             shutil.copyfile(pub, pub + ".x")
             time.sleep(0.01)
             os.replace(pub + ".x", pub)         # someone else's upload: a new ETag
@@ -1671,7 +1671,7 @@ def _():
 def _():
     import re
     flat = pa.schema([("n", pa.int64())])
-    copy_name = re.compile(r"^catalog\.\d{8}-\d{6}\.ducklake$")
+    copy_name = re.compile(r"^catalog\.\d{8}-\d{6}\.sqlite$")
     with tempfile.TemporaryDirectory() as root:
         d = os.path.join(root, "streams", "v2test", "copy")
         def copies():
@@ -1697,7 +1697,7 @@ def _():
         finally:
             s.close()
         c = duckdb.connect()
-        c.execute(f"ATTACH 'ducklake:{os.path.join(d, copies()[-1])}' AS b (READ_ONLY)")
+        c.execute(f"ATTACH 'ducklake:sqlite:{os.path.join(d, copies()[-1])}' AS b (READ_ONLY)")
         assert c.sql("SELECT count(*) FROM b.data").fetchall()[0] == (20,)
     with tempfile.TemporaryDirectory() as root:
         _catalog_writer_run(root, flat, [[pa.array([1])]], name="v2test/nocopy")
@@ -1720,9 +1720,9 @@ def _slow_catalog(seconds_per_file):
     from streaming_parquet import _catalog
     orig = _catalog.Catalog._register
 
-    def slow(self, con, path):
+    def slow(self, cat, path):
         time.sleep(seconds_per_file)
-        return orig(self, con, path)
+        return orig(self, cat, path)
     _catalog.Catalog._register = slow
 
     def undo():
@@ -1745,8 +1745,7 @@ def _():
             undo()
         d = os.path.join(root, "streams", "v2test", "cstop")
         os.remove(os.path.join(d, _catalog.CATALOG))    # as if never published
-        work = os.path.join(root, "work.ducklake")
-        cat = _catalog.Catalog("v2test/cstop", d + "/", work, 1.0, None)
+        cat = _catalog.Catalog("v2test/cstop", d + "/", 1.0, None)
         undo = _slow_catalog(0.1)                       # 20 files: about 2 s
         try:
             cat.poke()
@@ -1763,56 +1762,53 @@ def _():
         assert not os.path.exists(os.path.join(d, _catalog.CATALOG)), \
             "a stopped pass published"
         # the next start: a fresh catalog reconciles all 20
-        cat2 = _catalog.Catalog("v2test/cstop", d + "/", work, 1.0, None)
+        cat2 = _catalog.Catalog("v2test/cstop", d + "/", 1.0, None)
         cat2.poke()
         assert cat2.wait(30.0) and cat2.error is None, cat2.error
         c = _duckdb.connect()
-        c.execute(f"ATTACH 'ducklake:{os.path.join(d, _catalog.CATALOG)}' "
+        c.execute(f"ATTACH 'ducklake:sqlite:{os.path.join(d, _catalog.CATALOG)}' "
                   f"AS b (READ_ONLY)")
         assert c.sql("SELECT count(*) FROM b.data").fetchall()[0] == (20,)
 
 
-def _block_size(path):
-    c = duckdb.connect()
-    try:
-        c.execute(f"ATTACH '{path}' AS f (READ_ONLY)")
-        return c.execute("SELECT block_size FROM pragma_database_size() "
-                         "WHERE database_name = 'f'").fetchone()[0]
-    finally:
-        c.close()
-
-
-@test("catalog: the catalog has 16 KB blocks; one published with 256 KB "
-      "blocks is copied into them once and published")
+@test("catalog: a SQLite file DuckDB attaches as DuckLake 1.0; the writer "
+      "leaves no other file; a folder with a catalog of the earlier kind "
+      "gets a new one from its files, and the earlier one stays as it is")
 def _():
+    import sqlite3
     from streaming_parquet import _catalog
     flat = pa.schema([("n", pa.int64())])
     with tempfile.TemporaryDirectory() as root:
         _catalog_writer_run(root, flat, [[pa.array(range(0, 10))],
                                          [pa.array(range(10, 25))]],
-                            name="v2test/blocks")
-        d = os.path.join(root, "streams", "v2test", "blocks")
+                            name="v2test/lite", )
+        d = os.path.join(root, "streams", "v2test", "lite")
         pub = os.path.join(d, _catalog.CATALOG)
-        assert _block_size(pub) == 16384, _block_size(pub)
-        # as a writer before 2026-11-03 published it: DuckDB's default blocks
-        old = os.path.join(root, "old.ducklake")
-        c = duckdb.connect()
-        c.execute(f"ATTACH '{pub}' AS a (READ_ONLY)")
-        c.execute(f"ATTACH '{old}' AS b (BLOCK_SIZE 262144)")
-        c.execute("COPY FROM DATABASE a TO b")
-        c.close()
-        os.replace(old, pub)
-        assert _block_size(pub) == 262144
-        work = os.path.join(root, "work.ducklake")
-        cat = _catalog.Catalog("v2test/blocks", d + "/", work, 1.0, None)
+        db = sqlite3.connect(pub)
+        assert db.execute("select value from ducklake_metadata where key = "
+                          "'version'").fetchall() == [("1.0",)]
+        runs = db.execute("select run, first_row from sp_file order by "
+                          "first_row").fetchall()
+        db.close()
+        assert [r[1] for r in runs] == [0, 10], runs
+        assert runs[0][0] and runs[0][0] == runs[1][0], runs
+        assert sorted(n for n in os.listdir(d) if n.startswith("catalog")
+                      and "." + n.split(".")[1] != ".sqlite"
+                      and not n.endswith(".sqlite")) == [], os.listdir(d)
+        # as a writer of the earlier library left the folder
+        os.remove(pub)
+        old = os.path.join(d, "catalog.ducklake")
+        with open(old, "wb") as f:
+            f.write(b"an earlier catalog")
+        cat = _catalog.Catalog("v2test/lite", d + "/", 1.0, None)
         cat.poke()
         assert cat.wait(10.0) and cat.error is None, cat.error
-        assert _block_size(pub) == 16384, _block_size(pub)
         assert cat.files == 2, cat.files
         assert _catalog_rows(d) == [(25, 0, 24)]
-        # copied once: the next writer's pass leaves it alone
+        assert open(old, "rb").read() == b"an earlier catalog"
+        # a second writer's pass with nothing new publishes nothing
         etag = cat.etag
-        cat2 = _catalog.Catalog("v2test/blocks", d + "/", work, 1.0, None)
+        cat2 = _catalog.Catalog("v2test/lite", d + "/", 1.0, None)
         cat2.poke()
         assert cat2.wait(10.0) and cat2.error is None, cat2.error
         assert cat2.etag == etag, (cat2.etag, etag)
@@ -1829,8 +1825,7 @@ def _():
                                 name=name)
             d = os.path.join(root, "streams", *name.split("/"))
             os.remove(os.path.join(d, _catalog.CATALOG))
-            cats.append(_catalog.Catalog(name, d + "/", os.path.join(
-                root, name.replace("/", "-") + ".ducklake"), 1.0, None))
+            cats.append(_catalog.Catalog(name, d + "/", 1.0, None))
         undo = _slow_catalog(0.3)                       # 5 files: 1.5 s a pass
         try:
             t0 = time.monotonic()
@@ -2096,7 +2091,7 @@ def _():
                 what="its checkpoints deleted")
             assert ticket()["catalog_etag"] is not None
             c = duckdb.connect()
-            c.execute(f"ATTACH 'ducklake:{os.path.join(d, _catalog.CATALOG)}' "
+            c.execute(f"ATTACH 'ducklake:sqlite:{os.path.join(d, _catalog.CATALOG)}' "
                       f"AS b (READ_ONLY)")
             assert c.sql("SELECT count(*) FROM b.data").fetchall()[0] == (20,)
         finally:
@@ -2129,7 +2124,7 @@ def _():
             wait_for(lambda: not parquet_checkpoint.ckpt_versions(
                 sink, "20260101-000000.parquet"), what="the kept checkpoints cleared")
             c = duckdb.connect()
-            c.execute(f"ATTACH 'ducklake:{os.path.join(d, _catalog.CATALOG)}' "
+            c.execute(f"ATTACH 'ducklake:sqlite:{os.path.join(d, _catalog.CATALOG)}' "
                       f"AS b (READ_ONLY)")
             assert c.sql("SELECT count(*) FROM b.data").fetchall()[0] == (7,)
         finally:

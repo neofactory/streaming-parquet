@@ -284,8 +284,8 @@ stream's name as the path inside:
   streams/<name>/<stamp>[-<label>].parquet          finished files
   streams/<name>/<stamp>[-<label>].parquet.<v>.ckpt checkpoint versions (each kept 10 minutes once superseded)
   streams/<name>/<stamp>[-<label>].parquet.chunks/  chunks while open
-  streams/<name>/catalog.ducklake                   the catalog of finished files
-  streams/<name>/catalog.<YYYYMMDD-HHMMSS>.ducklake dated copies
+  streams/<name>/catalog.sqlite                     the catalog of finished files
+  streams/<name>/catalog.<YYYYMMDD-HHMMSS>.sqlite   dated copies
 ```
 
 A name may carry a hierarchy (`plant/line-1/probe/voltages`),
@@ -343,7 +343,7 @@ chain applies; the public bucket needs none.
 |---|---|---|
 | `connect()` + `duckdb_all` on the publisher's network | the store + Flight | the catalog, the unfinished files, memory: every row, the live edge in its own ring |
 | `connect()` + `duckdb_archive` anywhere | the store, read-only credentials | every row the store holds, current within a beat |
-| plain DuckDB | the store | finished files, through `ATTACH 'ducklake:<store>/streams/<name>/catalog.ducklake'` |
+| plain DuckDB | the store | finished files, through `ATTACH 'ducklake:sqlite:<store>/streams/<name>/catalog.sqlite'` |
 | `live_table()` on the writer's machine | local disk | everything up to the local checkpoint |
 | any parquet tool | the store | finished files |
 
@@ -353,25 +353,23 @@ reader lists the store.
 
 ## The catalog
 
-One DuckLake catalog per stream, `streams/<name>/catalog.ducklake`, a
-DuckDB database with one table, `data`, listing the stream's finished
+One DuckLake 1.0 catalog per stream, `streams/<name>/catalog.sqlite`, a
+SQLite database with one table, `data`, listing the stream's finished
 files by full path with each file's row count and each column's minimum
-and maximum, so DuckDB reads only the files a query needs. The writer
-keeps a working copy on local disk, registers each finished file (on
-a thread of the stream's own, never the worker pool; streams' passes
-run at the same time) and uploads the whole file conditioned on the
-ETag it last saw. The working copy has 16 KB blocks, DuckDB's
-smallest: the catalog is a fraction of a MB where DuckDB's default
-256 KB blocks made it several MB; a catalog published with other
-blocks is copied into 16 KB blocks once and published. Every pass reconciles
-against the files in the store, so a crash, a leftover or files from
-before the catalog all come out the same way. A long pass reports its
-progress; a stream's close stops it between two files. Dated copies,
-`catalog.<YYYYMMDD-HHMMSS>.ducklake`, are made at
-`ParquetOptions(catalog_copy_seconds)` (a day) only when the catalog changed.
-DuckDB reads the store with boto3's credentials (an assumed role
-included). The files are the source of truth; the catalog can be
-rebuilt from their footers.
+and maximum, so DuckDB reads only the files a query needs. The C core
+writes it: the writer needs no DuckDB. A pass (on a thread of the
+stream's own, never the worker pool; streams' passes run at the same
+time) reads the footer of each finished file the catalog lacks and
+uploads the whole catalog conditioned on the ETag it last saw. Every
+pass reconciles against the files in the store, so a crash, a leftover
+or files from before the catalog all come out the same way. A long pass
+reports its progress; a stream's close stops it between two files.
+Dated copies, `catalog.<YYYYMMDD-HHMMSS>.sqlite`, are made at
+`ParquetOptions(catalog_copy_seconds)` (a day) only when the catalog
+changed. A view's DuckDB reads the files with boto3's credentials (an
+assumed role included). The files are the source of truth; the catalog
+can be rebuilt from their footers. A catalog of the earlier kind
+(`catalog.ducklake`, a DuckDB file) is not read and not changed.
 
 ## Parquet encodings
 

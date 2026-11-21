@@ -191,7 +191,6 @@ def create_stream(name, schema, store=None, spool=DEFAULT_SPOOL,
             folder = folder if folder.endswith("/") else folder + "/"
             writer.catalog = _catalog.Catalog(
                 name, folder,
-                os.path.join(lock_dir, "streams", name, "catalog.work.ducklake"),
                 retry_s=options.ship_seconds,
                 copy_s=options.catalog_copy_seconds)
             writer.catalog.on_listed = writer.cataloged

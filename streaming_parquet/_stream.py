@@ -852,7 +852,7 @@ class Stream:
 
         # The catalog lists the last file before the stream goes, when it
         # can in a few seconds; otherwise its pass stops between two files
-        # (the process must not exit inside DuckDB: _catalog) and the
+        # and the
         # next start's reconcile does the rest.
         if self._parquet is not None and self._parquet.catalog is not None:
             t0 = time.monotonic()
