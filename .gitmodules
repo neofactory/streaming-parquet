@@ -1,6 +1,6 @@
 [submodule "duckdb-checkpoint/duckdb"]
-	path = duckdb-checkpoint/duckdb
+	path = src/duckdb/duckdb
 	url = https://github.com/duckdb/duckdb
 [submodule "duckdb-checkpoint/extension-ci-tools"]
-	path = duckdb-checkpoint/extension-ci-tools
+	path = src/duckdb/extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools
