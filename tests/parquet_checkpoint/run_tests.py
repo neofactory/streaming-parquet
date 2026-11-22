@@ -1,6 +1,6 @@
 """Standalone test runner for parquet_checkpoint (no pytest).
 
-Run:  python3 packages/parquet_checkpoint/run_tests.py
+Run:  python3 tests/parquet_checkpoint/run_tests.py
 
 The manifest-format suite, per the README test plan: most tests run
 against BOTH sinks (DirSink for the volume tier, FakeS3 for S3
@@ -24,7 +24,9 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path[:0] = [os.path.join(REPO, "src", "python"),
+                os.path.join(REPO, "tests")]
 
 from parquet_checkpoint import (ckpt_versions,
                                 CheckpointError, CheckpointReader,

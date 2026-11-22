@@ -1,15 +1,16 @@
-"""CFFI binding of the stream core: core/sp.c, whose header sp.h is the
+"""CFFI binding of the stream core: src/core/sp.c, whose header sp.h is the
 spec.
 
 The core holds the rules of streaming-parquet that every host language
 shares, written once: formats and decisions, no input or output, no
 clock. This module is what the Python host calls; the Go host
-(go/streaming) calls the same core. A rule that is in the core is in no
+(src/go/streaming) calls the same core. A rule that is in the core is in no
 host.
 
 The library is built with `make` and the system C compiler the first
-time this module is imported, next to its sources (core/), like the
-ring's and the checkpoint core's.
+time this module is imported in a checkout, from its sources in
+src/core into this package, like the ring's and the checkpoint core's;
+`pip install` builds it at install.
 """
 
 import os
@@ -17,8 +18,10 @@ import subprocess
 
 import cffi
 
-_CORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'core')
-_LIB_PATH = os.path.join(_CORE_DIR, 'libsp.dylib')
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+# the library is beside this file; in a checkout its sources are in src/core
+_CORE_DIR = os.path.join(os.path.dirname(os.path.dirname(_PKG_DIR)), 'core')
+_LIB_PATH = os.path.join(_PKG_DIR, 'libsp.dylib')
 _ERRLEN = 256
 
 ffi = cffi.FFI()
@@ -169,12 +172,21 @@ uint8_t *sp_catalog_bytes(SpCatalog *c, double now, size_t *out_len,
 
 
 def _build_if_stale():
-    sources = [os.path.join(_CORE_DIR, n) for n in ('sp.c', 'sp.h')]
+    """In a checkout, build the library from src/core into this package
+    when a source is newer than it. An installed package has the
+    library and no sources: nothing to do."""
+    sources = [os.path.join(_CORE_DIR, n) for n in ('sp.c', 'sp_catalog.c', 'sp.h')]
+    if not all(os.path.exists(s) for s in sources):
+        if os.path.exists(_LIB_PATH):
+            return
+        raise ImportError(
+            f"{__package__}: no {_LIB_PATH} and no sources in {_CORE_DIR} "
+            f"to build it from; install the package again")
     if (os.path.exists(_LIB_PATH) and os.path.getmtime(_LIB_PATH)
             >= max(os.path.getmtime(s) for s in sources)):
         return
-    subprocess.run(['make', '-C', _CORE_DIR, 'libsp.dylib'], check=True,
-                   capture_output=True)
+    subprocess.run(['make', '-C', _CORE_DIR, f'OUT={_PKG_DIR}', 'libsp'],
+                   check=True, capture_output=True)
 
 
 _build_if_stale()
@@ -313,7 +325,7 @@ def ticket_is_stale(ticket, now, if_absent):
     return bool(lib.sp_ticket_is_stale(_from_dict(ticket), now, if_absent))
 
 
-# ---- the ownership decision (core/sp.h: THE OWNERSHIP DECISION) ----------
+# ---- the ownership decision (src/core/sp.h: THE OWNERSHIP DECISION) ----------
 
 OWN, TAKE_OVER, REFUSED = 0, 1, 2
 _MSGLEN = 2048
@@ -359,7 +371,7 @@ def ownership_unread(name, store, why):
     return ffi.string(msg).decode("utf-8", "replace")
 
 
-# ---- the write plan (core/sp.h: THE WRITE PLAN) --------------------------
+# ---- the write plan (src/core/sp.h: THE WRITE PLAN) --------------------------
 
 NOTHING, ROW_GROUP, CHECKPOINT = 0, 1, 2
 
@@ -424,7 +436,7 @@ class Writes:
         return lib.sp_writes_lost(self._w)
 
 
-# ---- what the store holds (core/sp.h: WHAT THE STORE HOLDS) --------------
+# ---- what the store holds (src/core/sp.h: WHAT THE STORE HOLDS) --------------
 
 class Store:
     """What the store holds of one stream's run, for its ticket, and
@@ -512,7 +524,7 @@ class Store:
         return lib.sp_store_files(self._s)
 
 
-# ---- the reader (core/sp.h: THE READER) ----------------------------------
+# ---- the reader (src/core/sp.h: THE READER) ----------------------------------
 
 FOUND_NONE, FOUND_TICKET, FOUND_LOCAL, FOUND_UNREADABLE = 0, 1, 2, 3
 DO_WAIT, DO_CONNECT, DO_LOCAL, DO_LIST, DO_FAIL = 0, 1, 2, 3, 4
@@ -605,7 +617,7 @@ class Reader:
             out.append((level, ffi.string(msg).decode("utf-8", "replace")))
 
 
-# ---- the view (core/sp.h: THE VIEW) ---------------------------------------
+# ---- the view (src/core/sp.h: THE VIEW) ---------------------------------------
 
 SEAM_WHY = (None, 'tight', 'short', 'late')
 CATALOG_NONE, CATALOG_EXACT, CATALOG_CURRENT = 0, 1, 2
@@ -625,7 +637,7 @@ def view_seam(ticket, window):
     return seam, bool(use[0]), SEAM_WHY[why[0]]
 
 
-#: The two row id columns (core/sp.h: ROW IDS).
+#: The two row id columns (src/core/sp.h: ROW IDS).
 ROW_ID_RUN = "sp_run_start_time"
 ROW_ID_ROW = "sp_run_row_number"
 
@@ -728,7 +740,7 @@ class View:
             out.append((level, ffi.string(msg).decode("utf-8", "replace")))
 
 
-# ---- the catalog (core/sp.h: THE CATALOG) ----------------------------------
+# ---- the catalog (src/core/sp.h: THE CATALOG) ----------------------------------
 
 class CatalogError(ValueError):
     """The core refused a catalog's bytes or a file."""

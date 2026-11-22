@@ -13,7 +13,7 @@ Two checks, each covering what it can see:
                    naming it. A stale one means that server is gone; the
                    writer takes over.
 
-The decisions and their messages are the stream core's (core/sp.h, THE
+The decisions and their messages are the stream core's (src/core/sp.h, THE
 OWNERSHIP DECISION), the same for every host language; this module makes
 the lock file call and reads the ticket.
 

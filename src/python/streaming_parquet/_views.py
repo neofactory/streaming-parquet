@@ -46,7 +46,7 @@ on the schedule its write time and beat give. A catalog or checkpoint
 version the store no longer holds means a newer ticket exists: the view
 reads the ticket again.
 
-The rules are the core's (core/sp.h: THE VIEW): the seam, which
+The rules are the core's (src/core/sp.h: THE VIEW): the seam, which
 checkpoint version the text names, the text itself, and when to look
 again. This module reads the ticket, copies and attaches the catalog,
 runs the statement and the thread.
@@ -142,7 +142,7 @@ class _MemoryProxy:
     def __init__(self, chunks, schema, run=None):
         """run: a callable that answers the run the ring's rows belong
         to; given, every row also has that run's start time in the
-        column sp_run_start_time (row ids, core/sp.h: ROW IDS)."""
+        column sp_run_start_time (row ids, src/core/sp.h: ROW IDS)."""
         self._chunks = chunks
         self._run = run
         if run is not None:

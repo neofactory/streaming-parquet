@@ -10,7 +10,7 @@ setting cannot be turned on for a connection already open. Until DuckDB
 signs the extension (a community extension), every connection a view is
 given opens that way. load() says so when it does not.
 
-The extension is the build in this checkout's duckdb-checkpoint/
+The extension is the build in this checkout's src/duckdb/
 (see its README); a build serves one exact DuckDB version.
 """
 
@@ -19,8 +19,8 @@ import os
 import duckdb
 
 SOURCE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "duckdb-checkpoint")
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "duckdb")
 PATH = os.path.join(SOURCE, "build", "release", "extension",
                     "parquet_checkpoint", "parquet_checkpoint.duckdb_extension")
 

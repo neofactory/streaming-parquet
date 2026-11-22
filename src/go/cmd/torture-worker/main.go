@@ -27,7 +27,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/neofactory/streaming-parquet/streaming_parquet/go/streaming"
+	"github.com/neofactory/streaming-parquet/src/go/streaming"
 )
 
 type status struct {

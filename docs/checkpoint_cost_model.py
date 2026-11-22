@@ -69,7 +69,7 @@ def footer_kb(entries):
 
 class Steps:
     """The objects of the unfinished row group, merged in steps, as the
-    C core does it (pqc_next_span in parquet_checkpoint/core/pqc.c).
+    C core does it (pqc_next_span in src/core/pqc.c).
 
     The objects are a list in row order. Every checkpoint adds its new
     rows at the end. Each object has a step: 0 for the new rows of one

@@ -1,6 +1,6 @@
 // Package pqc is the Go host for the parquet_checkpoint C core.
 //
-// The core (core/pqc.h — the spec) does the format work: thrift offset
+// The core (src/core/pqc.h — the spec) does the format work: thrift offset
 // rebase, footer combining, which rows each object holds, chunk
 // cutting, the PQC2 checkpoint object. This host encodes parquet (see
 // rows.go) and stores bytes through a Sink (sink.go). The Python

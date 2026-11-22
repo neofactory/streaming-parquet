@@ -2,16 +2,17 @@ __pycache__/
 *.pyc
 *.dylib
 *.so
-san_test_bin
+*_bin
 *.dSYM/
 *.parquet
 *.duckdb
 telemetry-diag.log
 *.log
-parquet_checkpoint/core/corpus/
-fuzz_reader
-fuzz_shift
-fuzz_standln
+src/core/pqc_corpus/
+src/core/pqc_corpus_reader/
+src/core/pqc_corpus_shift/
+pqc_fuzz_reader
+pqc_fuzz_shift
 .coverage
 .coverage.*
 # packaging (pyproject.toml; editable installs write egg-info here)
@@ -19,4 +20,3 @@ fuzz_standln
 build/
 dist/
 .venv/
-fuzz_bin

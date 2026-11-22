@@ -3,8 +3,8 @@ package streaming
 // sp_core.c and sp.h are CHECKED-IN COPIES of ../../core/sp.{c,h}, the
 // stream core (copies, not a symlink or an include from outside the
 // package, so the Go build cache tracks their content).
-// run_go_streaming_compat.py refreshes them and refuses to pass while
-// they differ from the core.
+// src/go/sync_core.py refreshes them, and the Python-against-Go tests
+// refuse to pass while one differs from the core.
 //
 // The core holds the rules that every host language shares, written
 // once. This file is how the Go host calls it. A rule that is in the
@@ -25,7 +25,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/neofactory/streaming-parquet/parquet_checkpoint/go/pqc"
+	"github.com/neofactory/streaming-parquet/src/go/pqc"
 )
 
 const coreErrLen = 256

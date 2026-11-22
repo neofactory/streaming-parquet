@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/neofactory/streaming-parquet/parquet_checkpoint/go/s3fake"
+	"github.com/neofactory/streaming-parquet/src/go/s3fake"
 )
 
 // The Go side of the Python contract suite: the S3 sink against the

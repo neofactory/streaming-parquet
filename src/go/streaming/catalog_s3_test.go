@@ -9,7 +9,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/neofactory/streaming-parquet/parquet_checkpoint/go/pqc"
+	"github.com/neofactory/streaming-parquet/src/go/pqc"
 )
 
 // The catalog on a real bucket: the conditional upload and the footer

@@ -4,7 +4,7 @@ Builds a schema in pyarrow, exports it via the C Data Interface into
 ar_ring_new, writes rows through the leaf setters, and imports record
 sets back through ArrowArrayStream. Run after `make`:
 
-    python3 packages/arrow_ring/core/smoke_test.py
+    python3 tests/arrow_ring/smoke_test.py
 """
 
 import os
@@ -13,7 +13,9 @@ import sys
 import cffi
 import pyarrow as pa
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(REPO, "src", "python"))
+import arrow_ring  # noqa: E402,F401  (builds the library on first use)
 
 ffi = cffi.FFI()
 ffi.cdef("""
@@ -48,7 +50,7 @@ int64_t ar_recordset_hi(const ArRecordSet *rs);
 ArStatus ar_recordset_stream(ArRecordSet *rs, void *out_stream);
 void ar_recordset_release(ArRecordSet *rs);
 """)
-lib = ffi.dlopen(os.path.join(HERE, "libarrow_ring.dylib"))
+lib = ffi.dlopen(os.path.join(REPO, "src", "python", "arrow_ring", "libarrow_ring.dylib"))
 
 AR_OK, AR_PIN_STALLED = 0, 4
 checks = []

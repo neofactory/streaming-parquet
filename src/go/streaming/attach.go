@@ -13,7 +13,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"github.com/neofactory/streaming-parquet/arrow_ring/go/ring"
+	"github.com/neofactory/streaming-parquet/src/go/ring"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -110,7 +110,11 @@ func (a *Attached) Reason() string {
 
 // took notes what the core said, and logs its lines.
 func (a *Attached) took(st readerStep) readerStep {
-	a.state.Store(st.state)
+	if st.action != doLocal {
+		// a local stream's state shows once its ring is in place
+		// (run): "streaming" with no ring would be a state to trip on
+		a.state.Store(st.state)
+	}
 	a.reason.Store(a.rules.reason())
 	for _, line := range a.rules.messages() {
 		fmt.Fprintln(os.Stderr, line)
@@ -304,6 +308,7 @@ func (a *Attached) lifecycle(t *Telemetry) {
 			a.mu.Lock()
 			a.ring = local.ring
 			a.mu.Unlock()
+			a.state.Store(st.state)
 			for !local.isClosed() {
 				if !wait(ticketPollInterval) {
 					return

@@ -1,7 +1,7 @@
 """Write real seed artifacts (checkpoints + footers) for the fuzz
 driver's corpus. Uses the pyarrow encoder the C core lacks, so the
 standalone mutation fuzzer starts from valid inputs and explores the
-accept boundary. Run: python3 parquet_checkpoint/make_corpus.py
+accept boundary. Run: python3 tests/parquet_checkpoint/make_corpus.py
 """
 import io
 import os
@@ -11,12 +11,14 @@ import sys
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path[:0] = [os.path.join(REPO, "src", "python"),
+                os.path.join(REPO, "tests")]
 from parquet_checkpoint import CheckpointWriter, FakeS3, ckpt_versions
 
 F = pa.field
 S = pa.schema([F('n', pa.int64(), nullable=False), F('s', pa.string())])
-D = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'core', 'corpus')
+D = os.path.join(REPO, 'src', 'core', 'pqc_corpus')
 os.makedirs(D, exist_ok=True)
 
 

@@ -21,7 +21,9 @@ import traceback
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path[:0] = [os.path.join(REPO, "src", "python"),
+                os.path.join(REPO, "tests")]
 
 from parquet_checkpoint import (ckpt_versions,
                                 CheckpointReader, CheckpointWriter,

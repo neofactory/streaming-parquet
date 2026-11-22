@@ -20,7 +20,7 @@ Status recorded 2026-08-27.
   live checkpoint as a read-only seekable file object. Stock
   pyarrow/pandas read live files; column pruning reaches storage
   (byte-metered in tests). `live_file(path)` convenience.
-- **DuckDB extension (duckdb-checkpoint/)**: `parquet_checkpoint` →
+- **DuckDB extension (src/duckdb/)**: `parquet_checkpoint` →
   stock `read_parquet()` over live checkpoints. Bare local `.ckpt`
   claimed by suffix; scheme'd paths wrapped as `pqc://s3://…` (first
   claimer wins in DuckDB's filesystem dispatch and order is

@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/parquet/file"
-	"github.com/neofactory/streaming-parquet/arrow_ring/go/ring"
-	"github.com/neofactory/streaming-parquet/parquet_checkpoint/go/pqc"
+	"github.com/neofactory/streaming-parquet/src/go/pqc"
+	"github.com/neofactory/streaming-parquet/src/go/ring"
 )
 
 // Durable: the first seq not yet in the archive. A consumer that must
@@ -154,6 +154,9 @@ func TestFileIsCutByBytes(t *testing.T) {
 	var files []string
 	rows := 0
 	err = filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if os.IsNotExist(err) {
+			return nil // the catalog pass's temporary file, gone again
+		}
 		if err == nil && strings.HasSuffix(p, ".parquet") && !info.IsDir() {
 			files = append(files, p)
 		}

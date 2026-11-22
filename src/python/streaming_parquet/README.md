@@ -104,8 +104,8 @@ One margin for each hazard:
 
 | What it guards | Margin | Where |
 |---|---|---|
-| A reader and the ring | A quarter of the ring | `SP_VIEW_RING_MARGIN_SHARE` (core/sp.h) |
-| A reader and the store | 10 minutes: the store keeps an object that long after the list stops naming it, and a view looks again every 5 | `parquet_checkpoint.SUPERSEDED_KEEP_S`, `SP_VIEW_REPOINT_SHARE` (core/sp.h) |
+| A reader and the ring | A quarter of the ring | `SP_VIEW_RING_MARGIN_SHARE` (src/core/sp.h) |
+| A reader and the store | 10 minutes: the store keeps an object that long after the list stops naming it, and a view looks again every 5 | `parquet_checkpoint.SUPERSEDED_KEEP_S`, `SP_VIEW_REPOINT_SHARE` (src/core/sp.h) |
 | A dead writer | Three beats, at least 30 seconds | `pqc_dead_after` in the C core (`parquet_checkpoint.dead_after`, Go `pqc.DeadAfter`) |
 
 A beat is the longest time between two writes of the writer's ticket
@@ -254,7 +254,7 @@ close it: the view goes on answering from what is there (the store's
 files; for `duckdb_live`, the rows the ring held), and with no live
 writer it looks at the store every 15 seconds. The rules of the view
 (the seam, the versions its text names, the text, when it looks again)
-are in the stream core (`core/sp.h`, THE VIEW).
+are in the stream core (`src/core/sp.h`, THE VIEW).
 
 **The seam.** To the extent that rows are in the ring, the view uses
 them. The seam is the oldest row boundary the store has that is above
@@ -609,7 +609,7 @@ reason at any time. When the writer starts again (a new run in the
 ticket) the reader starts on a fresh ring, since row numbers start
 again at 0. Go has the same rules: `Attach` returns the error, and
 `Reason()` is `standing()`. These rules are in the stream core
-(`core/sp.h`, THE READER), once, for both languages.
+(`src/core/sp.h`, THE READER), once, for both languages.
 
 **One writer per stream.** A stream takes its writer lock the first time
 it is published or starts a file, and holds it until it closes. An
@@ -718,7 +718,7 @@ onto `Attached` is the symmetry-parity item on the list.
 - Suites: run_tests.py (66), run_worker_pool_tests.py, the Go
   compatibility gates, parquet_checkpoint's suites (format, C parity, Go
   parity, stress, S3 contract), arrow_ring's suites, and
-  duckdb-checkpoint/run_extension_tests.py (S3 with CKPT_TEST_STORE).
+  tests/duckdb/run_extension_tests.py (S3 with CKPT_TEST_STORE).
 - In production: a machine shop's CNC and probe daemons write
   through this library.
 - Open: the Go host (above); attached-side archival in Python; DuckDB's

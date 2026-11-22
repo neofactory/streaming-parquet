@@ -1,7 +1,7 @@
 """Make the footer seeds of `make fuzz`: the footers of two small
 parquet files, one flat and one with lists, structs and decimals.
 
-    python3 corpus/make_footers.py        (from core/)
+    python3 src/core/sp_corpus/make_footers.py
 """
 import datetime as dt
 import decimal
@@ -13,7 +13,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "..", "..", ".."))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "python"))
 from streaming_parquet import _core  # noqa: E402
 
 flat = pa.table({

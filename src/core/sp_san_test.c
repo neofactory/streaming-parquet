@@ -895,9 +895,9 @@ int main(void) {
         char err[512];
         size_t len = 0, flen = 0, nlen = 0;
         static uint8_t flat[1 << 16], nested[1 << 16];
-        FILE *fp = fopen("corpus/flat.footer", "rb");
+        FILE *fp = fopen("sp_corpus/flat.footer", "rb");
         if (fp) { flen = fread(flat, 1, sizeof flat, fp); fclose(fp); }
-        fp = fopen("corpus/nested.footer", "rb");
+        fp = fopen("sp_corpus/nested.footer", "rb");
         if (fp) { nlen = fread(nested, 1, sizeof nested, fp); fclose(fp); }
         CHECK(flen > 0 && nlen > 0);
 

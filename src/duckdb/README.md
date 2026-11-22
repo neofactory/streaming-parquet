@@ -5,7 +5,7 @@ An unfinished file in streaming-parquet is stored as objects (chunks,
 row groups, the rows of each checkpoint) plus checkpoint versions, each
 one object written once and never changed,
 `<file>.parquet.<version>.ckpt` (the list of the file's objects and its
-footer; format in `../parquet_checkpoint/core/pqc.h`). This extension
+footer; format in `../core/pqc.h`). This extension
 presents those pieces as one ordinary Parquet file, so DuckDB's own
 Parquet reader reads it unchanged: column selection, row-group skipping
 and ranged reads all work.

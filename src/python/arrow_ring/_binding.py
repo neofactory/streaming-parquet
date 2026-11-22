@@ -2,7 +2,7 @@
 
 Same public surface as the retired pure-Python implementation (Ring,
 get_mutable_row/commit/read_row/pin, RecordSet, the two
-errors); the engine is core/libarrow_ring.dylib. Python's jobs here:
+errors); the engine is libarrow_ring.dylib (src/core/arrow_ring.c). Python's jobs here:
 schema metadata (leaf routing, handle classes via _schema/_row), value
 conversion at the boundary (datetime -> ticks, Decimal -> bytes,
 sequences -> packed elements), and pyarrow import of exported streams.
@@ -27,8 +27,10 @@ from ._schema import flatten_schema
 
 INT64_MAX = 2 ** 63 - 1
 
-_CORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'core')
-_LIB_PATH = os.path.join(_CORE_DIR, 'libarrow_ring.dylib')
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+# the library is beside this file; in a checkout its sources are in src/core
+_CORE_DIR = os.path.join(os.path.dirname(os.path.dirname(_PKG_DIR)), 'core')
+_LIB_PATH = os.path.join(_PKG_DIR, 'libarrow_ring.dylib')
 
 ffi = cffi.FFI()
 _CDEF = """
@@ -118,17 +120,25 @@ ArStatus ar_to_wire(const ArRing *ring, const ArWireMap *map, int64_t seq,
 ffi.cdef(_CDEF)
 
 
-def _build_lib():
-    src = os.path.join(_CORE_DIR, 'arrow_ring.c')
-    hdr = os.path.join(_CORE_DIR, 'arrow_ring.h')
-    if (not os.path.exists(_LIB_PATH)
-            or os.path.getmtime(_LIB_PATH) < max(os.path.getmtime(src),
-                                                 os.path.getmtime(hdr))):
-        subprocess.run(['make'], cwd=_CORE_DIR, check=True,
-                       capture_output=True)
+def _build_if_stale():
+    """In a checkout, build the library from src/core into this package
+    when a source is newer than it. An installed package has the
+    library and no sources: nothing to do."""
+    sources = [os.path.join(_CORE_DIR, n) for n in ('arrow_ring.c', 'arrow_ring.h')]
+    if not all(os.path.exists(s) for s in sources):
+        if os.path.exists(_LIB_PATH):
+            return
+        raise ImportError(
+            f"{__package__}: no {_LIB_PATH} and no sources in {_CORE_DIR} "
+            f"to build it from; install the package again")
+    if (os.path.exists(_LIB_PATH) and os.path.getmtime(_LIB_PATH)
+            >= max(os.path.getmtime(s) for s in sources)):
+        return
+    subprocess.run(['make', '-C', _CORE_DIR, f'OUT={_PKG_DIR}', 'libarrow_ring'],
+                   check=True, capture_output=True)
 
 
-_build_lib()
+_build_if_stale()
 lib = ffi.dlopen(_LIB_PATH)
 # Look up every function now. cffi finds a function on its first use
 # under a lock of its own that is not reentrant, and it holds that same

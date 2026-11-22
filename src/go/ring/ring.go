@@ -1,6 +1,6 @@
 // Package ring is the Go host for the arrow_ring C core.
 //
-// The core (core/arrow_ring.h — the spec) owns storage, recycling,
+// The core (src/core/arrow_ring.h — the spec) owns storage, recycling,
 // and pins; this binding is thin by design. Boundary language
 // is the Arrow C Data Interface: schemas and batches go in via
 // arrow-go's cdata export, record sets come out as zero-copy record

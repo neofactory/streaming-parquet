@@ -2,7 +2,7 @@
 
 Run:  python3 parquet_checkpoint/run_c_compat.py
 
-The writer's rules live once, in the C core (core/pqc.c). This suite
+The writer's rules live once, in the C core (src/core/pqc.c). This suite
 builds core/libpqc.dylib (make) and proves the core against things
 that are not the core:
 
@@ -31,15 +31,18 @@ import cffi
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path[:0] = [os.path.join(REPO, "src", "python"),
+                os.path.join(REPO, "tests")]
 
 from parquet_checkpoint import (ckpt_object, ckpt_versions,
                                 CheckpointReader, CheckpointWriter, FakeS3,
                                 finalize)
 
-CORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'core')
+CORE = os.path.join(REPO, 'src', 'core')
+LIB = os.path.join(REPO, 'src', 'python', 'parquet_checkpoint', 'libpqc.dylib')
 
-r = subprocess.run(['make', '-C', CORE, 'libpqc.dylib'],
+r = subprocess.run(['make', '-C', CORE, 'OUT=' + os.path.dirname(LIB), 'libpqc'],
                    capture_output=True, text=True)
 if r.returncode != 0:
     print(r.stdout + r.stderr)
@@ -86,7 +89,7 @@ uint8_t *pqc_shift_footer(const uint8_t *thrift, size_t len,
                           char *err, size_t errlen);
 void pqc_free(void *p);
 """)
-C = ffi.dlopen(os.path.join(CORE, 'libpqc.dylib'))
+C = ffi.dlopen(LIB)
 
 ERR = ffi.new('char[512]')
 

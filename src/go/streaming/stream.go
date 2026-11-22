@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/neofactory/streaming-parquet/arrow_ring/go/ring"
-	"github.com/neofactory/streaming-parquet/parquet_checkpoint/go/pqc"
+	"github.com/neofactory/streaming-parquet/src/go/pqc"
+	"github.com/neofactory/streaming-parquet/src/go/ring"
 )
 
 // Stream is a stream this process writes: a ring, and behind it a

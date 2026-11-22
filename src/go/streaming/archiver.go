@@ -12,8 +12,8 @@ import (
 	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/compress"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
-	"github.com/neofactory/streaming-parquet/arrow_ring/go/ring"
-	"github.com/neofactory/streaming-parquet/parquet_checkpoint/go/pqc"
+	"github.com/neofactory/streaming-parquet/src/go/pqc"
+	"github.com/neofactory/streaming-parquet/src/go/ring"
 )
 
 // archiver is the parquet path, shared by created streams AND

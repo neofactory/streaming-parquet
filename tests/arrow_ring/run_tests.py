@@ -1,6 +1,6 @@
 """Standalone test runner for arrow_ring (no pytest dependency).
 
-Run:  python3 packages/arrow_ring/run_tests.py
+Run:  python3 tests/arrow_ring/run_tests.py
 
 Covers the allocation model (mutable -> frozen -> recycled), read-only
 handles, pins blocking the writer, zero-copy
@@ -17,7 +17,9 @@ import traceback
 
 import pyarrow as pa
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path[:0] = [os.path.join(REPO, "src", "python"),
+                os.path.join(REPO, "tests")]
 
 from arrow_ring import Ring, StaleReadError, PinStalledError
 
@@ -476,7 +478,7 @@ del ring
 gc.set_threshold(1, 1, 1)
 ffi.new("struct { int64_t a; double b; int32_t c[3]; } *")
 print("ok")
-""" % os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+""" % os.path.join(REPO, "src", "python")
     r = subprocess.run([sys.executable, '-c', code], capture_output=True,
                        text=True, timeout=60)
     assert r.returncode == 0 and r.stdout.strip() == 'ok', (r.stdout, r.stderr)

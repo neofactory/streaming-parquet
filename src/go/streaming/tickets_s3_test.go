@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/neofactory/streaming-parquet/parquet_checkpoint/go/s3fake"
+	"github.com/neofactory/streaming-parquet/src/go/s3fake"
 )
 
 func TestParseS3Root(t *testing.T) {

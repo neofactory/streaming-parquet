@@ -56,7 +56,7 @@ RecordSet: .table .lo .hi .release() .detach() ; context manager
 DynamicRelation: .table ; __arrow_c_stream__       # register with DuckDB
 errors: StaleReadError, PinStalledError
 planned: Ring(..., base_seq=S) ; gap-advance append (attach alignment)
-C core: ar_* mirror of the above (core/arrow_ring.h is the spec)
+C core: ar_* mirror of the above (src/core/arrow_ring.h is the spec)
 ```
 
 ## The API (this README is the contract)
@@ -181,7 +181,7 @@ freelist; dedicated ones drop when their record sets release.
 
 ## C core
 
-The native core is defined in [`core/arrow_ring.h`](core/arrow_ring.h)
+The native core is defined in [`src/core/arrow_ring.h`](../../core/arrow_ring.h)
 (the header is the spec; `core/README.md` explains the architecture):
 one C library bound by Python/Go/Rust, Arrow C Data Interface at every
 boundary, memcpy stream ingest, ArrowArrayStream egress, parquet as a
@@ -191,8 +191,8 @@ reference; its test suite is the core's acceptance suite.
 ## Go host (go/ring)
 
 A thin cgo binding over the same core (checked-in copies of
-`core/arrow_ring.{c,h}`, synced and drift-checked by
-`run_go_compat.py`), speaking arrow-go at the boundary. The leaf
+`src/core/arrow_ring.{c,h}`, synced and drift-checked by
+`tests/arrow_ring/run_go_compat.py`), speaking arrow-go at the boundary. The leaf
 setters store straight into the open row's slot with no cgo call for
 fixed-width leaves (`direct.go`: the shape comes from the schema, the
 buffer addresses from the core, the refusals are the core's with the
@@ -214,7 +214,7 @@ recs, _ := rs.Records()                 // zero-copy arrow-go records
 rs.Release()                            // or rs.Detach()
 ```
 
-Cross-language gate: `run_go_compat.py` — Go record sets written as
+Cross-language gate: `tests/arrow_ring/run_go_compat.py` — Go record sets written as
 IPC read exactly in pyarrow (struct leaves and strings included);
 pyarrow IPC bulk-ingests into a Go ring and reads exactly through the
 row getters. Note Go `arrow.Field` defaults to non-nullable — match
@@ -227,13 +227,13 @@ nullability across languages or the ring refuses the schema loudly.
 ## Tests and tools
 
 ```sh
-python3 packages/arrow_ring/run_tests.py           # acceptance suite (38)
-python3 packages/arrow_ring/run_pipeline_tests.py  # parquet, DuckDB union
+python3 tests/arrow_ring/run_tests.py              # acceptance suite (38)
+python3 tests/arrow_ring/run_pipeline_tests.py     # parquet, DuckDB union
                                                    # view, Flight loopback
-python3 packages/arrow_ring/run_go_compat.py       # Go <-> Python cross
-python3 packages/arrow_ring/exerciser.py --seconds 15 --rate 20000
+python3 tests/arrow_ring/run_go_compat.py          # Go <-> Python cross
+python3 tests/arrow_ring/exerciser.py --seconds 15 --rate 20000
                                                    # endurance/throughput
-(cd packages/arrow_ring/go && go test ./ring/)     # Go host suite
-(cd packages/arrow_ring/core && make san)          # ASan+UBSan C soak
-(cd packages/arrow_ring/core && make leaks)        # macOS leaks check
+(cd src/go && go test ./ring/)                     # Go host suite
+(cd src/core && make san-arrow_ring)               # ASan+UBSan C soak
+(cd src/core && make leaks)                        # macOS leaks check
 ```

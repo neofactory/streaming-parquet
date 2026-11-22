@@ -126,7 +126,7 @@ class ParquetWriter:
         self._ships = {}                # file name -> Shipper (live + pending)
         # What the store holds of this run, for the ticket, and when a
         # finished file's checkpoints are deleted: the stream core's
-        # rule and state (core/sp.h, WHAT THE STORE HOLDS). Written on
+        # rule and state (src/core/sp.h, WHAT THE STORE HOLDS). Written on
         # the pool's lanes, read by the stream's heartbeat thread, under
         # _store_lock. In short: a finished file stays in the ticket
         # until a published catalog lists it; then the ticket drops it,

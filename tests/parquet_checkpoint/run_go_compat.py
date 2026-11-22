@@ -10,7 +10,7 @@ must produce artifacts the OTHER side can read and finalize:
   - Python writer crashes: Go finalizes and reads exactly
   - each side reads the other's FINISHED files
 
-Also syncs the checked-in copies of core/pqc.{c,h} into go/pqc/ and
+Also syncs the checked-in copies of src/core/pqc.{c,h} into go/pqc/ and
 fails if they drift (the Go build cache needs in-package files).
 """
 
@@ -25,22 +25,23 @@ import traceback
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path[:0] = [os.path.join(REPO, "src", "python"),
+                os.path.join(REPO, "tests")]
 
 from parquet_checkpoint import (ckpt_versions,
                                 CheckpointReader, CheckpointWriter, DirSink,
                                 finalize, live_table)
 
-PKG = os.path.dirname(os.path.abspath(__file__))
-GO = os.path.join(PKG, 'go')
+GO = os.path.join(REPO, 'src', 'go')
 
-# ---- sync the in-package core copies, loudly --------------------------------
-for f in ('pqc.c', 'pqc.h'):
-    src = os.path.join(PKG, 'core', f)
-    dst = os.path.join(GO, 'pqc', 'pqc_core.c' if f == 'pqc.c' else f)
-    if not filecmp.cmp(src, dst, shallow=False):
-        shutil.copyfile(src, dst)
-        print(f"  synced {dst} from core/")
+# The Go packages compile checked-in copies of the C cores
+# (src/go/sync_core.py). Refresh them; the run fails at its end if one
+# still differs.
+sys.path.insert(0, GO)
+import sync_core  # noqa: E402
+for _dst in sync_core.sync():
+    print(f"  copied {_dst} from src/core")
 
 BIN = os.path.join(tempfile.gettempdir(), 'pqc-compat-bin')
 r = subprocess.run(['go', 'build', '-o', BIN, './cmd/pqc-compat'],
@@ -164,10 +165,7 @@ def _():
         assert st is not None and st.min == 0
 
 
-for f in ('pqc.c', 'pqc.h'):
-    src = os.path.join(PKG, 'core', f)
-    dst = os.path.join(GO, 'pqc', 'pqc_core.c' if f == 'pqc.c' else f)
-    assert filecmp.cmp(src, dst, shallow=False), f"{dst} drifted from core/"
+assert not sync_core.differing(), sync_core.differing()
 
 print(f"\n{'=' * 50}")
 print(f"Results: {passed} passed, {failed} failed")

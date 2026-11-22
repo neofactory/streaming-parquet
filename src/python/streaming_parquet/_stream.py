@@ -136,7 +136,7 @@ class Stream:
         self._ship_error = None         # the last failure's text
 
         # The write plan: which committed rows go to the files, and
-        # when. Its rules and state are the stream core's (core/sp.h,
+        # when. Its rules and state are the stream core's (src/core/sp.h,
         # THE WRITE PLAN); this class pins the rows and does the writes.
         # Tail-checkpoint cadence: between row groups, the pending rows
         # ride the checkpoint as a provisional row group. Crash loss =
@@ -1025,7 +1025,7 @@ def _ring_sizes(name, ring_rows, row_group_rows):
         the next quarter     the store's lag: a view reads from the
                              ring every row the store does not have yet
         the oldest quarter   the time a running query has: a view does
-                             not start in it (SP_VIEW_RING_MARGIN_SHARE, core/sp.h)
+                             not start in it (SP_VIEW_RING_MARGIN_SHARE, src/core/sp.h)
 
     Given neither size, DuckDB's row group; given one, the other
     follows; given both, a ring under two row groups is refused."""

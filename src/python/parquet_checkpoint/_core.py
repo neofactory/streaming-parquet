@@ -1,4 +1,4 @@
-"""CFFI binding of the parquet_checkpoint C core: core/pqc.c, whose
+"""CFFI binding of the parquet_checkpoint C core: src/core/pqc.c, whose
 header pqc.h is the format's spec.
 
 The core does the format work and no I/O. A host encodes rows as a
@@ -7,13 +7,14 @@ bytes; the core rebases the footer's offsets to the rows' place in the
 final file, decides which rows each object holds (the new rows of a
 checkpoint, or a merge), cuts chunks, builds the combined footer and
 the checkpoint object, and hands bytes back for the host to store. The
-Go host (go/pqc) and the DuckDB extension use the same core; this
+Go host (src/go/pqc) and the DuckDB extension use the same core; this
 module is what the Python writer calls, so the format's rules exist
 once.
 
 The library is built with `make` and the system C compiler the first
-time this module is imported, next to its sources (core/), like
-arrow_ring's.
+time this module is imported in a checkout, from its sources in
+src/core into this package, like arrow_ring's; `pip install` builds it
+at install.
 """
 
 import os
@@ -22,8 +23,10 @@ import subprocess
 
 import cffi
 
-_CORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'core')
-_LIB_PATH = os.path.join(_CORE_DIR, 'libpqc.dylib')
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+# the library is beside this file; in a checkout its sources are in src/core
+_CORE_DIR = os.path.join(os.path.dirname(os.path.dirname(_PKG_DIR)), 'core')
+_LIB_PATH = os.path.join(_PKG_DIR, 'libpqc.dylib')
 
 NAME_MAX = 256                  # PQC_NAME_MAX
 _ERRLEN = 512
@@ -58,17 +61,25 @@ void pqc_free(void *p);
 ffi.cdef(_CDEF)
 
 
-def _build_lib():
-    src = os.path.join(_CORE_DIR, 'pqc.c')
-    hdr = os.path.join(_CORE_DIR, 'pqc.h')
-    if (not os.path.exists(_LIB_PATH)
-            or os.path.getmtime(_LIB_PATH) < max(os.path.getmtime(src),
-                                                 os.path.getmtime(hdr))):
-        subprocess.run(['make', 'libpqc.dylib'], cwd=_CORE_DIR, check=True,
-                       capture_output=True)
+def _build_if_stale():
+    """In a checkout, build the library from src/core into this package
+    when a source is newer than it. An installed package has the
+    library and no sources: nothing to do."""
+    sources = [os.path.join(_CORE_DIR, n) for n in ('pqc.c', 'pqc.h')]
+    if not all(os.path.exists(s) for s in sources):
+        if os.path.exists(_LIB_PATH):
+            return
+        raise ImportError(
+            f"{__package__}: no {_LIB_PATH} and no sources in {_CORE_DIR} "
+            f"to build it from; install the package again")
+    if (os.path.exists(_LIB_PATH) and os.path.getmtime(_LIB_PATH)
+            >= max(os.path.getmtime(s) for s in sources)):
+        return
+    subprocess.run(['make', '-C', _CORE_DIR, f'OUT={_PKG_DIR}', 'libpqc'],
+                   check=True, capture_output=True)
 
 
-_build_lib()
+_build_if_stale()
 lib = ffi.dlopen(_LIB_PATH)
 # Look up every function and parse every type now, as arrow_ring's
 # binding does. cffi does both on first use under a lock of its own

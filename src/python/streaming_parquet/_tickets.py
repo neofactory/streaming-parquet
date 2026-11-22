@@ -151,7 +151,7 @@ def stale_after(ticket):
 
 def _text(ticket):
     """A ticket dict as the bytes the store holds: the stream core
-    writes the text (core/sp.h is the ticket's spec)."""
+    writes the text (src/core/sp.h is the ticket's spec)."""
     return _core.ticket_text(ticket).encode()
 
 

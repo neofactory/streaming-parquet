@@ -26,10 +26,11 @@ import traceback
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path[:0] = [os.path.join(REPO, "src", "python"),
+                os.path.join(REPO, "tests")]
 
-PKG = os.path.dirname(os.path.abspath(__file__))
-GO = os.path.join(PKG, 'go')
+GO = os.path.join(REPO, 'src', 'go')
 
 # ---- hermetic discovery root ------------------------------------------------
 ROOT = tempfile.mkdtemp(prefix='sp-compat-root-')
@@ -37,16 +38,12 @@ atexit.register(lambda: shutil.rmtree(ROOT, ignore_errors=True))
 
 import streaming_parquet as sp
 
-# The Go package compiles checked-in copies of the stream core (the Go
-# build cache needs in-package files). Refresh them; the last test
-# fails if they differ.
-import filecmp
-CORE_COPIES = [(os.path.join(PKG, 'core', 'sp.c'), os.path.join(GO, 'streaming', 'sp_core.c')),
-               (os.path.join(PKG, 'core', 'sp_catalog.c'), os.path.join(GO, 'streaming', 'sp_catalog.c')),
-               (os.path.join(PKG, 'core', 'sp.h'), os.path.join(GO, 'streaming', 'sp.h'))]
-for src, dst in CORE_COPIES:
-    if not os.path.exists(dst) or not filecmp.cmp(src, dst, shallow=False):
-        shutil.copyfile(src, dst)
+# The Go packages compile checked-in copies of the C cores
+# (src/go/sync_core.py). Refresh them; the last test fails if one
+# still differs.
+sys.path.insert(0, GO)
+import sync_core  # noqa: E402
+sync_core.sync()
 
 BIN = os.path.join(tempfile.gettempdir(), 'stream-compat-bin')
 r = subprocess.run(['go', 'build', '-o', BIN, './cmd/stream-compat'],
@@ -87,7 +84,7 @@ def _():
     try:
         # The store is new: nothing is in the folder x until this
         # writer's ticket is. A reader of a name in a folder that does
-        # not exist is refused (core/sp.h: THE READER), so wait for it.
+        # not exist is refused (src/core/sp.h: THE READER), so wait for it.
         deadline = time.monotonic() + 20
         while 'x/gopub' not in sp.list_streams(ROOT):
             assert time.monotonic() < deadline, "no ticket from the Go writer"
@@ -419,10 +416,9 @@ def _():
     assert got == (3002, 3002, 3001), got
 
 
-@test("the Go package's copies of the stream core are the core")
+@test("the Go packages' copies of the C cores are the cores")
 def _():
-    for src, dst in CORE_COPIES:
-        assert filecmp.cmp(src, dst, shallow=False), f"{dst} differs from core/"
+    assert not sync_core.differing(), sync_core.differing()
 
 
 sp.close()

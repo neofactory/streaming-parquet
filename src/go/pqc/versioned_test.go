@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/neofactory/streaming-parquet/parquet_checkpoint/go/s3fake"
+	"github.com/neofactory/streaming-parquet/src/go/s3fake"
 )
 
 // The contract of Versioned, the same for a directory and for a bucket:

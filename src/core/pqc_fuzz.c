@@ -128,7 +128,7 @@ static void hit(const uint8_t *buf, size_t n) {
 
 int main(int argc, char **argv) {
   long iters = argc > 1 ? atol(argv[1]) : 200000;
-  const char *dir = argc > 2 ? argv[2] : "corpus";
+  const char *dir = argc > 2 ? argv[2] : "pqc_corpus";
   s_rng = argc > 3 ? (uint64_t)atoll(argv[3]) : 0x9E3779B97F4A7C15ull;
   load_corpus(dir);
   if (g_n == 0) { fprintf(stderr, "no corpus in %s\n", dir); return 2; }

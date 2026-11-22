@@ -33,21 +33,25 @@ project depends on a checkout like this:
     [tool.uv.sources]
     streaming-parquet = { path = "../streaming-parquet", editable = true }
 
-`arrow_ring` builds its C core with `make` and the system C compiler
-on first import, next to its sources (`arrow_ring/core/`), so that
-directory must be writable; in an editable install it is the checkout.
-`parquet_checkpoint` does the same for its core
-(`parquet_checkpoint/core/`) the first time a file is written; reading
-needs no build.
+The three packages load their C cores as libraries. `pip install`
+builds them (`setup.py`: `make` and the system C compiler; the stream
+core also needs the SQLite library and header, on Ubuntu
+`libsqlite3-dev`). In a checkout or an editable install each package
+builds its library from `src/core/` into its own directory the first
+time it is imported, so that directory must be writable.
 
 ## Layout
 
-- `<pkg>/` — the Python package (the reference implementation)
-- `<pkg>/core/` — the C core (C11, libc(+pthreads) only; the header
-  is the spec)
-- `<pkg>/go/` — the Go host (cgo over the same core)
-- `<pkg>/run_*.py` — standalone suites: unit, stress, cross-language
-  parity
+- `src/core/` — the three C cores (C11; each header is the spec): the
+  ring (`arrow_ring`), the checkpoint format (`pqc`) and the stream's
+  rules (`sp`), with their C tests and one Makefile
+- `src/python/` — the Python packages `arrow_ring`,
+  `parquet_checkpoint` and `streaming_parquet`
+- `src/go/` — the Go module, packages `ring`, `pqc` and `streaming`
+  (cgo over checked-in copies of the same cores: `src/go/sync_core.py`)
+- `src/duckdb/` — the DuckDB extension that reads unfinished files
+- `tests/` — the Python test scripts: unit, stress, and each language
+  against the other
 - `docs/` — documents that cross the packages:
   [what a checkpoint costs](docs/checkpoint-cost.md),
   [old names and when they stop](docs/deprecations.md)
@@ -89,5 +93,5 @@ outside this repo, has verified 650M-row runs exact.
 ## License
 
 Apache License 2.0 ([LICENSE](LICENSE)). The build scaffolding in
-`duckdb-checkpoint/` comes from DuckDB's extension template, under its
-MIT license ([duckdb-checkpoint/LICENSE](duckdb-checkpoint/LICENSE)).
+`src/duckdb/` comes from DuckDB's extension template, under its
+MIT license ([src/duckdb/LICENSE](src/duckdb/LICENSE)).

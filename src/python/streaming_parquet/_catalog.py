@@ -2,7 +2,7 @@
 
     <store>/streams/<name>/catalog.sqlite
 
-A SQLite database that holds a DuckLake 1.0 catalog (core/sp.h: THE
+A SQLite database that holds a DuckLake 1.0 catalog (src/core/sp.h: THE
 CATALOG). One table, `data`, whose files are the stream's finished
 parquet files, each by its full path. DuckDB reads it with
 ATTACH 'ducklake:sqlite:<file>' and opens only the files a query needs:

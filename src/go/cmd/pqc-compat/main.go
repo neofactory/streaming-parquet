@@ -15,7 +15,7 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/neofactory/streaming-parquet/parquet_checkpoint/go/pqc"
+	"github.com/neofactory/streaming-parquet/src/go/pqc"
 )
 
 type Row struct {

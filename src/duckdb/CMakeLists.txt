@@ -14,10 +14,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include_directories(src/include)
 # the checkpoint parser is the shared C core (fuzz-tested; one parser
 # across Python, Go, and this extension)
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../parquet_checkpoint/core)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../core)
 
 set(EXTENSION_SOURCES src/parquet_checkpoint_extension.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../parquet_checkpoint/core/pqc.c)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/pqc.c)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

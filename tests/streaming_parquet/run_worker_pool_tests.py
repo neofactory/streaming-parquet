@@ -18,7 +18,8 @@ import weakref
 
 import pyarrow as pa
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+PYTHON = Path(__file__).resolve().parents[2] / "src" / "python"
+sys.path.insert(0, str(PYTHON))
 from arrow_ring import PinStalledError, Ring
 
 
@@ -138,7 +139,7 @@ def promoted_task_releases_pin(module, workers, capture, fail=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker-module", type=Path,
-                        default=Path(__file__).with_name("_worker_pool.py"))
+                        default=PYTHON / "streaming_parquet" / "_worker_pool.py")
     args = parser.parse_args()
     module = load_worker_module(args.worker_module)
     cases = [(workers, capture, False)

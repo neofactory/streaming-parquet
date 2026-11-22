@@ -7,7 +7,7 @@ the Go host's record sets, written as IPC, must read exactly in
 pyarrow; pyarrow-written IPC must bulk-ingest into a Go ring and read
 exactly through the row getters (incl. struct leaves and strings).
 
-Also syncs the checked-in copies of core/arrow_ring.{c,h} into
+Also syncs the checked-in copies of src/core/arrow_ring.{c,h} into
 go/ring/ and fails if they drift.
 """
 
@@ -22,16 +22,16 @@ import traceback
 import pyarrow as pa
 import pyarrow.ipc
 
-PKG = os.path.dirname(os.path.abspath(__file__))
-GO = os.path.join(PKG, 'go')
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+GO = os.path.join(REPO, 'src', 'go')
 
-for f in ('arrow_ring.c', 'arrow_ring.h'):
-    src = os.path.join(PKG, 'core', f)
-    dst = os.path.join(GO, 'ring',
-                       'arrow_ring_core.c' if f.endswith('.c') else f)
-    if not filecmp.cmp(src, dst, shallow=False):
-        shutil.copyfile(src, dst)
-        print(f"  synced {dst} from core/")
+# The Go packages compile checked-in copies of the C cores
+# (src/go/sync_core.py). Refresh them; the run fails at its end if one
+# still differs.
+sys.path.insert(0, GO)
+import sync_core  # noqa: E402
+for _dst in sync_core.sync():
+    print(f"  copied {_dst} from src/core")
 
 BIN = os.path.join(tempfile.gettempdir(), 'ring-compat-bin')
 r = subprocess.run(['go', 'build', '-o', BIN, './cmd/ring-compat'],
@@ -129,11 +129,7 @@ def _():
         assert (int(rows), int(s)) == (1200, 1200 * 1199 // 2), (rows, s)
 
 
-for f in ('arrow_ring.c', 'arrow_ring.h'):
-    src = os.path.join(PKG, 'core', f)
-    dst = os.path.join(GO, 'ring',
-                       'arrow_ring_core.c' if f.endswith('.c') else f)
-    assert filecmp.cmp(src, dst, shallow=False), f"{dst} drifted from core/"
+assert not sync_core.differing(), sync_core.differing()
 
 print(f"\n{'=' * 50}")
 print(f"Results: {passed} passed, {failed} failed")

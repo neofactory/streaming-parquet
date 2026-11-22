@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/ipc"
-	"github.com/neofactory/streaming-parquet/arrow_ring/go/ring"
+	"github.com/neofactory/streaming-parquet/src/go/ring"
 
 	"github.com/apache/arrow-go/v18/arrow"
 )

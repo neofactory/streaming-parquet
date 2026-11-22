@@ -27,7 +27,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/compress"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
-	"github.com/neofactory/streaming-parquet/arrow_ring/go/ring"
+	"github.com/neofactory/streaming-parquet/src/go/ring"
 )
 
 func rssMB() float64 {

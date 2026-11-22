@@ -1,6 +1,6 @@
 """Standalone test runner for streaming_parquet (no pytest dependency).
 
-Run:  python3 streaming_parquet/run_tests.py
+Run:  python3 tests/streaming_parquet/run_tests.py
 
 Streams on the arrow_ring core, the Arrow-schema API, attach()
 local/remote, the reader verbs (newest_row, cursor, arrow_table, the
@@ -21,7 +21,9 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path[:0] = [os.path.join(REPO, "src", "python"),
+                os.path.join(REPO, "tests")]
 
 import streaming_parquet as sp
 import parquet_checkpoint  # noqa: E402 (path set above)
@@ -1345,7 +1347,7 @@ s.close()
 def _owner_child(root, mode):
     import subprocess
     env = dict(os.environ)
-    env["PYTHONPATH"] = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env["PYTHONPATH"] = os.path.join(REPO, "src", "python")
     p = subprocess.Popen([sys.executable, "-c", _OWNER_CHILD, root, mode],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.DEVNULL, env=env, text=True)
@@ -2180,7 +2182,7 @@ con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
 v = s.duckdb_all(con)
 print(con.sql(f"SELECT count(*) FROM {v.name}").fetchall()[0][0], flush=True)
 s.close()
-""" % os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+""" % os.path.join(REPO, "src", "python")
     r = _sp.run([sys.executable, '-c', code], capture_output=True, text=True,
                 timeout=60)
     assert r.returncode == 0 and r.stdout.strip() == "10", (r.returncode,
@@ -2678,7 +2680,7 @@ print("\n--- diagnostics ---")
 @test("diag log: $STREAMING_PARQUET_DIAG_LOG moves it; default is the cwd")
 def _():
     import subprocess
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    repo = os.path.join(REPO, "src", "python")
     probe = ("import logging, streaming_parquet; "
              "logging.getLogger('telemetry.diag').info('diag-log-probe')")
     with tempfile.TemporaryDirectory() as tmp:
@@ -2947,7 +2949,7 @@ def _():
 @test("two processes can have an internal stream of one name; the second to write parquet is refused")
 def _():
     import subprocess
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    repo = os.path.join(REPO, "src", "python")
     child = (
         "import sys, pyarrow as pa, streaming_parquet as sp\n"
         "s = sp.create_stream('v2test/shared', pa.schema([('tv', pa.float64())]),\n"
@@ -3042,7 +3044,7 @@ def _():
 @test("docs/deprecations.md and _deprecations.py list the same Python names")
 def _():
     from streaming_parquet import _deprecations
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    repo = REPO
     rows = {}
     for line in open(os.path.join(repo, "docs", "deprecations.md")):
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
@@ -3094,7 +3096,7 @@ def _():
     assert not _core.ticket_is_stale(old, 34.9, 30.0)
 
 
-print("\n--- the reader's rules (core/sp.h: THE READER) ---")
+print("\n--- the reader's rules (src/core/sp.h: THE READER) ---")
 
 
 class _Lines:

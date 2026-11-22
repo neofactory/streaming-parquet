@@ -126,7 +126,7 @@ s3fake (go/s3fake): the tests' in-process S3, path-style, with the
 multipart part rules (the Go side of FakeS3); sink_s3_test.go runs the
 sink contract and the writer lifecycle on it
 
-C core (core/pqc.h IS its spec; language-neutral: hosts encode
+C core (src/core/pqc.h IS its spec; language-neutral: hosts encode
 parquet and do all storage). The Python CheckpointWriter and the Go
 Writer are both hosts over it, so the writer's rules exist once; the
 DuckDB extension reads with it:
@@ -187,7 +187,7 @@ recover_directory(sink)
   WHERE seq > watermark`, where the watermark IS the checkpoint
   (tested every cycle in the suite).
 
-## DuckDB extension (duckdb-checkpoint/)
+## DuckDB extension (src/duckdb/)
 
 The same virtual file as a DuckDB filesystem: the `parquet_checkpoint`
 extension, loaded on a connection opened with
@@ -204,8 +204,8 @@ wrapped path is opened through DuckDB's own filesystems — httpfs
 etc. — so every backend DuckDB gains works here too). Closed files
 and live checkpoints mix freely in one read_parquet list. The
 extension compiles the same C core (one parser, fuzz-tested); build
-with `GEN=ninja make release` in duckdb-checkpoint/, test with
-run_extension_tests.py. A build serves one exact DuckDB version
+with `GEN=ninja make release` in src/duckdb/, test with
+tests/duckdb/run_extension_tests.py. A build serves one exact DuckDB version
 (today 2.0.0, the `duckdb` submodule's tag); every DuckDB update needs
 a rebuild for each platform.
 
@@ -289,13 +289,13 @@ Test content (all in `run_tests.py`, 14 tests):
 ## Tests and tools
 
 ```sh
-python3 packages/parquet_checkpoint/run_tests.py     # 28 tests
-python3 packages/parquet_checkpoint/run_stress.py --kills 25
-python3 packages/parquet_checkpoint/run_stress.py --seconds 60 --rate 20000
-python3 packages/parquet_checkpoint/run_s3_contract.py   # real S3, needs creds
-python3 packages/parquet_checkpoint/run_c_compat.py      # C core parity
-python3 packages/parquet_checkpoint/run_go_compat.py     # Go <-> Python cross
-(cd packages/parquet_checkpoint/go && go test ./pqc/)    # Go host suite
+python3 tests/parquet_checkpoint/run_tests.py     # 28 tests
+python3 tests/parquet_checkpoint/run_stress.py --kills 25
+python3 tests/parquet_checkpoint/run_stress.py --seconds 60 --rate 20000
+python3 tests/parquet_checkpoint/run_s3_contract.py   # real S3, needs creds
+python3 tests/parquet_checkpoint/run_c_compat.py      # C core parity
+python3 tests/parquet_checkpoint/run_go_compat.py     # Go <-> Python cross
+(cd src/go && go test ./pqc/)                            # Go host suite
 ```
 
 Run the suite + stress on BOTH Mac (APFS) and the Linux box (ext4)

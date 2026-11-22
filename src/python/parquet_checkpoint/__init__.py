@@ -18,7 +18,7 @@ Artifacts (relative names, resolved by a sink -- local dir or S3):
                      one object each
         unfinished   the rows of the row group still being filled: one
                      object for each checkpoint's new rows, merged in
-                     steps (core/pqc.h)
+                     steps (src/core/pqc.h)
   run.parquet.000017.ckpt     a checkpoint: version 17 of the file's
       checkpoint, one object, written once and never changed. Each
       checkpoint is a new version; a version superseded for
@@ -179,7 +179,7 @@ class CheckpointWriter:
                               #   rows (a Table), provisional
     w.close() -> 'run.parquet'
 
-    The format work is the C core's (core/pqc.c through _core, the same
+    The format work is the C core's (src/core/pqc.c through _core, the same
     core the Go host and the DuckDB extension use): this class encodes
     rows as parquet with pyarrow, hands the core the bytes, and stores
     what the core hands back. One owner at a time, like a file handle.

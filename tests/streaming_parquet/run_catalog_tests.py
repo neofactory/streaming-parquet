@@ -1,4 +1,4 @@
-"""The core's catalog (core/sp.h: THE CATALOG) against DuckDB's own.
+"""The core's catalog (src/core/sp.h: THE CATALOG) against DuckDB's own.
 
     python3 run_catalog_tests.py
 
@@ -26,7 +26,7 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "src", "python"))
 from streaming_parquet import _core  # noqa: E402
 
 here = tempfile.mkdtemp(prefix="cat-cmp-")

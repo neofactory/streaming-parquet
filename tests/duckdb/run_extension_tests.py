@@ -16,11 +16,13 @@ import threading
 import duckdb
 import pyarrow as pa
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path[:0] = [os.path.join(REPO, "src", "python"),
+                os.path.join(REPO, "tests")]
 from parquet_checkpoint import CheckpointReader, CheckpointWriter, DirSink
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-EXT = os.path.join(HERE, 'build', 'release', 'extension', 'parquet_checkpoint',
+EXT = os.path.join(REPO, 'src', 'duckdb', 'build', 'release', 'extension', 'parquet_checkpoint',
                    'parquet_checkpoint.duckdb_extension')
 
 F = pa.field

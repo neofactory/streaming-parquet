@@ -11,7 +11,7 @@ connect() (in __init__) returns an Attached either way:
             One feeder per attach; closing the Attached stops it.
 
 A feeder's rules (where the writer is, when to wait, when to start
-again on a fresh ring, what to log) are the stream core's: core/sp.h,
+again on a fresh ring, what to log) are the stream core's: src/core/sp.h,
 THE READER. A waiting feeder looks among this process's streams at
 every poll, before the store, and reads one it finds in place.
 
@@ -278,7 +278,7 @@ class Attached:
         at a time and pins only the chunk in hand, so a query holds
         nothing of the ring between chunks, however long it runs.
         row_ids: also the columns sp_run_start_time and
-        sp_run_row_number (core/sp.h: ROW IDS)."""
+        sp_run_row_number (src/core/sp.h: ROW IDS)."""
         from arrow_ring import DynamicRelation
         d = self._require()
         vname = name or f"sp_live_{_safe(d.name)}"
@@ -448,7 +448,7 @@ class _Feeder:
         # when this process has a stream in the name's folder)
         self._local = local
         # the rules: where the writer is, when to wait, when to start
-        # again (core/sp.h: THE READER). This thread makes its calls;
+        # again (src/core/sp.h: THE READER). This thread makes its calls;
         # _state, _reason and _run are what it said last.
         self._core = _core.Reader(who or f"connect({name!r})", name, store,
                                   ticket is not None)
