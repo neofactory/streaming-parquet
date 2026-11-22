@@ -59,7 +59,7 @@ import time
 from datetime import datetime
 
 from . import _core
-from ._diag import _diag, console_print
+from ._diag import _diag
 
 CATALOG = "catalog.sqlite"
 TABLE = "data"
@@ -382,7 +382,6 @@ class Catalog:
                     msg = (f"[{self.name}] catalog pass {e}; the next "
                            f"start's reconcile finishes it")
                     _diag.info(msg)
-                    console_print(f"[streaming-parquet] {msg}")
                     # files added in memory, never published
                     self._cat = None
                     break
@@ -461,7 +460,6 @@ class Catalog:
             msg = (f"[{self.name}] catalog: listing {total} file(s) "
                    f"from {self.folder} (each file's footer is read)")
             _diag.info(msg)
-            console_print(f"[streaming-parquet] {msg}")
         for i, path in enumerate(todo):
             if self._stop.is_set():
                 raise _Stopped(i, total)
@@ -476,7 +474,6 @@ class Catalog:
                        f"listed, {took:.0f} s so far, about "
                        f"{left:.0f} s left")
                 _diag.info(msg)
-                console_print(f"[streaming-parquet] {msg}")
 
     def _register(self, cat, path):
         """Read the footer of the file at `path` and list the file."""

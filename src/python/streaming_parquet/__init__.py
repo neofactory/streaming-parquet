@@ -52,7 +52,7 @@ import threading
 
 import pyarrow as pa
 
-from ._diag import suppress_console, set_verbosity  # noqa: F401 -- public API
+from ._diag import log_to_file, suppress_console, set_verbosity  # noqa: F401 -- public API
 from ._clock import set_clock  # noqa: F401 -- public API
 from ._clock import run_start
 from . import _catalog
@@ -71,7 +71,7 @@ from ._flight_server import start_flight_server
 
 from arrow_ring import StaleReadError, PinStalledError  # noqa: F401 -- public
 
-_diag = logging.getLogger("telemetry.diag")
+_diag = logging.getLogger("streaming_parquet")
 
 # Module-level state
 _lock = threading.Lock()

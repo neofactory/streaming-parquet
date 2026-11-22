@@ -8,7 +8,7 @@ day the old one is removed.
 
 import logging
 
-_diag = logging.getLogger("telemetry.diag")
+_diag = logging.getLogger("streaming_parquet")
 
 DEPRECATED_ON = "2026-11-11"
 REMOVED_AFTER = "2027-02-11"
@@ -19,9 +19,23 @@ OLD_NAMES = {
     "Archive": "ParquetOptions",
     "Archive(parquet=...)": "ParquetOptions(compression=...)",
     "create_stream(archive=...)": "create_stream(parquet=...)",
+    "suppress_console": 'logging.getLogger("streaming_parquet").propagate = False',
+    "set_verbosity": 'logging.getLogger("streaming_parquet").setLevel(...)',
+}
+
+#: old name -> (the day it was replaced, the day it stops), for a name
+#: replaced on another day than DEPRECATED_ON
+OTHER_DAYS = {
+    "suppress_console": ("2026-11-22", "2027-02-22"),
+    "set_verbosity": ("2026-11-22", "2027-02-22"),
 }
 
 _told = set()
+
+
+def days(old):
+    """(the day `old` was replaced, the day it stops)."""
+    return OTHER_DAYS.get(old, (DEPRECATED_ON, REMOVED_AFTER))
 
 
 def old_name(old):
@@ -32,5 +46,5 @@ def old_name(old):
         return
     _told.add(old)
     _diag.warning(f"[streaming-parquet] {old} is an old name for {new}. "
-                  f"It works until {REMOVED_AFTER}; use {new}. "
+                  f"It works until {days(old)[1]}; use {new}. "
                   f"docs/deprecations.md has the list.")

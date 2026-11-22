@@ -22,6 +22,7 @@
 package streaming
 
 import (
+	"log/slog"
 	"os"
 	"sync"
 )
@@ -35,12 +36,19 @@ type Config struct {
 	FlightAddr string // the Flight listen address, e.g. ":8815" for a
 	//                   process found by DNS; "" = any free port, which
 	//                   the ticket announces.
+	Logger *slog.Logger // where the library's log lines go. nil: warnings
+	//                     and errors to standard error, as text. An
+	//                     ERROR is a fault that loses or delays data, a
+	//                     WARN a condition someone should look at, INFO a
+	//                     milestone (a file is finished, the catalog is
+	//                     published).
 }
 
 // Telemetry is one process's streaming context (streams share the
 // process's Flight face and ticket store).
 type Telemetry struct {
 	tickets ticketStore // nil = no discovery configured
+	log     *slog.Logger
 	root    string
 	flight  *flightFace
 	mu      sync.Mutex
@@ -52,7 +60,11 @@ func Init(cfg Config) (*Telemetry, error) {
 	if err != nil {
 		return nil, err
 	}
-	t := &Telemetry{flight: f, streams: map[string]*Stream{}}
+	t := &Telemetry{flight: f, streams: map[string]*Stream{}, log: cfg.Logger}
+	if t.log == nil {
+		t.log = slog.New(slog.NewTextHandler(os.Stderr,
+			&slog.HandlerOptions{Level: slog.LevelWarn}))
+	}
 	root := cfg.Root
 	if root == "" {
 		root = os.Getenv("STREAMING_PARQUET_ROOT")

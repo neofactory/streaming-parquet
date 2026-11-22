@@ -37,6 +37,31 @@ def _newest_ckpt(names):
     return max(got)[1] if got else None
 from streaming_parquet import StaleReadError, PinStalledError, MemoryOptions, ParquetOptions, ArchiveState, MirrorState
 
+# The suite reads the library's INFO lines; a program that sets nothing
+# up gets warnings and errors alone.
+import logging  # noqa: E402
+logging.getLogger("streaming_parquet").setLevel(logging.INFO)
+
+
+class _LogLines:
+    """The log lines of the library while the block runs, as
+    (level name, text)."""
+
+    def __enter__(self):
+        self.lines = []
+        outer = self
+
+        class H(logging.Handler):
+            def emit(self, record):
+                outer.lines.append((record.levelname, record.getMessage()))
+        self._h = H()
+        logging.getLogger("streaming_parquet").addHandler(self._h)
+        return self.lines
+
+    def __exit__(self, *exc):
+        logging.getLogger("streaming_parquet").removeHandler(self._h)
+
+
 signal.alarm(180)   # global hang guard
 
 
@@ -1860,11 +1885,8 @@ def _():
         d = os.path.join(root, "streams", "v2test", "cclose")
         os.remove(os.path.join(d, _catalog.CATALOG))    # a backlog of 40
         undo = _slow_catalog(0.25)                      # 40 files: about 10 s
-        err = _io.StringIO()
-        was = _d._console_suppressed
-        _d._console_suppressed = False
         try:
-            with contextlib.redirect_stderr(err):
+            with _LogLines() as lines:
                 s = sp.create_stream("v2test/cclose", flat, store=root,
                                             memory=MemoryOptions(lookback=500),
                                             parquet=ParquetOptions(checkpoint_seconds=0.05))
@@ -1874,9 +1896,8 @@ def _():
                 s.close()
                 took = time.monotonic() - t0
         finally:
-            _d._console_suppressed = was
             undo()
-        out = err.getvalue()
+        out = "\n".join(text for _level, text in lines)
         assert took < 8.0, took
         assert "catalog pass running," in out, out
         assert "stopping the catalog pass after its current file" in out, out
@@ -1908,17 +1929,13 @@ def _():
                 time.sleep(5.0)              # the last checkpoint, slowly
             return put(name, data)
         s.append(pa.record_batch([pa.array(range(100, 200))], schema=flat))
-        err = _io.StringIO()
-        was = _d._console_suppressed
-        _d._console_suppressed = False
         try:
-            with contextlib.redirect_stderr(err):
+            with _LogLines() as lines:
                 remote.put = slow_put
                 s.close()
         finally:
-            _d._console_suppressed = was
             remote.put = put
-        out = err.getvalue()
+        out = "\n".join(text for _level, text in lines)
         assert "close: uploading checkpoint" in out and " MB), " in out, out
         assert "the file is complete in the local spool" in out, out
         assert "the next start finishes the upload" in out, out
@@ -2482,6 +2499,21 @@ def _():
             assert con.sql(
                 "SELECT n FROM all_r WHERE sp_run_row_number = 7 ORDER BY "
                 "sp_run_start_time").fetchall() == [(7,), (1007,)]
+            # a stream with a column of one of the two names is refused
+            clash = pa.schema([("n", pa.int64()), ("sp_run_row_number", pa.int64())])
+            c = sp.create_stream("v2test/ridclash", clash, store=root,
+                                 memory=MemoryOptions(lookback=100))
+            try:
+                for make in (c.duckdb_live, c.duckdb_all):
+                    try:
+                        make(con, name="clash", row_ids=True)
+                        raise AssertionError("row ids on a clashing column")
+                    except ValueError as e:
+                        assert "has a column named sp_run_row_number already" \
+                            in str(e), e
+                c.duckdb_live(con, name="clash").close()     # fine without
+            finally:
+                c.close()
             # off by default: the stream's columns alone
             for make in (a.duckdb_all, a.duckdb_archive, a.duckdb_live):
                 v = make(con, name="plain")
@@ -2677,27 +2709,75 @@ def _():
 
 print("\n--- diagnostics ---")
 
-@test("diag log: $STREAMING_PARQUET_DIAG_LOG moves it; default is the cwd")
+@test("logging the standard way: with nothing set up no file is made and "
+      "warnings go to standard error; log_to_file() and "
+      "$STREAMING_PARQUET_DIAG_LOG write the library's lines to a file; a "
+      "handler of the program's own gets them")
 def _():
     import subprocess
     repo = os.path.join(REPO, "src", "python")
-    probe = ("import logging, streaming_parquet; "
-             "logging.getLogger('telemetry.diag').info('diag-log-probe')")
+    probe = ("import logging, sys, streaming_parquet as sp\n"
+             "if len(sys.argv) > 1 and sys.argv[1] == 'file':\n"
+             "    sp.log_to_file('mine.log'); sp.log_to_file('mine.log')\n"
+             "if len(sys.argv) > 1 and sys.argv[1] == 'own':\n"
+             "    logging.basicConfig(level=logging.INFO, stream=sys.stdout,\n"
+             "                        format='OWN %(name)s %(levelname)s %(message)s')\n"
+             "log = logging.getLogger('streaming_parquet')\n"
+             "log.info('probe-info'); log.warning('probe-warning')\n"
+             "logging.getLogger('parquet_checkpoint').info('probe-checkpoint')\n")
     with tempfile.TemporaryDirectory() as tmp:
         env = dict(os.environ, PYTHONPATH=repo)
         env.pop('STREAMING_PARQUET_DIAG_LOG', None)
-        default = os.path.join(tmp, 'telemetry-diag.log')
-        subprocess.run([sys.executable, '-c', probe], cwd=tmp, env=env,
-                       check=True, capture_output=True)
-        assert 'diag-log-probe' in open(default).read()
-        os.remove(default)
+
+        def run(*args):
+            return subprocess.run([sys.executable, '-c', probe, *args], cwd=tmp,
+                                  env=env, check=True, capture_output=True,
+                                  text=True)
+        r = run()
+        assert os.listdir(tmp) == [], os.listdir(tmp)       # no file
+        assert 'probe-warning' in r.stderr and 'probe-info' not in r.stderr, r.stderr
+        r = run('file')
+        text = open(os.path.join(tmp, 'mine.log')).read()
+        assert text.count('probe-info') == 1 and text.count('probe-warning') == 1 \
+            and text.count('probe-checkpoint') == 1, text
+        os.remove(os.path.join(tmp, 'mine.log'))
+        r = run('own')
+        assert 'OWN streaming_parquet INFO probe-info' in r.stdout, r.stdout
+        assert 'OWN parquet_checkpoint INFO probe-checkpoint' in r.stdout, r.stdout
+        assert os.listdir(tmp) == [], os.listdir(tmp)
         moved = os.path.join(tmp, 'state', 'sp-diag.log')
         os.mkdir(os.path.dirname(moved))
         env['STREAMING_PARQUET_DIAG_LOG'] = moved
-        subprocess.run([sys.executable, '-c', probe], cwd=tmp, env=env,
-                       check=True, capture_output=True)
-        assert 'diag-log-probe' in open(moved).read()
-        assert not os.path.exists(default)
+        run()
+        assert 'probe-info' in open(moved).read()
+
+
+@test("the old names suppress_console and set_verbosity still work, with "
+      "one warning each")
+def _():
+    import logging
+    from streaming_parquet import _deprecations
+    log = logging.getLogger("streaming_parquet")
+    level = log.level
+    try:
+        with _LogLines() as lines:
+            _deprecations._told.discard("suppress_console")
+            _deprecations._told.discard("set_verbosity")
+            sp.set_verbosity(1)
+            assert log.level == logging.DEBUG
+            sp.set_verbosity(0)
+            assert log.level == logging.INFO
+            sp.suppress_console(True)
+            assert log.propagate is False
+            log.warning("kept from the console")
+            sp.suppress_console(False)
+            assert log.propagate is True
+        said = [t for _l, t in lines if "old name" in t]
+        assert len(said) == 2 and "set_verbosity" in said[0] \
+            and "suppress_console" in said[1], said
+        assert any("kept from the console" in t for _l, t in lines)
+    finally:
+        log.setLevel(level)
 
 
 print("\n--- parquet on and off at any time ---")
@@ -3003,7 +3083,9 @@ def _():
         files = [f for _r, _d, fs in os.walk(tmp) for f in fs
                  if f.endswith(".parquet")]
         assert len(files) == 1, files
-    assert _deprecations._told == set(_deprecations.OLD_NAMES), _deprecations._told
+    logging_names = {"suppress_console", "set_verbosity"}     # their own test
+    assert _deprecations._told - logging_names == \
+        set(_deprecations.OLD_NAMES) - logging_names, _deprecations._told
 
 
 @test("an old name warns once, with the new name and the day of removal")
@@ -3016,7 +3098,7 @@ def _():
         def emit(self, record):
             got.append(record.getMessage())
     handler = Keep()
-    log = logging.getLogger("telemetry.diag")
+    log = logging.getLogger("streaming_parquet")
     log.addHandler(handler)
     try:
         _deprecations._told.clear()
@@ -3050,7 +3132,7 @@ def _():
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         if len(cells) == 5 and cells[2] == "Python":
             rows[cells[0].strip("`")] = (cells[1].strip("`"), cells[3], cells[4])
-    want = {old: (new, _deprecations.DEPRECATED_ON, _deprecations.REMOVED_AFTER)
+    want = {old: (new, *_deprecations.days(old))
             for old, new in _deprecations.OLD_NAMES.items()}
     assert rows == want, (rows, want)
 
@@ -3111,12 +3193,12 @@ class _Lines:
             def emit(self, record):
                 outer.lines.append((record.levelname, record.getMessage()))
         self._h = H()
-        logging.getLogger("telemetry.diag").addHandler(self._h)
+        logging.getLogger("streaming_parquet").addHandler(self._h)
         return self.lines
 
     def __exit__(self, *exc):
         import logging
-        logging.getLogger("telemetry.diag").removeHandler(self._h)
+        logging.getLogger("streaming_parquet").removeHandler(self._h)
 
 
 @test("connect: a name whose folder does not exist is an error at once")

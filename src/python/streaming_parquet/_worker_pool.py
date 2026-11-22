@@ -14,7 +14,7 @@ import logging
 import queue
 import threading
 
-_diag = logging.getLogger("telemetry.diag")
+_diag = logging.getLogger("streaming_parquet")
 
 
 class _StreamSlots:

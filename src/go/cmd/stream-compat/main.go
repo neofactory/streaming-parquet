@@ -15,6 +15,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -82,7 +83,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: stream-compat serve|attach ...")
 		os.Exit(2)
 	}
-	tel, err := streaming.Init(streaming.Config{Root: os.Args[2]})
+	// every line of the library, for the test that reads this program's
+	// standard error
+	logger := slog.New(slog.NewTextHandler(os.Stderr,
+		&slog.HandlerOptions{Level: slog.LevelInfo}))
+	tel, err := streaming.Init(streaming.Config{Root: os.Args[2], Logger: logger})
 	if err != nil {
 		die(err)
 	}

@@ -466,6 +466,7 @@ class S3Sink:
                 pass
             raise
         dt = time.monotonic() - t_all
-        if _s3.trace or dt >= _s3.SLOW_CALL_S:
+        if (_s3.trace or dt >= _s3.SLOW_CALL_S
+                or _log.isEnabledFor(logging.DEBUG)):
             _log.info(f"s3 assemble {key} {len(plan)} part(s) {dt:.3f}s"
                       f"{' SLOW' if dt >= _s3.SLOW_CALL_S else ''}")

@@ -1,110 +1,108 @@
-"""Centralized diagnostic logging for streaming_parquet.
+"""Logging, the standard way.
 
-All streaming_parquet console and file logging goes through this module.
-The file logger always writes to $STREAMING_PARQUET_DIAG_LOG, default
-telemetry-diag.log in the working directory (read once, at import).
-Console output can be suppressed (e.g. during a Rich Live display) via
-suppress_console(True/False).
+The library logs to the logger named "streaming_parquet" (the checkpoint
+layer to "parquet_checkpoint", the ring to "arrow_ring"). It attaches no
+handler and sets no level: the program decides where the lines go, with
+Python's `logging`, as for any library.
 
-Verbosity levels:
-    0 — normal: milestones only (FIRST COMMIT, WORKER STARTED/STOPPED, errors)
-    1 — verbose: + periodic DRAIN stats, subscriber connect/disconnect
-    2 — very verbose: + every batch, detailed diagnostics
+    logging.basicConfig(level=logging.INFO)          # the program's own setup
+    logging.getLogger("streaming_parquet").setLevel(logging.DEBUG)
+
+With nothing set up, Python shows warnings and errors on standard error
+and makes no file.
+
+    sp.log_to_file("telemetry-diag.log")
+
+is for a program that wants the library's lines in a file of its own:
+every line at INFO and above from the three loggers, one line each, with
+the time. $STREAMING_PARQUET_DIAG_LOG, when set, does the same at import
+with the path it names.
+
+Levels: an ERROR is a fault that loses or delays data, a WARNING is a
+condition someone should look at, INFO is a milestone (a stream starts,
+a file is finished, the catalog is published), DEBUG is detail for a
+person who is looking for a fault (with DEBUG on "parquet_checkpoint",
+every S3 call is logged with its duration).
+
+suppress_console() and set_verbosity() are old names (docs/deprecations.md).
 """
 
 import logging
 import os
-import sys
 import threading
 
-# --- Shared state (controlled from streaming_parquet/__init__.py) ---
+LOGGER = "streaming_parquet"
+#: The loggers log_to_file() writes: the library's three.
+LOGGERS = ("streaming_parquet", "parquet_checkpoint", "arrow_ring")
+
+_diag = logging.getLogger(LOGGER)
+
 _lock = threading.Lock()
-_console_suppressed = False
-_verbosity = 0  # 0=normal, 1=verbose, 2=very verbose
+_files = {}             # absolute path -> the FileHandler writing it
+_suppressed = None      # the NullHandler of suppress_console(True)
 
-# --- File logger (always on) ---
-_diag = logging.getLogger("telemetry.diag")
-_diag.setLevel(logging.DEBUG)
-_diag.propagate = False  # Never bubble up to root logger
-
-_file_handler = logging.FileHandler(
-    os.environ.get("STREAMING_PARQUET_DIAG_LOG")
-    or os.path.join(os.getcwd(), "telemetry-diag.log"), mode="a"
-)
-_file_handler.setFormatter(logging.Formatter(
-    "%(asctime)s.%(msecs)03d %(message)s", datefmt="%H:%M:%S"
-))
-_diag.addHandler(_file_handler)
-
-# The checkpoint/mirror layer's timing lines (slow S3 calls, slow
-# finalizes) land in the same file. File only: never the console, which
-# a curses display may own.
-_pc = logging.getLogger("parquet_checkpoint")
-_pc.setLevel(logging.INFO)
-_pc.propagate = False
-_pc.addHandler(_file_handler)
-
-# --- Console handler (toggleable) ---
-_console_handler = logging.StreamHandler(sys.stderr)
-_console_handler.setFormatter(logging.Formatter(
-    "telemetry.diag %(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-))
-_diag.addHandler(_console_handler)
+#: The format of a line in a log_to_file() file: the one the library's
+#: file has had (the time of day, then the line).
+FILE_FORMAT = "%(asctime)s.%(msecs)03d %(message)s"
+FILE_DATE_FORMAT = "%H:%M:%S"
 
 
-def _update_console_handler():
-    """Add or remove the console handler based on current state."""
-    if _console_suppressed:
-        _diag.removeHandler(_console_handler)
-    elif _console_handler not in _diag.handlers:
-        _diag.addHandler(_console_handler)
+def log_to_file(path):
+    """Write the library's log lines to the file `path` as well (lines
+    are added to a file that exists). Every line at INFO and above; a
+    logger the program has given a level of its own keeps it. A second
+    call with the same path changes nothing; another path is another
+    file."""
+    path = os.path.abspath(path)
+    with _lock:
+        if path in _files:
+            return
+        handler = logging.FileHandler(path, mode="a")
+        handler.setFormatter(logging.Formatter(FILE_FORMAT,
+                                               datefmt=FILE_DATE_FORMAT))
+        _files[path] = handler
+        for name in LOGGERS:
+            logger = logging.getLogger(name)
+            logger.addHandler(handler)
+            if logger.level == logging.NOTSET:
+                logger.setLevel(logging.INFO)
 
 
 def suppress_console(suppress: bool = True):
-    """Suppress or resume all streaming_parquet console output.
-
-    When suppressed, file logging continues but nothing prints to the console.
-    Use this when a Rich Live display or similar TUI is active.
-    """
-    global _console_suppressed
+    """An old name. While suppressed, the library's lines go to its own
+    handlers only (a log_to_file() file): not to the program's handlers
+    and not to standard error. The standard way: put a handler of your
+    own on the logger "streaming_parquet" and set its `propagate` to
+    False."""
+    from ._deprecations import old_name
+    old_name("suppress_console")
+    global _suppressed
     with _lock:
-        _console_suppressed = suppress
-        _update_console_handler()
+        if suppress and _suppressed is None:
+            _suppressed = logging.NullHandler()
+            for name in LOGGERS:
+                logger = logging.getLogger(name)
+                logger.addHandler(_suppressed)
+                logger.propagate = False
+        elif not suppress and _suppressed is not None:
+            for name in LOGGERS:
+                logger = logging.getLogger(name)
+                logger.removeHandler(_suppressed)
+                logger.propagate = True
+            _suppressed = None
 
 
 def set_verbosity(level: int):
-    """Set streaming_parquet diagnostic verbosity.
-
-    0 — normal: milestones only
-    1 — verbose: + periodic stats
-    2 — very verbose: + every detail, and every S3 call is logged
-        with its duration (parquet_checkpoint _s3.trace)
-    """
-    global _verbosity
-    with _lock:
-        _verbosity = max(0, min(2, level))
-    try:
-        from parquet_checkpoint import _s3
-        _s3.trace = _verbosity >= 2
-    except ImportError:
-        pass
+    """An old name. 0: INFO and above; 1: DEBUG too; 2: DEBUG also for
+    the checkpoint layer (every S3 call with its duration). The
+    standard way: logging.getLogger("streaming_parquet").setLevel(...)."""
+    from ._deprecations import old_name
+    old_name("set_verbosity")
+    logging.getLogger(LOGGER).setLevel(
+        logging.DEBUG if level >= 1 else logging.INFO)
+    logging.getLogger("parquet_checkpoint").setLevel(
+        logging.DEBUG if level >= 2 else logging.INFO)
 
 
-def get_verbosity() -> int:
-    return _verbosity
-
-
-def is_console_suppressed() -> bool:
-    return _console_suppressed
-
-
-def console_print(msg: str):
-    """Print a streaming_parquet message to the console (unless suppressed).
-
-    For [TELEMETRY] status messages that aren't part of the diag logger.
-    Always flushes.
-    """
-    with _lock:
-        if not _console_suppressed:
-            print(msg, file=sys.stderr, flush=True)
+if os.environ.get("STREAMING_PARQUET_DIAG_LOG"):
+    log_to_file(os.environ["STREAMING_PARQUET_DIAG_LOG"])

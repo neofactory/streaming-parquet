@@ -3,7 +3,7 @@ package streaming
 import (
 	"bytes"
 	"fmt"
-	"os"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"time"
@@ -40,7 +40,8 @@ type archiver struct {
 	wp         *writePlan
 	store      *storeState // what the store holds, for the ticket; the owner's
 	cat        *catalog    // the catalog of the finished files; nil = none is kept
-	lostBefore int64       // rows lost under this stream's earlier options
+	log        *slog.Logger
+	lostBefore int64 // rows lost under this stream's earlier options
 
 	// The writes owed, oldest first: each a row range, pinned when it
 	// became due. plan adds to it; write does its head.
@@ -118,7 +119,7 @@ func ringSizes(name string, ringRows, rowGroupRows int64) (int64, int64, error) 
 // that writes files) keeps none: a finished file's checkpoints are
 // deleted at once, and no ticket names the file after it.
 func newArchiver(r *ring.Ring, name, run string, o ParquetOptions, store *storeState,
-	catFor func(sink pqc.Sink, folder string) *catalog) (*archiver, error) {
+	catFor func(sink pqc.Sink, folder string) *catalog, log *slog.Logger) (*archiver, error) {
 	if store == nil {
 		store = newStoreState(pqc.SupersededKeep)
 	}
@@ -152,6 +153,7 @@ func newArchiver(r *ring.Ring, name, run string, o ParquetOptions, store *storeS
 	}
 	a := &archiver{
 		wp:              wp,
+		log:             log,
 		store:           store,
 		ring:            r,
 		schema:          r.Schema(),
@@ -221,16 +223,16 @@ func (a *archiver) bootSweep() error {
 					a.store.kept(final, version, vs[len(vs)-1].Object)
 				}
 				a.cat.await(final)
-				fmt.Fprintf(os.Stderr, "[%s] boot sweep: %s %s\n",
-					a.name, status, a.location+"/"+final)
+				a.log.Info(fmt.Sprintf("[%s] boot sweep: %s %s",
+					a.name, status, a.location+"/"+final))
 				continue
 			}
 			status, err := pqc.Finalize(final, a.sink)
 			if err != nil {
 				return fmt.Errorf("boot sweep %s: %w", final, err)
 			}
-			fmt.Fprintf(os.Stderr, "[%s] boot sweep: %s %s\n",
-				a.name, status, a.location+"/"+final)
+			a.log.Info(fmt.Sprintf("[%s] boot sweep: %s %s",
+				a.name, status, a.location+"/"+final))
 		}
 	}
 	return nil
@@ -362,8 +364,8 @@ func (a *archiver) enqueue(force bool, committed int64) error {
 	if lost > 0 {
 		// rows reused before their write: loud, counted, then on from
 		// what the ring still has
-		fmt.Fprintf(os.Stderr, "[%s] ARCHIVE LOSS: rows [%d,%d) recycled "+
-			"before parquet flush\n", a.name, cursor, cursor+lost)
+		a.log.Error(fmt.Sprintf("[%s] ARCHIVE LOSS: rows [%d,%d) recycled "+
+			"before parquet flush", a.name, cursor, cursor+lost))
 	}
 	if kind == writeNothing {
 		rs.Release()

@@ -41,12 +41,11 @@ import logging
 import threading
 import time
 
-#: Timing lines for S3 calls. streaming_parquet attaches its diag file
-#: handler to this logger.
+#: Timing lines for S3 calls, on the checkpoint layer's logger.
 _log = logging.getLogger('parquet_checkpoint')
 
-#: A call at or over SLOW_CALL_S is logged (always); with `trace` on,
-#: every call is (streaming_parquet turns it on at verbosity 2).
+#: A call at or over SLOW_CALL_S is logged (always); every call is when
+#: `trace` is on or the logger is at DEBUG.
 SLOW_CALL_S = 1.0
 trace = False
 
@@ -125,7 +124,7 @@ def timed(op, key, fn, detail=''):
         t_end = time.monotonic()
         dt = t_end - t0
         marks, _marks.m = _marks.m, None
-        if trace or dt >= SLOW_CALL_S:
+        if trace or dt >= SLOW_CALL_S or _log.isEnabledFor(logging.DEBUG):
             retries = meta.get('RetryAttempts')
             tries = ('' if retries is None else
                      f" {retries + 1} attempt{'s' if retries else ''}")

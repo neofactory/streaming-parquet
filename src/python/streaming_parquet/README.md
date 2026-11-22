@@ -490,8 +490,8 @@ everything slow; `cut` triggers them too. A reader, in any thread, calls
 one of the reader verbs, and it all just works.
 
 ```
-$STREAMING_PARQUET_DIAG_LOG    # diag log file, opened at import;
-                               # default telemetry-diag.log in the cwd
+log_to_file(path)              # the library's log lines to a file as well
+$STREAMING_PARQUET_DIAG_LOG    # the same, at import, with the path it names
 STORE = "s3://my-bucket"    # a whole bucket, or a whole directory; no prefix
 create_stream(name, schema, store=STORE, spool=DEFAULT_SPOOL, memory=MemoryOptions(...), parquet=ParquetOptions(...), publish=True)
     # name: the stream's whole path under the store (files at streams/<name>/,
@@ -630,6 +630,38 @@ The ring is sized at creation, so a later row group it cannot hold is
 refused. The module's `start_parquet` with options acts on every local
 stream; without options it acts on the streams that have some and
 leaves the others alone.
+
+## Logging
+
+The library logs the standard way of each language, and sets nothing up
+itself.
+
+| | Where the lines go | With nothing set up |
+|---|---|---|
+| Python | the loggers `streaming_parquet`, `parquet_checkpoint` and `arrow_ring` of `logging` | warnings and errors on standard error; no file |
+| Go | the `*slog.Logger` given in `Config.Logger` | warnings and errors on standard error, as text |
+| C cores | the host: the ring calls a function the host gives (`ArRingOptions.diag`); the stream core hands its lines to the host with their level (`sp_reader_message`, `sp_view_message`) | — |
+
+    import logging
+    logging.basicConfig(level=logging.INFO)        # the program's own setup
+    sp.log_to_file("telemetry-diag.log")           # or: the library's lines in a file
+
+    tel, err := streaming.Init(streaming.Config{Logger: slog.Default()})
+
+The levels mean the same in each language. An error is a fault that
+loses or delays data. A warning is a condition someone should look at.
+An info line is a milestone: a stream starts, a file is finished, the
+catalog is published. Debug is detail for a person who is looking for a
+fault; in Python, debug on `parquet_checkpoint` logs every S3 call with
+its duration.
+
+`sp.log_to_file(path)` adds every line at info and above from the three
+Python loggers to the file, one line each with the time of day. Before
+2026-11-22 the Python library always wrote `telemetry-diag.log` in the
+working directory and printed its lines on standard error; a program
+that wants that file now calls `log_to_file`. `suppress_console()` and
+`set_verbosity()` are old names (docs/deprecations.md). The DuckDB
+extension writes no log lines: its faults are DuckDB errors.
 
 ## Go host (go/streaming)
 

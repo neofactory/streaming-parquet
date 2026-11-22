@@ -284,7 +284,8 @@ class Attached:
         vname = name or f"sp_live_{_safe(d.name)}"
         if row_ids:
             from . import _core
-            from ._views import _MemoryProxy
+            from ._views import _MemoryProxy, refuse_row_id_columns
+            refuse_row_id_columns(d.name, d.schema)
             mem = f"__sp_live_{_safe(vname)}"
             con.register(mem, _MemoryProxy(
                 lambda lo: self._require().iter_chunks(lo), d.schema,

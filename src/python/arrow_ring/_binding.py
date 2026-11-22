@@ -12,6 +12,7 @@ Everything stateful — slots, cursors, pins, pools — lives in C.
 import datetime
 import decimal
 import operator
+import logging
 import os
 import re
 import struct
@@ -118,6 +119,16 @@ ArStatus ar_to_wire(const ArRing *ring, const ArWireMap *map, int64_t seq,
                     void *frame, int64_t frame_len);
 """
 ffi.cdef(_CDEF)
+
+
+#: The core's diagnostic lines (an oversized value, a jump in the row
+#: numbers) go to this logger as warnings: the core calls _diag_line.
+_log = logging.getLogger("arrow_ring")
+
+
+@ffi.callback("void(void *, const char *)")
+def _diag_line(_ctx, msg):
+    _log.warning(ffi.string(msg).decode("utf-8", "replace"))
 
 
 def _build_if_stale():
@@ -232,6 +243,7 @@ class Ring:
         schema._export_to_c(int(ffi.cast("uintptr_t", cs)))
         opts = ffi.new("ArRingOptions *")
         opts.segment_bytes = segment_bytes or 0
+        opts.diag = _diag_line          # the core's lines, to the logger
         out = ffi.new("ArRing **")
         st = lib.ar_ring_new(cs, capacity, opts, out)
         if st != AR_OK:

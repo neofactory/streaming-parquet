@@ -29,7 +29,7 @@ import pyarrow as pa
 
 import parquet_checkpoint
 
-from ._diag import _diag, console_print
+from ._diag import _diag
 from ._options import MemoryOptions, ParquetOptions, ArchiveState, MirrorState, MemoryState
 from ._stream_data import _StreamData
 from ._worker_pool import get_pool
@@ -172,20 +172,19 @@ class Stream:
         # a stream committing nothing (the tail checkpoint, the mirror
         # retry). Always runs; the ticket part only with a root.
         if not publish:
-            console_print(f"[streaming-parquet] {self.name}: internal "
-                          f"stream -- no ticket, not served to other "
-                          f"processes")
+            _diag.info(f"[{self.name}] internal stream -- no ticket, not "
+                       f"served to other processes")
         elif self._ticket_root is not None:
-            console_print(f"[streaming-parquet] Ticket heartbeat starting: "
-                          f"{self._ticket_root}/tickets/{self.name} "
-                          f"(on each change of the stored data, at least "
-                          f"every {self._beat_seconds:g}s; stale after "
-                          f"{self._stale_after:g}s; host={_get_local_ip()}, "
-                          f"port={self._port})")
+            _diag.info(f"[{self.name}] ticket heartbeat starting: "
+                       f"{self._ticket_root}/tickets/{self.name} "
+                       f"(on each change of the stored data, at least "
+                       f"every {self._beat_seconds:g}s; stale after "
+                       f"{self._stale_after:g}s; host={_get_local_ip()}, "
+                       f"port={self._port})")
         else:
-            console_print("[streaming-parquet] No store given "
-                          "(store= / $STREAMING_PARQUET_STORE) -- no ticket; "
-                          "the stream is local + direct-ticket only")
+            _diag.info(f"[{self.name}] no store given "
+                       f"(store= / $STREAMING_PARQUET_STORE) -- no ticket; "
+                       f"the stream is local + direct-ticket only")
         # The ticket: written by _write_ticket only, under its own lock,
         # right after each upload and catalog upload and at least every
         # beat. `revision` counts this run's ticket writes; every Flight
@@ -336,8 +335,6 @@ class Stream:
             except Exception as e:
                 if not self._ticket_failing:
                     self._ticket_failing = True
-                    console_print(f"[streaming-parquet] {self.name}: ticket "
-                                  f"write failing: {e}")
                     _diag.error(f"[{self.name}] ticket write failing: {e}")
                 return False
             first = self._ticket_revision == 0
@@ -350,9 +347,9 @@ class Stream:
                 self._ticket_failing = False
                 _diag.info(f"[{self.name}] ticket write recovered")
         if first and published:
-            console_print(f"[streaming-parquet] First ticket published: "
-                          f"{self._ticket_root}/tickets/{self.name} -> "
-                          f"{ticket}")
+            _diag.info(f"[{self.name}] first ticket published: "
+                       f"{self._ticket_root}/tickets/{self.name} -> "
+                       f"{ticket}")
         # A waiting reader answers at once with the new revision.
         self._flight_server.notify(self.name)
         return True
@@ -840,9 +837,8 @@ class Stream:
                     break
                 doing = self._parquet.shipping_now()
                 if doing:
-                    console_print(f"[streaming-parquet] {self.name} close: "
-                                  f"{doing}, {time.monotonic() - t0:.0f} s "
-                                  f"so far")
+                    _diag.info(f"[{self.name}] close: {doing}, "
+                               f"{time.monotonic() - t0:.0f} s so far")
             if not shipped.is_set():
                 doing = self._parquet.shipping_now() or "the mirror pass"
                 msg = (f"[{self.name}] close: still {doing} after "
@@ -850,7 +846,6 @@ class Stream:
                        f"in the local spool ({self._parquet.get_dir()}) and "
                        f"the next start finishes the upload")
                 _diag.warning(msg)
-                console_print(f"[streaming-parquet] {msg}")
                 step("ship-wait TIMEOUT", t0)
             else:
                 step("ship", t0)
@@ -870,16 +865,15 @@ class Stream:
                     break
                 n, total = cat.progress
                 if total > 1:
-                    console_print(f"[streaming-parquet] {self.name} close: "
-                                  f"catalog pass running, {n} of {total} "
-                                  f"file(s) registered")
+                    _diag.info(f"[{self.name}] close: catalog pass "
+                               f"running, {n} of {total} file(s) listed")
             if done:
                 step("catalog", t0)
             else:
                 n, total = cat.progress
-                console_print(f"[streaming-parquet] {self.name} close: "
-                              f"stopping the catalog pass after its current "
-                              f"file ({n} of {total} registered)")
+                _diag.info(f"[{self.name}] close: stopping the catalog "
+                           f"pass after its current file ({n} of {total} "
+                           f"listed)")
                 cat.stop()
                 if cat.wait(10.0):
                     step("catalog STOPPED", t0)

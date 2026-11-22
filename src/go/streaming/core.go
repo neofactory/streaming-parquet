@@ -20,6 +20,7 @@ import "C"
 
 import (
 	"fmt"
+	"log/slog"
 	"runtime"
 	"sync"
 	"time"
@@ -612,12 +613,28 @@ func (rr *readerRules) lost(why error) readerStep {
 func (rr *readerRules) close()         { C.sp_reader_close(rr.r) }
 func (rr *readerRules) reason() string { return C.GoString(C.sp_reader_reason(rr.r)) }
 
+// coreLine is a line the core has for the log, with its level.
+type coreLine struct {
+	level slog.Level
+	text  string
+}
+
 // messages are the lines for the log since the last call.
-func (rr *readerRules) messages() []string {
-	var out []string
+func (rr *readerRules) messages() []coreLine {
+	var out []coreLine
 	var msg [coreMsgLen]C.char
-	for C.sp_reader_message(rr.r, &msg[0], coreMsgLen) != 0 {
-		out = append(out, C.GoString(&msg[0]))
+	for {
+		level := C.sp_reader_message(rr.r, &msg[0], coreMsgLen)
+		if level == 0 {
+			return out
+		}
+		l := slog.LevelInfo
+		switch level {
+		case C.SP_LOG_WARNING:
+			l = slog.LevelWarn
+		case C.SP_LOG_ERROR:
+			l = slog.LevelError
+		}
+		out = append(out, coreLine{l, C.GoString(&msg[0])})
 	}
-	return out
 }

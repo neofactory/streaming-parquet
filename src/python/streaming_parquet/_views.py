@@ -166,6 +166,20 @@ class _MemoryProxy:
 _RUN_TYPE = pa.timestamp("us", "UTC")
 
 
+def refuse_row_id_columns(stream, schema):
+    """row_ids=True on a stream that has a column of one of the two
+    names is refused: the view would have two columns of that name."""
+    if schema is None:
+        return
+    taken = [n for n in (_core.ROW_ID_RUN, _core.ROW_ID_ROW) if n in schema.names]
+    if taken:
+        raise ValueError(
+            f"row_ids=True on the stream {stream!r}: the stream has a "
+            f"column named {' and '.join(taken)} already, and row ids add "
+            f"a column of that name. Make the view without row_ids, or "
+            f"name the stream's column another way.")
+
+
 def _run_time(run):
     """A run (the writer's start, '2026-11-21T23:58:06.066487Z') as a
     datetime; None for no run or text that is not one."""
@@ -242,6 +256,8 @@ class StoreView:
 
     def __init__(self, con, source, name, schema, with_memory, row_ids=False):
         from . import _extension
+        if row_ids:
+            refuse_row_id_columns(source.name, schema)
         _extension.load(con, f"{name}: the archive view of {source.name!r}")
         self.name = name
         self._con = con

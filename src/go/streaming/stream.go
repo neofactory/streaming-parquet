@@ -2,7 +2,6 @@ package streaming
 
 import (
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -301,7 +300,7 @@ func (s *Stream) wrote(err error) {
 		return
 	}
 	if s.failing {
-		fmt.Fprintf(os.Stderr, "[%s] archive recovered\n", s.Name)
+		s.tel.log.Info(fmt.Sprintf("[%s] archive recovered", s.Name))
 		s.failing, s.errText = false, ""
 	}
 }
@@ -309,7 +308,7 @@ func (s *Stream) wrote(err error) {
 // fault records a failure on the parquet path. Caller holds mu.
 func (s *Stream) fault(err error) {
 	if !s.failing {
-		fmt.Fprintf(os.Stderr, "[%s] archive failing: %v\n", s.Name, err)
+		s.tel.log.Error(fmt.Sprintf("[%s] archive failing: %v", s.Name, err))
 	}
 	s.failing, s.errText = true, err.Error()
 }
@@ -374,9 +373,9 @@ func (s *Stream) Publish() error {
 		s.hbDone.Add(1)
 		go s.heartbeat(s.stopHB)
 	} else {
-		fmt.Fprintf(os.Stderr, "[%s] no discovery root configured "+
+		s.tel.log.Info(fmt.Sprintf("[%s] no discovery root configured "+
 			"(Config.Root / $STREAMING_PARQUET_ROOT) — no ticket; "+
-			"the stream is local + direct-ticket only\n", s.Name)
+			"the stream is local + direct-ticket only", s.Name))
 	}
 	return nil
 }
@@ -400,8 +399,8 @@ func (s *Stream) unpublish() {
 		close(s.stopHB)
 		s.hbDone.Wait()
 		if err := s.tel.tickets.delete(s.Name); err != nil {
-			fmt.Fprintf(os.Stderr, "[%s] ticket delete failed: %v\n",
-				s.Name, err)
+			s.tel.log.Warn(fmt.Sprintf("[%s] ticket delete failed: %v",
+				s.Name, err))
 		}
 	}
 	s.tel.flight.unregister(s.Name)
@@ -413,7 +412,7 @@ func (s *Stream) catalogFor(sink pqc.Sink, folder string) *catalog {
 	if c := s.catalogs[folder]; c != nil {
 		return c
 	}
-	c := newCatalog(s.Name, folder, sink, s.store, s.ticketWritten)
+	c := newCatalog(s.Name, folder, sink, s.store, s.ticketWritten, s.tel.log)
 	if c != nil {
 		if s.catalogs == nil {
 			s.catalogs = map[string]*catalog{}
@@ -476,12 +475,12 @@ func (s *Stream) heartbeat(stop chan struct{}) {
 		if where != "" {
 			// what a reader can take from the store: the core's record
 			if err := s.store.fill(&t, where); err != nil {
-				fmt.Fprintf(os.Stderr, "[%s] ticket: %v\n", s.Name, err)
+				s.tel.log.Error(fmt.Sprintf("[%s] ticket: %v", s.Name, err))
 			}
 		}
 		if err := s.tel.tickets.put(s.Name, t); err != nil {
-			fmt.Fprintf(os.Stderr, "[%s] ticket publish error: %v\n",
-				s.Name, err)
+			s.tel.log.Error(fmt.Sprintf("[%s] ticket publish error: %v",
+				s.Name, err))
 		} else {
 			s.ticketStored.Store(revision)
 		}
@@ -548,7 +547,7 @@ func (s *Stream) StartParquet(label string, o *ParquetOptions) error {
 		}
 		lost = s.arch.lost()
 	}
-	arch, err := newArchiver(s.ring, s.Name, s.run, opts, s.store, s.catalogFor)
+	arch, err := newArchiver(s.ring, s.Name, s.run, opts, s.store, s.catalogFor, s.tel.log)
 	if err != nil {
 		return err
 	}

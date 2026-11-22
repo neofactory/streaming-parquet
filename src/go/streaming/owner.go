@@ -80,7 +80,7 @@ func (t *Telemetry) claim(name, run string) (*ownership, error) {
 	if err != nil {
 		// an unreachable store at start never delays the stream: this
 		// server's lock still holds
-		fmt.Fprintln(os.Stderr, ownershipUnread(name, t.root, err))
+		t.log.Warn(ownershipUnread(name, t.root, err))
 		return owned, nil
 	}
 	decision, message := ownershipDecision(who, name, t.root, ticket, host,
@@ -90,7 +90,7 @@ func (t *Telemetry) claim(name, run string) (*ownership, error) {
 		owned.release()
 		return nil, errors.New(message)
 	case ownTakeOver:
-		fmt.Fprintln(os.Stderr, message)
+		t.log.Warn(message)
 	}
 	return owned, nil
 }

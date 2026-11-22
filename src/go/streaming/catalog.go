@@ -35,7 +35,7 @@ import "C"
 import (
 	"errors"
 	"fmt"
-	"os"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -64,6 +64,7 @@ type catalog struct {
 	sink   pqc.Sink
 	vs     pqc.Versioned
 	store  *storeState
+	log    *slog.Logger
 	// writeTicket writes the stream's ticket now; false when it could
 	// not. Nil: the stream has no ticket.
 	writeTicket func() bool
@@ -83,13 +84,13 @@ type catalog struct {
 	cat *C.SpCatalog // the pass goroutine's alone
 }
 
-func newCatalog(name, folder string, sink pqc.Sink, store *storeState, writeTicket func() bool) *catalog {
+func newCatalog(name, folder string, sink pqc.Sink, store *storeState, writeTicket func() bool, log *slog.Logger) *catalog {
 	vs, ok := sink.(pqc.Versioned)
 	if !ok {
 		return nil // a sink that cannot publish by version: no catalog
 	}
 	return &catalog{name: name, folder: folder, sink: sink, vs: vs, store: store,
-		writeTicket: writeTicket, awaiting: map[string]bool{}, wanted: true}
+		writeTicket: writeTicket, awaiting: map[string]bool{}, wanted: true, log: log}
 }
 
 func (c *catalog) state() (files int, errText string) {
@@ -135,15 +136,15 @@ func (c *catalog) run() {
 		switch {
 		case err == nil:
 			if c.errText != "" {
-				fmt.Fprintf(os.Stderr, "[%s] catalog recovered\n", c.name)
+				c.log.Info(fmt.Sprintf("[%s] catalog recovered", c.name))
 			}
 			c.errText = ""
 		case errors.Is(err, errCatalogStopped):
-			fmt.Fprintf(os.Stderr, "[%s] catalog pass %v; the next start's "+
-				"pass finishes it\n", c.name, err)
+			c.log.Info(fmt.Sprintf("[%s] catalog pass %v; the next start's "+
+				"pass finishes it", c.name, err))
 		default:
 			if c.errText == "" {
-				fmt.Fprintf(os.Stderr, "[%s] catalog failing: %v\n", c.name, err)
+				c.log.Error(fmt.Sprintf("[%s] catalog failing: %v", c.name, err))
 			}
 			c.errText = err.Error()
 			c.wanted = true // the next finished file or checkpoint tries again
@@ -184,8 +185,8 @@ func (c *catalog) pass() (map[string]bool, error) {
 		if !errors.Is(err, pqc.ErrChanged) {
 			return nil, err
 		}
-		fmt.Fprintf(os.Stderr, "[%s] catalog: %v since this writer's last "+
-			"upload; fetching it again\n", c.name, err)
+		c.log.Warn(fmt.Sprintf("[%s] catalog: %v since this writer's last "+
+			"upload; fetching it again", c.name, err))
 	}
 	return nil, fmt.Errorf("the published catalog changed under three passes "+
 		"in a row: another writer is updating it (%w)", err)
@@ -277,9 +278,9 @@ func (c *catalog) passOnce() (map[string]bool, error) {
 	c.mu.Lock()
 	c.etag, c.files = etag, count
 	c.mu.Unlock()
-	fmt.Fprintf(os.Stderr, "[%s] catalog: listed %d file(s), %d in all; "+
-		"published %s%s (%.1f MB)\n", c.name, added, count, c.folder,
-		catalogObject, float64(len(data))/1e6)
+	c.log.Info(fmt.Sprintf("[%s] catalog: listed %d file(s), %d in all; "+
+		"published %s%s (%.1f MB)", c.name, added, count, c.folder,
+		catalogObject, float64(len(data))/1e6))
 	return names, nil
 }
 
@@ -371,8 +372,8 @@ func (c *catalog) discardDue() {
 			continue
 		}
 		if err := pqc.DiscardCheckpoints(n, c.sink); err != nil {
-			fmt.Fprintf(os.Stderr, "[%s] deleting the checkpoints of %s after "+
-				"the ticket dropped it: %v; the next checkpoint retries\n", c.name, n, err)
+			c.log.Error(fmt.Sprintf("[%s] deleting the checkpoints of %s after "+
+				"the ticket dropped it: %v; the next checkpoint retries", c.name, n, err))
 			continue
 		}
 		c.store.discarded(n)
@@ -403,7 +404,7 @@ func (c *catalog) finish(wait time.Duration) {
 		select {
 		case <-done:
 		case <-time.After(30 * time.Second):
-			fmt.Fprintf(os.Stderr, "[%s] catalog: the pass did not stop in 30 s\n", c.name)
+			c.log.Warn(fmt.Sprintf("[%s] catalog: the pass did not stop in 30 s", c.name))
 			return // the pass still holds the catalog in memory
 		}
 	}

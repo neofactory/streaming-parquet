@@ -15,6 +15,8 @@ old name carries a `// Deprecated:` comment, which editors and
 | `Archive` | `ParquetOptions` | Python | 2026-11-11 | 2027-02-11 |
 | `Archive(parquet=...)` | `ParquetOptions(compression=...)` | Python | 2026-11-11 | 2027-02-11 |
 | `create_stream(archive=...)` | `create_stream(parquet=...)` | Python | 2026-11-11 | 2027-02-11 |
+| `suppress_console` | `logging.getLogger("streaming_parquet").propagate = False` | Python | 2026-11-22 | 2027-02-22 |
+| `set_verbosity` | `logging.getLogger("streaming_parquet").setLevel(...)` | Python | 2026-11-22 | 2027-02-22 |
 | `ArchiveOptions` | `ParquetOptions` | Go | 2026-11-11 | 2027-02-11 |
 
 ## Changes with no old name
@@ -32,6 +34,19 @@ the compiler names the line.
 | `s.Ring().Commit()` then `s.Publish()` | `s.Commit()`; the stream's goroutine writes the files | 2026-11-12 |
 | the error returned by `s.Publish()` | `s.ArchiveState().Failing` and `.Error` | 2026-11-12 |
 | `s.Publish()`, the step after a commit | removed; `s.Publish()` now makes an internal stream findable and readable | 2026-11-12 |
+
+## Logging, changed 2026-11-22
+
+The Python library no longer writes `telemetry-diag.log` by itself, and
+no longer prints its lines on standard error by itself. It logs to the
+logger `streaming_parquet` of `logging`, and the program decides where
+the lines go. A program that wants the file calls
+`sp.log_to_file("telemetry-diag.log")`. The logger's old name,
+`telemetry.diag`, is gone: a handler a program put on it gets nothing.
+
+In Go the lines go to `Config.Logger`, a `*slog.Logger`; with none,
+warnings and errors go to standard error. Before, every line was
+printed on standard error.
 
 ## The rule for names
 

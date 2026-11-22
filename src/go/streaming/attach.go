@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"os"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +25,7 @@ import (
 // parquet path consumes a ring and any ring can archive.
 type Attached struct {
 	Name string
+	log  *slog.Logger
 
 	// last ticket seen (host/port/archive); nil before discovery
 	lastTicket atomic.Pointer[Ticket]
@@ -78,7 +79,7 @@ func (t *Telemetry) Attach(name string, o AttachOptions) (*Attached, error) {
 		archOpt = &opts
 	}
 	a := &Attached{Name: name, capacity: ringRows, columns: o.Columns,
-		archOpt: archOpt, closed: make(chan struct{})}
+		archOpt: archOpt, closed: make(chan struct{}), log: t.log}
 	rules, err := newReaderRules(fmt.Sprintf("Attach(%q)", name), name, t.root,
 		o.Ticket != nil)
 	if err != nil {
@@ -117,7 +118,7 @@ func (a *Attached) took(st readerStep) readerStep {
 	}
 	a.reason.Store(a.rules.reason())
 	for _, line := range a.rules.messages() {
-		fmt.Fprintln(os.Stderr, line)
+		a.log.Log(context.Background(), line.level, line.text)
 	}
 	return st
 }
@@ -258,8 +259,8 @@ func (a *Attached) dropRing(own bool) {
 	if own {
 		if a.arch != nil && a.arch.recording() {
 			if err := a.arch.stop(); err != nil {
-				fmt.Fprintf(os.Stderr, "[%s] a new run: finishing the "+
-					"earlier run's file failed: %v\n", a.Name, err)
+				a.log.Error(fmt.Sprintf("[%s] a new run: finishing the "+
+					"earlier run's file failed: %v", a.Name, err))
 			}
 		}
 		if a.ring != nil {
@@ -395,7 +396,7 @@ func (a *Attached) receive(tk *Ticket) error {
 		}
 		a.ring, a.ownRing = r, true
 		if a.archOpt != nil {
-			arch, err := newArchiver(r, a.Name, tk.Run, *a.archOpt, nil, nil)
+			arch, err := newArchiver(r, a.Name, tk.Run, *a.archOpt, nil, nil, a.log)
 			if err != nil {
 				a.mu.Unlock()
 				return err
@@ -463,7 +464,7 @@ func (a *Attached) receive(tk *Ticket) error {
 				return err
 			}
 			if archErr != nil {
-				fmt.Fprintf(os.Stderr, "[%s] archiver: %v\n", a.Name, archErr)
+				a.log.Error(fmt.Sprintf("[%s] archiver: %v", a.Name, archErr))
 			}
 			if firstSeq >= 0 {
 				from = firstSeq + rec.NumRows()

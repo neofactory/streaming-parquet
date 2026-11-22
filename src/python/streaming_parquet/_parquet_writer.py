@@ -30,7 +30,9 @@ import parquet_checkpoint
 import time
 
 from . import _core
-from ._diag import _diag, get_verbosity
+import logging
+
+from ._diag import _diag
 
 
 def default_encodings(schema):
@@ -572,7 +574,7 @@ class ParquetWriter:
             _diag.info(f"[{self._stream_name}] remote finalized {name}")
         self.discard_due()              # the upload step deletes what is superseded
         elapsed = time.monotonic() - t_pass
-        if parts and (elapsed >= self.SHIP_SLOW_S or get_verbosity() >= 2):
+        if parts and (elapsed >= self.SHIP_SLOW_S or _diag.isEnabledFor(logging.DEBUG)):
             _diag.info(f"[{self._stream_name}] ship pass {elapsed:.2f}s"
                        f"{' SLOW' if elapsed >= self.SHIP_SLOW_S else ''}: "
                        + "; ".join(parts))
