@@ -120,7 +120,10 @@ func (t *Telemetry) CreateStream(name string, schema *arrow.Schema,
 	if dup {
 		return nil, &DupStreamError{name}
 	}
-	r, err := ring.NewRing(schema, ringRows, nil)
+	// The ring's writer is the program's goroutine, which must do no
+	// output: the ring keeps the lines its core makes for the log, and
+	// the stream's goroutine logs them (work).
+	r, err := ring.NewRing(schema, ringRows, &ring.Options{Logger: t.log, HoldLines: true})
 	if err != nil {
 		return nil, err
 	}
@@ -184,6 +187,12 @@ func (s *Stream) Commit() (int64, error) {
 	n, err := s.ring.Commit()
 	s.tel.flight.notify(s.Name)
 	s.plan()
+	if s.ring.LinesHeld() { // the stream's goroutine logs them
+		select {
+		case s.wake <- struct{}{}:
+		default:
+		}
+	}
 	return n, err
 }
 
@@ -222,6 +231,7 @@ func (s *Stream) work() {
 			s.tel.flight.notify(s.Name) // rows committed on the ring directly
 			s.plan()
 		}
+		s.ring.LogLines() // what the ring's core said on the writer's goroutine
 		s.write()
 		if !timer.Stop() {
 			select {
@@ -646,6 +656,7 @@ func (s *Stream) Close() error {
 
 	close(s.stopWork)
 	s.workDone.Wait()
+	s.ring.LogLines() // the goroutine that logs them has stopped
 	s.tel.flight.notify(s.Name)
 
 	s.io.Lock()

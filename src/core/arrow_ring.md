@@ -7,12 +7,15 @@ target shape) covers ring lifecycle, leaf set/get, commit/pins,
 the segment pool, and record-set export as ArrowArrayStream — verified
 end-to-end against pyarrow via the C interfaces (`make` then
 `python3 smoke_test.py`, 14/14: fixed/struct/nullable/utf8/list
-columns, zero-copy buffer identity, pin-stall and release). Loud
-not-implemented stubs: ar_append_batch/stream, ArWireMap,
-ar_recordset_write_ipc, the parquet shim. nanoarrow not yet needed —
-schema format strings are parsed directly; nanoarrow arrives with IPC.
-Next: the CFFI binding so the Python package's 31-test suite runs on
-this core (the acceptance gate); then ingest + wire maps.
+columns, zero-copy buffer identity, pin-stall and release). Since then:
+ingest (ar_append_batch/stream), wire maps, the chunk cursor, and the
+Python and Go bindings. nanoarrow is not needed: schema format strings
+are parsed directly.
+
+How a call reports is `report.h`, the same for the three cores: a
+status, and the reason and the lines for the host's log in the `Report`
+the caller passed. The core writes nowhere, calls no function of the
+host, and never waits.
 
 ## Why a C core
 
@@ -42,16 +45,15 @@ one data memcpy into the segment pool + an O(n) offset rebase; bitmaps
 memcpy when the landing slot is 8-aligned, shift-copy otherwise.
 Nanoseconds per packet, no per-row work in any language.
 
-**Send** (`ar_recordset_stream` / `ar_recordset_write_ipc`): the
-batches ARE the ring's buffers — IPC encoding writes a small header
-then the buffer bytes straight from ring memory. Frozen-after-commit
+**Send** (`ar_recordset_stream`): the batches ARE the ring's buffers —
+a host's IPC writer writes a small header then the buffer bytes
+straight from ring memory. Frozen-after-commit
 is what makes that safe; pins are what keep it safe while it happens.
 
-**Parquet**: no pure-C parquet encoder exists, so parquet is a
-companion module (`libarrow_ring_parquet`, a thin C-ABI shim over
-parquet-cpp). The core does not link Arrow C++. Bindings may skip the
-shim entirely and feed `ar_recordset_stream` to their host language's
-parquet writer — same buffers either way.
+**Parquet**: no pure-C parquet encoder exists, and the core does not
+link Arrow C++. A binding feeds `ar_recordset_stream` to its host
+language's parquet writer (pyarrow, arrow-go): the buffers are the
+ring's.
 
 ## Modules
 
@@ -77,7 +79,8 @@ recycled slot lifecycle; monotonic seqs, slot = seq % capacity;
 nullable leaves reset to null on allocation, var leaves stamp the pool
 cursor (keeps elem-starts cumulative for chunk math); the pin is the
 guarantee, and a pin holds exactly its rows; writer-blocks-on-pin with the
-caller owning the grace policy (AR_ERR_PIN_STALLED after block_ms);
+caller owning the grace policy (ar_row_begin answers REPORT_BLOCKED at
+once; the host waits and calls again, for as long as it chooses);
 pool growth never stalls the writer, pins only delay segment reuse;
 chunk cuts at ring wrap + segment boundaries + rewrite
 discontinuities; int32-offset overflow is a loud error naming the

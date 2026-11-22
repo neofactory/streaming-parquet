@@ -640,7 +640,7 @@ itself.
 |---|---|---|
 | Python | the loggers `streaming_parquet`, `parquet_checkpoint` and `arrow_ring` of `logging` | warnings and errors on standard error; no file |
 | Go | the `*slog.Logger` given in `Config.Logger` | warnings and errors on standard error, as text |
-| C cores | the host: the ring calls a function the host gives (`ArRingOptions.diag`); the stream core hands its lines to the host with their level (`sp_reader_message`, `sp_view_message`) | — |
+| C cores | the host. A core writes nowhere: each line comes back, with its level and the time it was made, in the `Report` of the call that made it (`src/core/report.h`), and the host logs it | — |
 
     import logging
     logging.basicConfig(level=logging.INFO)        # the program's own setup

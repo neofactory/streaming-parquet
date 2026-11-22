@@ -13,6 +13,12 @@
 //
 // Threading contract (from the core): ONE writer goroutine per ring;
 // any number of reader goroutines.
+//
+// How the core reports is src/core/report.h: every call that can fail,
+// or that can have a line for the log, is given a Report. Its status
+// and reason become an *Error; its lines go to the ring's logger
+// (Options.Logger). The core writes nowhere and never waits: RowBegin
+// does the waiting for a pin here.
 package ring
 
 /*
@@ -34,8 +40,11 @@ static void *leaf_valid_ptr(const ArRing *r, int32_t leaf) {
 import "C"
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"runtime"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -51,16 +60,67 @@ type Error struct {
 
 func (e *Error) Error() string { return e.Status + ": " + e.Detail }
 
-var statusNames = map[C.ArStatus]string{
-	C.AR_ERR_INVALID:          "invalid",
-	C.AR_ERR_TYPE_UNSUPPORTED: "type-unsupported",
-	C.AR_ERR_STALE:            "stale",
-	C.AR_ERR_PIN_STALLED:      "pin-stalled",
-	C.AR_ERR_NOT_NULLABLE:     "not-nullable",
-	C.AR_ERR_WIDTH:            "width",
-	C.AR_ERR_OFFSET_OVERFLOW:  "offset-overflow",
-	C.AR_ERR_NOMEM:            "nomem",
-	C.AR_ERR_IO:               "io",
+// The names of the statuses of report.h that the ring gives.
+var statusNames = map[int]string{
+	int(C.REPORT_INVALID):      "invalid",
+	int(C.REPORT_REFUSED):      "refused",
+	int(C.REPORT_UNSUPPORTED):  "type-unsupported",
+	int(C.REPORT_STALE):        "stale",
+	int(C.REPORT_BLOCKED):      "pin-stalled",
+	int(C.REPORT_NOT_NULLABLE): "not-nullable",
+	int(C.REPORT_WIDTH):        "width",
+	int(C.REPORT_OVERFLOW):     "offset-overflow",
+	int(C.REPORT_NO_MEMORY):    "nomem",
+}
+
+// A reader's call takes a Report from this list and gives it back: C
+// memory, so the garbage collector neither moves nor counts it. (The
+// writer's calls use the ring's own.)
+var freeReports = make(chan *C.Report, 64)
+
+func getReport() *C.Report {
+	select {
+	case rep := <-freeReports:
+		return rep
+	default:
+		return (*C.Report)(C.malloc(C.sizeof_Report))
+	}
+}
+
+func putReport(rep *C.Report) {
+	select {
+	case freeReports <- rep:
+	default:
+		C.free(unsafe.Pointer(rep))
+	}
+}
+
+// coreErr is the error of a call that failed: its status name and the
+// reason in its report.
+func coreErr(rep *C.Report) error {
+	name := statusNames[int(rep.status)]
+	if name == "" {
+		name = fmt.Sprintf("status-%d", int(rep.status))
+	}
+	return &Error{Status: name, Detail: C.GoString(&rep.error[0])}
+}
+
+// readErr is coreErr for a reader's call: the report goes back to the
+// list.
+func readErr(rep *C.Report, st C.int) error {
+	defer putReport(rep)
+	if st == C.REPORT_OK {
+		return nil
+	}
+	return coreErr(rep)
+}
+
+// Line is a line the core made for the log: its level, when the core
+// made it, and its text.
+type Line struct {
+	Level slog.Level
+	Time  time.Time
+	Text  string
 }
 
 // IsStale reports whether err is the core's stale-read refusal (the
@@ -81,25 +141,113 @@ func IsPinStalled(err error) bool {
 // Ring wraps one ArRing.
 type Ring struct {
 	c        *C.ArRing
+	wr       *C.Report // the writer's Report: one writer goroutine per ring
 	schema   *arrow.Schema
 	leaves   map[string]int32
 	info     []*leafInfo // by leaf index: the direct-store shape (direct.go)
 	capacity int64
 	slot     int64 // the open row's slot, from RowBegin
+
+	log  *slog.Logger
+	hold bool
+	mu   sync.Mutex // covers held and lost
+	held []Line
+	lost int
 }
+
+// mostLines is how many lines a ring keeps for LogLines.
+const mostLines = 256
 
 // Options mirror ArRingOptions; zero values take the core's defaults.
 type Options struct {
 	SegmentBytes int64 // var-width pool segment size; default 1<<20
+
+	// Logger gets the lines the core makes for the log (an oversized
+	// value, a jump in the row numbers), as warnings, each with the
+	// time the core made it. nil: slog.Default().
+	Logger *slog.Logger
+
+	// HoldLines false: a line is logged at once, by the goroutine whose
+	// call made it. true: the lines are kept until LogLines, for a host
+	// whose writer goroutine must do no output and which has another
+	// goroutine to call LogLines from.
+	HoldLines bool
 }
 
-func (r *Ring) err(st C.ArStatus) error {
-	name := statusNames[st]
-	if name == "" {
-		name = fmt.Sprintf("status-%d", int(st))
+// said takes the lines of a writer's call from its report.
+func (r *Ring) said() {
+	rep := r.wr
+	if rep.lines == 0 && rep.dropped == 0 {
+		return
 	}
-	return &Error{Status: name, Detail: C.GoString(C.ar_last_error(r.c))}
+	for i := 0; i < int(rep.lines); i++ {
+		l := &rep.line[i]
+		level := slog.LevelInfo
+		switch l.level {
+		case C.REPORT_WARNING:
+			level = slog.LevelWarn
+		case C.REPORT_ERROR:
+			level = slog.LevelError
+		}
+		line := Line{level, time.Unix(0, int64(float64(l.wall)*1e9)), C.GoString(&l.text[0])}
+		if !r.hold {
+			r.logLine(line)
+			continue
+		}
+		r.mu.Lock()
+		if len(r.held) < mostLines {
+			r.held = append(r.held, line)
+		} else {
+			r.lost++
+		}
+		r.mu.Unlock()
+	}
+	if rep.dropped > 0 {
+		r.mu.Lock()
+		r.lost += int(rep.dropped)
+		r.mu.Unlock()
+	}
 }
+
+func (r *Ring) logLine(l Line) {
+	ctx := context.Background()
+	if !r.log.Enabled(ctx, l.Level) {
+		return
+	}
+	r.log.Handler().Handle(ctx, slog.NewRecord(l.Time, l.Level, l.Text, 0))
+}
+
+// LinesHeld reports whether lines are kept and wait for LogLines.
+func (r *Ring) LinesHeld() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.held) > 0 || r.lost > 0
+}
+
+// TakeLines returns the kept lines, oldest first; they are no longer
+// kept.
+func (r *Ring) TakeLines() []Line {
+	r.mu.Lock()
+	out, lost := r.held, r.lost
+	r.held, r.lost = nil, 0
+	r.mu.Unlock()
+	if lost > 0 {
+		out = append(out, Line{slog.LevelWarn, time.Now(), fmt.Sprintf(
+			"[arrow_ring] %d more lines of the core were made and not kept", lost)})
+	}
+	return out
+}
+
+// LogLines logs the kept lines to the ring's logger, each with the
+// time the core made it. Any goroutine but the writer's.
+func (r *Ring) LogLines() {
+	for _, l := range r.TakeLines() {
+		r.logLine(l)
+	}
+}
+
+// werr is the error of a writer's call that failed.
+func (r *Ring) werr() error { return coreErr(r.wr) }
 
 // NewRing creates a ring for the schema (see the header for the type
 // surface). Capacity is rows — the total loss-free budget for every
@@ -108,19 +256,25 @@ func NewRing(schema *arrow.Schema, capacity int64, opts *Options) (*Ring, error)
 	var cs cdata.CArrowSchema
 	cdata.ExportArrowSchema(schema, &cs)
 	var co C.ArRingOptions
+	log, hold := slog.Default(), false
 	if opts != nil {
 		co.segment_bytes = C.int64_t(opts.SegmentBytes)
+		hold = opts.HoldLines
+		if opts.Logger != nil {
+			log = opts.Logger
+		}
 	}
 	var cr *C.ArRing
+	wr := (*C.Report)(C.malloc(C.sizeof_Report))
 	st := C.ar_ring_new((*C.struct_ArrowSchema)(unsafe.Pointer(&cs)),
-		C.int64_t(capacity), &co, &cr)
-	if st != C.AR_OK {
-		// no ring handle yet; the core wrote the detail to the
-		// (thread-local) error slot reachable via a NULL ring
-		return nil, &Error{Status: statusNames[st],
-			Detail: C.GoString(C.ar_last_error(nil))}
+		C.int64_t(capacity), &co, &cr, wr)
+	if st != C.REPORT_OK {
+		err := coreErr(wr)
+		C.free(unsafe.Pointer(wr))
+		return nil, err
 	}
-	r := &Ring{c: cr, schema: schema, leaves: map[string]int32{}, capacity: capacity}
+	r := &Ring{c: cr, wr: wr, schema: schema, leaves: map[string]int32{},
+		capacity: capacity, log: log, hold: hold}
 	byPath := map[string]*leafInfo{}
 	if err := flattenLeaves(schema.Fields(), "", byPath); err != nil {
 		C.ar_ring_free(cr)
@@ -153,6 +307,8 @@ func (r *Ring) Close() {
 	if r.c != nil {
 		C.ar_ring_free(r.c)
 		r.c = nil
+		C.free(unsafe.Pointer(r.wr))
+		r.wr = nil
 	}
 }
 
@@ -180,12 +336,19 @@ func (r *Ring) LeafPaths() []string {
 
 // RowBegin allocates the next slot; block bounds the wait on a pinned
 // recycle target (IsPinStalled on timeout, with the pin named in the
-// detail).
+// detail). The waiting is done here: the core answers at once.
 func (r *Ring) RowBegin(block time.Duration) (int64, error) {
 	var seq C.int64_t
-	st := C.ar_row_begin(r.c, C.int64_t(block/time.Millisecond), &seq)
-	if st != C.AR_OK {
-		return -1, r.err(st)
+	st := C.ar_row_begin(r.c, &seq, r.wr)
+	if st == C.REPORT_BLOCKED && block > 0 {
+		deadline := time.Now().Add(block)
+		for st == C.REPORT_BLOCKED && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+			st = C.ar_row_begin(r.c, &seq, r.wr)
+		}
+	}
+	if st != C.REPORT_OK {
+		return -1, r.werr()
 	}
 	r.slot = int64(seq) % r.capacity
 	return int64(seq), nil
@@ -239,8 +402,8 @@ func (r *Ring) SetF64(leaf int32, v float64) error {
 	case 4:
 		*(*float32)(unsafe.Add(li.data, r.slot*4)) = float32(v)
 	default: // float16: the core converts
-		if st := C.ar_set_f64(r.c, C.int32_t(leaf), C.double(v)); st != C.AR_OK {
-			return r.err(st)
+		if st := C.ar_set_f64(r.c, C.int32_t(leaf), C.double(v), r.wr); st != C.REPORT_OK {
+			return r.werr()
 		}
 		return nil
 	}
@@ -284,10 +447,11 @@ func (r *Ring) SetBytes(leaf int32, v []byte) error {
 	if len(v) > 0 {
 		p = unsafe.Pointer(&v[0])
 	}
-	st := C.ar_set_bytes(r.c, C.int32_t(leaf), p, C.int64_t(len(v)))
+	st := C.ar_set_bytes(r.c, C.int32_t(leaf), p, C.int64_t(len(v)), r.wr)
 	runtime.KeepAlive(v)
-	if st != C.AR_OK {
-		return r.err(st)
+	r.said() // a value larger than a pool segment makes a line
+	if st != C.REPORT_OK {
+		return r.werr()
 	}
 	return nil
 }
@@ -316,10 +480,11 @@ func (r *Ring) SetList(leaf int32, elems []byte, nElems int64) error {
 	if len(elems) > 0 {
 		p = unsafe.Pointer(&elems[0])
 	}
-	st := C.ar_set_list(r.c, C.int32_t(leaf), p, C.int64_t(nElems))
+	st := C.ar_set_list(r.c, C.int32_t(leaf), p, C.int64_t(nElems), r.wr)
 	runtime.KeepAlive(elems)
-	if st != C.AR_OK {
-		return r.err(st)
+	r.said()
+	if st != C.REPORT_OK {
+		return r.werr()
 	}
 	return nil
 }
@@ -333,8 +498,8 @@ func (r *Ring) SetNull(leaf int32) error {
 		return &Error{Status: "not-nullable", Detail: fmt.Sprintf("field '%s' is not nullable", li.path)}
 	}
 	if li.kind == kindVar { // the core also zeroes the row's length
-		if st := C.ar_set_null(r.c, C.int32_t(leaf)); st != C.AR_OK {
-			return r.err(st)
+		if st := C.ar_set_null(r.c, C.int32_t(leaf), r.wr); st != C.REPORT_OK {
+			return r.werr()
 		}
 		return nil
 	}
@@ -345,8 +510,8 @@ func (r *Ring) SetNull(leaf int32) error {
 // Commit freezes every allocated row. Cheap: a pointer advance.
 func (r *Ring) Commit() (int64, error) {
 	var n C.int64_t
-	if st := C.ar_commit(r.c, &n); st != C.AR_OK {
-		return 0, r.err(st)
+	if st := C.ar_commit(r.c, &n, r.wr); st != C.REPORT_OK {
+		return 0, r.werr()
 	}
 	return int64(n), nil
 }
@@ -367,9 +532,10 @@ func (r *Ring) AppendRecordAt(rec arrow.RecordBatch, firstSeq int64) error {
 	var ca cdata.CArrowArray
 	cdata.ExportArrowRecordBatch(rec, &ca, nil)
 	st := C.ar_append_batch_at(r.c,
-		(*C.struct_ArrowArray)(unsafe.Pointer(&ca)), C.int64_t(firstSeq))
-	if st != C.AR_OK {
-		return r.err(st)
+		(*C.struct_ArrowArray)(unsafe.Pointer(&ca)), C.int64_t(firstSeq), r.wr)
+	r.said() // a jump in the row numbers makes a line
+	if st != C.REPORT_OK {
+		return r.werr()
 	}
 	return nil
 }
@@ -379,8 +545,9 @@ func (r *Ring) AppendRecordAt(rec arrow.RecordBatch, firstSeq int64) error {
 func (r *Ring) GetI64(seq int64, leaf int32) (v int64, isNull bool, err error) {
 	var cv C.int64_t
 	var n C.bool
-	if st := C.ar_get_i64(r.c, C.int64_t(seq), C.int32_t(leaf), &cv, &n); st != C.AR_OK {
-		return 0, false, r.err(st)
+	rep := getReport()
+	if err := readErr(rep, C.ar_get_i64(r.c, C.int64_t(seq), C.int32_t(leaf), &cv, &n, rep)); err != nil {
+		return 0, false, err
 	}
 	return int64(cv), bool(n), nil
 }
@@ -388,8 +555,9 @@ func (r *Ring) GetI64(seq int64, leaf int32) (v int64, isNull bool, err error) {
 func (r *Ring) GetU64(seq int64, leaf int32) (v uint64, isNull bool, err error) {
 	var cv C.uint64_t
 	var n C.bool
-	if st := C.ar_get_u64(r.c, C.int64_t(seq), C.int32_t(leaf), &cv, &n); st != C.AR_OK {
-		return 0, false, r.err(st)
+	rep := getReport()
+	if err := readErr(rep, C.ar_get_u64(r.c, C.int64_t(seq), C.int32_t(leaf), &cv, &n, rep)); err != nil {
+		return 0, false, err
 	}
 	return uint64(cv), bool(n), nil
 }
@@ -397,16 +565,18 @@ func (r *Ring) GetU64(seq int64, leaf int32) (v uint64, isNull bool, err error) 
 func (r *Ring) GetF64(seq int64, leaf int32) (v float64, isNull bool, err error) {
 	var cv C.double
 	var n C.bool
-	if st := C.ar_get_f64(r.c, C.int64_t(seq), C.int32_t(leaf), &cv, &n); st != C.AR_OK {
-		return 0, false, r.err(st)
+	rep := getReport()
+	if err := readErr(rep, C.ar_get_f64(r.c, C.int64_t(seq), C.int32_t(leaf), &cv, &n, rep)); err != nil {
+		return 0, false, err
 	}
 	return float64(cv), bool(n), nil
 }
 
 func (r *Ring) GetBool(seq int64, leaf int32) (v bool, isNull bool, err error) {
 	var cv, n C.bool
-	if st := C.ar_get_bool(r.c, C.int64_t(seq), C.int32_t(leaf), &cv, &n); st != C.AR_OK {
-		return false, false, r.err(st)
+	rep := getReport()
+	if err := readErr(rep, C.ar_get_bool(r.c, C.int64_t(seq), C.int32_t(leaf), &cv, &n, rep)); err != nil {
+		return false, false, err
 	}
 	return bool(cv), bool(n), nil
 }
@@ -418,10 +588,10 @@ func (r *Ring) GetBytes(seq int64, leaf int32) (v []byte, isNull bool, err error
 	var p unsafe.Pointer
 	var n C.int64_t
 	var isn C.bool
-	st := C.ar_get_var(r.c, C.int64_t(seq), C.int32_t(leaf),
-		(*unsafe.Pointer)(unsafe.Pointer(&p)), &n, &isn)
-	if st != C.AR_OK {
-		return nil, false, r.err(st)
+	rep := getReport()
+	if err := readErr(rep, C.ar_get_var(r.c, C.int64_t(seq), C.int32_t(leaf),
+		(*unsafe.Pointer)(unsafe.Pointer(&p)), &n, &isn, rep)); err != nil {
+		return nil, false, err
 	}
 	if bool(isn) || p == nil {
 		return nil, bool(isn), nil
@@ -462,10 +632,10 @@ func (r *Ring) NewWireMap(entries []WireEntry) (*WireMap, error) {
 		sizes[i] = C.int32_t(e.Size)
 	}
 	var m *C.ArWireMap
-	st := C.ar_wiremap_new(r.c, &leaves[0], &offsets[0], &sizes[0],
-		C.int32_t(n), &m)
-	if st != C.AR_OK {
-		return nil, r.err(st)
+	rep := getReport()
+	if err := readErr(rep, C.ar_wiremap_new(r.c, &leaves[0], &offsets[0], &sizes[0],
+		C.int32_t(n), &m, rep)); err != nil {
+		return nil, err
 	}
 	return &WireMap{c: m, ring: r}, nil
 }
@@ -480,10 +650,10 @@ func (m *WireMap) Close() {
 // FromWire scatters one frame into the open row (RowBegin first).
 func (r *Ring) FromWire(m *WireMap, frame []byte) error {
 	st := C.ar_from_wire(r.c, m.c, unsafe.Pointer(&frame[0]),
-		C.int64_t(len(frame)))
+		C.int64_t(len(frame)), r.wr)
 	runtime.KeepAlive(frame)
-	if st != C.AR_OK {
-		return r.err(st)
+	if st != C.REPORT_OK {
+		return r.werr()
 	}
 	return nil
 }
@@ -491,10 +661,10 @@ func (r *Ring) FromWire(m *WireMap, frame []byte) error {
 // ToWire gathers leaves of a committed row back into a frame.
 func (r *Ring) ToWire(m *WireMap, seq int64, frameLen int) ([]byte, error) {
 	frame := make([]byte, frameLen)
-	st := C.ar_to_wire(r.c, m.c, C.int64_t(seq),
-		unsafe.Pointer(&frame[0]), C.int64_t(frameLen))
-	if st != C.AR_OK {
-		return nil, r.err(st)
+	rep := getReport()
+	if err := readErr(rep, C.ar_to_wire(r.c, m.c, C.int64_t(seq),
+		unsafe.Pointer(&frame[0]), C.int64_t(frameLen), rep)); err != nil {
+		return nil, err
 	}
 	return frame, nil
 }
@@ -517,9 +687,9 @@ type RecordSet struct {
 // (rs.Lo > lo: rows recycled); hi above committed is lowered to it.
 func (r *Ring) Pin(lo, hi int64) (*RecordSet, error) {
 	var rs *C.ArRecordSet
-	st := C.ar_pin(r.c, C.int64_t(lo), C.int64_t(hi), &rs)
-	if st != C.AR_OK {
-		return nil, r.err(st)
+	rep := getReport()
+	if err := readErr(rep, C.ar_pin(r.c, C.int64_t(lo), C.int64_t(hi), &rs, rep)); err != nil {
+		return nil, err
 	}
 	return &RecordSet{c: rs, ring: r,
 		Lo: int64(C.ar_recordset_lo(rs)),
@@ -532,8 +702,9 @@ func (r *Ring) Pin(lo, hi int64) (*RecordSet, error) {
 func (rs *RecordSet) Records() ([]arrow.RecordBatch, error) {
 	stream := (*C.struct_ArrowArrayStream)(C.malloc(C.sizeof_struct_ArrowArrayStream))
 	defer C.free(unsafe.Pointer(stream))
-	if st := C.ar_recordset_stream(rs.c, stream); st != C.AR_OK {
-		return nil, rs.ring.err(st)
+	rep := getReport()
+	if err := readErr(rep, C.ar_recordset_stream(rs.c, stream, rep)); err != nil {
+		return nil, err
 	}
 	rdr, err := cdata.ImportCRecordReader(
 		(*cdata.CArrowArrayStream)(unsafe.Pointer(stream)), nil)

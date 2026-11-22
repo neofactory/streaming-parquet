@@ -2711,6 +2711,44 @@ def _():
 
 print("\n--- diagnostics ---")
 
+@test("a line the ring's core makes on the writer's thread is logged by "
+      "another thread, with the time the core made it")
+def _():
+    import logging
+    import threading
+    schema = pa.schema([pa.field("s", pa.utf8(), nullable=False)])
+    got = []
+
+    class H(logging.Handler):
+        def emit(self, record):
+            got.append((record, threading.current_thread()))
+    log = logging.getLogger("arrow_ring")
+    h = H()
+    log.addHandler(h)
+    propagate, log.propagate = log.propagate, False
+    s = sp.create_stream("v2test/ringline", schema,
+                         memory=MemoryOptions(lookback=64, segment_bytes=256))
+    try:
+        t0 = time.time()
+        row = s.get_mutable_row()
+        row.s = "B" * 2000              # larger than a segment: the core says so
+        s.commit()
+        t1 = time.time()
+        assert got == [] or got[0][1] is not threading.current_thread(), \
+            "the writer's thread did the output"
+        wait_for(lambda: got, what="the ring's line in the log")
+        record, thread = got[0]
+        assert thread is not threading.current_thread(), thread
+        assert record.levelno == logging.WARNING
+        assert "oversized value: 2000 elements" in record.getMessage()
+        assert t0 <= record.created <= t1, (t0, record.created, t1)
+    finally:
+        s.close()
+        log.removeHandler(h)
+        log.propagate = propagate
+    assert len(got) == 1, [r.getMessage() for r, _ in got]
+
+
 @test("logging the standard way: with nothing set up no file is made and "
       "warnings go to standard error; log_to_file() and "
       "$STREAMING_PARQUET_DIAG_LOG write the library's lines to a file; a "

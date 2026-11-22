@@ -84,8 +84,8 @@ The uncovered branches cluster exactly where the risk is:
   run separately) and some fault-injection branches.
 - The C third-of-branches-untaken is mostly error paths (alloc
   failure, refusals) and boundary directions.
-- Dead API: `ar_append_stream`, `ar_recordset_write_ipc` — no host
-  calls them; untested by construction.
+- Dead API: `ar_append_stream` — no host calls it; only the C soak
+  test does.
 
 ## Test-data uniformity (the suites' blind spot)
 

@@ -389,7 +389,9 @@ func (a *Attached) receive(tk *Ticket) error {
 	}
 	a.mu.Lock()
 	if a.ring == nil {
-		r, err := ring.NewRing(schema, a.capacity, nil)
+		// this goroutine is the ring's writer and may do output: the
+		// lines the ring's core makes are logged at once
+		r, err := ring.NewRing(schema, a.capacity, &ring.Options{Logger: a.log})
 		if err != nil {
 			a.mu.Unlock()
 			return err

@@ -207,8 +207,8 @@ func (r *Ring) leafInfo(leaf int32) (*leafInfo, error) {
 
 // setF64ViaCore is the cgo path, kept only as the benchmark's baseline.
 func (r *Ring) setF64ViaCore(leaf int32, v float64) error {
-	if st := C.ar_set_f64(r.c, C.int32_t(leaf), C.double(v)); st != C.AR_OK {
-		return r.err(st)
+	if st := C.ar_set_f64(r.c, C.int32_t(leaf), C.double(v), r.wr); st != C.REPORT_OK {
+		return r.werr()
 	}
 	return nil
 }

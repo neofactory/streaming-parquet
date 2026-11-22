@@ -19,40 +19,55 @@ import arrow_ring  # noqa: E402,F401  (builds the library on first use)
 
 ffi = cffi.FFI()
 ffi.cdef("""
-typedef int ArStatus;
+typedef struct {
+    int32_t level;
+    double wall;
+    double mono;
+    char text[1024];
+} ReportLine;
+typedef struct {
+    int32_t status;
+    int32_t lines;
+    int32_t dropped;
+    char error[512];
+    ReportLine line[4];
+} Report;
 typedef struct ArRing ArRing;
 typedef struct ArRecordSet ArRecordSet;
 typedef struct ArRingOptions ArRingOptions;
 
-ArStatus ar_ring_new(const void *schema, int64_t capacity,
-                     const ArRingOptions *opts, ArRing **out);
+int ar_ring_new(const void *schema, int64_t capacity,
+                const ArRingOptions *opts, ArRing **out, Report *report);
 void ar_ring_free(ArRing *ring);
-const char *ar_last_error(const ArRing *ring);
 int32_t ar_leaf_index(const ArRing *ring, const char *path);
-ArStatus ar_row_begin(ArRing *ring, int64_t block_ms, int64_t *out_seq);
-ArStatus ar_set_i64(ArRing *ring, int32_t leaf, int64_t v);
-ArStatus ar_set_f64(ArRing *ring, int32_t leaf, double v);
-ArStatus ar_set_bool(ArRing *ring, int32_t leaf, _Bool v);
-ArStatus ar_set_bytes(ArRing *ring, int32_t leaf, const void *d, int64_t n);
-ArStatus ar_set_list(ArRing *ring, int32_t leaf, const void *e, int64_t n);
-ArStatus ar_set_null(ArRing *ring, int32_t leaf);
-ArStatus ar_commit(ArRing *ring, int64_t *out_count);
-ArStatus ar_get_f64(const ArRing *ring, int64_t seq, int32_t leaf,
-                    double *out, _Bool *is_null);
-ArStatus ar_get_var(const ArRing *ring, int64_t seq, int32_t leaf,
-                    const void **data, int64_t *n, _Bool *is_null);
+int ar_row_begin(ArRing *ring, int64_t *out_seq, Report *report);
+int ar_set_i64(ArRing *ring, int32_t leaf, int64_t v, Report *report);
+int ar_set_f64(ArRing *ring, int32_t leaf, double v, Report *report);
+int ar_set_bool(ArRing *ring, int32_t leaf, _Bool v, Report *report);
+int ar_set_bytes(ArRing *ring, int32_t leaf, const void *d, int64_t n,
+                 Report *report);
+int ar_set_list(ArRing *ring, int32_t leaf, const void *e, int64_t n,
+                Report *report);
+int ar_set_null(ArRing *ring, int32_t leaf, Report *report);
+int ar_commit(ArRing *ring, int64_t *out_count, Report *report);
+int ar_get_f64(const ArRing *ring, int64_t seq, int32_t leaf,
+               double *out, _Bool *is_null, Report *report);
+int ar_get_var(const ArRing *ring, int64_t seq, int32_t leaf,
+               const void **data, int64_t *n, _Bool *is_null, Report *report);
 int64_t ar_oldest_seq(const ArRing *ring);
 int64_t ar_newest_seq(const ArRing *ring);
 uint64_t ar_leaf_data_address(const ArRing *ring, int32_t leaf);
-ArStatus ar_pin(ArRing *ring, int64_t lo, int64_t hi, ArRecordSet **out);
+int ar_pin(ArRing *ring, int64_t lo, int64_t hi, ArRecordSet **out,
+           Report *report);
 int64_t ar_recordset_lo(const ArRecordSet *rs);
 int64_t ar_recordset_hi(const ArRecordSet *rs);
-ArStatus ar_recordset_stream(ArRecordSet *rs, void *out_stream);
+int ar_recordset_stream(ArRecordSet *rs, void *out_stream, Report *report);
 void ar_recordset_release(ArRecordSet *rs);
 """)
 lib = ffi.dlopen(os.path.join(REPO, "src", "python", "arrow_ring", "libarrow_ring.dylib"))
 
-AR_OK, AR_PIN_STALLED = 0, 4
+REPORT_OK, REPORT_BLOCKED = 0, 6     # src/core/report.h
+R = ffi.new("Report *")              # every call is given this report
 checks = []
 
 
@@ -62,21 +77,22 @@ def check(name, cond):
 
 
 def ok(st):
-    if st != AR_OK:
-        raise RuntimeError(ffi.string(lib.ar_last_error(ffi.NULL)).decode())
+    assert st == R.status, (st, R.status)
+    if st != REPORT_OK:
+        raise RuntimeError(ffi.string(R.error).decode())
 
 
 def new_ring(schema, capacity):
     cs = ffi.new("char[]", 128)   # ArrowSchema is ~72 bytes; padded
     schema._export_to_c(int(ffi.cast("uintptr_t", cs)))
     out = ffi.new("ArRing **")
-    ok(lib.ar_ring_new(cs, capacity, ffi.NULL, out))
+    ok(lib.ar_ring_new(cs, capacity, ffi.NULL, out, R))
     return out[0]
 
 
 def table_of(rs):
     stream = ffi.new("char[]", 80)   # ArrowArrayStream is 40 bytes; padded
-    ok(lib.ar_recordset_stream(rs, stream))
+    ok(lib.ar_recordset_stream(rs, stream, R))
     reader = pa.RecordBatchReader._import_from_c(
         int(ffi.cast("uintptr_t", stream)))
     return reader.read_all()
@@ -100,29 +116,29 @@ check("leaf indices resolve", all(v >= 0 for v in L.values()))
 
 import struct as _struct
 for i in range(6):
-    ok(lib.ar_row_begin(ring, 0, ffi.NULL))
-    ok(lib.ar_set_f64(ring, L['tv'], float(i)))
-    ok(lib.ar_set_i64(ring, L['servo.pos'], i * 100))
-    ok(lib.ar_set_i64(ring, L['servo.vel'], i * 200))
+    ok(lib.ar_row_begin(ring, ffi.NULL, R))
+    ok(lib.ar_set_f64(ring, L['tv'], float(i), R))
+    ok(lib.ar_set_i64(ring, L['servo.pos'], i * 100, R))
+    ok(lib.ar_set_i64(ring, L['servo.vel'], i * 200, R))
     if i % 2 == 0:
-        ok(lib.ar_set_i64(ring, L['mark'], i * 10))   # odd rows stay null
+        ok(lib.ar_set_i64(ring, L['mark'], i * 10, R))   # odd rows stay null
     enc = f"row-{i}".encode()
-    ok(lib.ar_set_bytes(ring, L['label'], enc, len(enc)))
+    ok(lib.ar_set_bytes(ring, L['label'], enc, len(enc), R))
     vals = _struct.pack(f'<{i}d', *[float(j) for j in range(i)])
-    ok(lib.ar_set_list(ring, L['samples'], vals, i))
+    ok(lib.ar_set_list(ring, L['samples'], vals, i, R))
 n = ffi.new("int64_t *")
-ok(lib.ar_commit(ring, n))
+ok(lib.ar_commit(ring, n, R))
 check("commit count", n[0] == 6)
 
 out = ffi.new("double *"); nul = ffi.new("_Bool *")
-ok(lib.ar_get_f64(ring, 3, L['tv'], out, nul))
+ok(lib.ar_get_f64(ring, 3, L['tv'], out, nul, R))
 check("get_f64", out[0] == 3.0 and not nul[0])
 d = ffi.new("const void **"); dn = ffi.new("int64_t *")
-ok(lib.ar_get_var(ring, 4, L['label'], d, dn, nul))
+ok(lib.ar_get_var(ring, 4, L['label'], d, dn, nul, R))
 check("get_var utf8", ffi.buffer(d[0], dn[0])[:] == b'row-4')
 
 rsp = ffi.new("ArRecordSet **")
-ok(lib.ar_pin(ring, 0, 2**63 - 1, rsp))
+ok(lib.ar_pin(ring, 0, 2**63 - 1, rsp, R))
 rs = rsp[0]
 t = table_of(rs)
 check("table rows", t.num_rows == 6)
@@ -138,16 +154,17 @@ check("zero-copy fixed data",
 
 # pin blocks writer at wrap; release unblocks
 for i in range(6, 16):
-    ok(lib.ar_row_begin(ring, 0, ffi.NULL))
-    ok(lib.ar_set_f64(ring, L['tv'], float(i)))
-    ok(lib.ar_set_bytes(ring, L['label'], b'x', 1))
-    ok(lib.ar_set_list(ring, L['samples'], b'', 0))
-ok(lib.ar_commit(ring, ffi.NULL))
-st = lib.ar_row_begin(ring, 20, ffi.NULL)     # seq 16 recycles seq 0: pinned
-check("pin stalls writer", st == AR_PIN_STALLED)
+    ok(lib.ar_row_begin(ring, ffi.NULL, R))
+    ok(lib.ar_set_f64(ring, L['tv'], float(i), R))
+    ok(lib.ar_set_bytes(ring, L['label'], b'x', 1, R))
+    ok(lib.ar_set_list(ring, L['samples'], b'', 0, R))
+ok(lib.ar_commit(ring, ffi.NULL, R))
+st = lib.ar_row_begin(ring, ffi.NULL, R)         # seq 16 recycles seq 0: pinned
+check("pin stalls writer", st == REPORT_BLOCKED
+      and b"blocked by a pin on [0, 6)" in ffi.string(R.error))
 lib.ar_recordset_release(rs)
 check("release unblocks writer",
-      lib.ar_row_begin(ring, 0, ffi.NULL) == AR_OK)
+      lib.ar_row_begin(ring, ffi.NULL, R) == REPORT_OK)
 check("frozen table content survived pin window",
       t.column('label').to_pylist()[0] == 'row-0')
 

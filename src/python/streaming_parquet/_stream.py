@@ -102,6 +102,10 @@ class Stream:
         self._data = _StreamData(name, schema, capacity=ring_rows,
                                  segment_bytes=memory.segment_bytes)
         self._ring = self._data.ring
+        # The writer of this ring is the program's own thread, which
+        # must do no output: the ring keeps the lines its core makes
+        # for the log, and the heartbeat thread logs them.
+        self._ring.hold_lines = True
         self._flight_server = flight_server
         self._port = port
         self._ticket_root = store
@@ -200,6 +204,9 @@ class Stream:
             self._parquet.on_ticket = self._write_ticket
         self._face._source = self._view_source()
         self._heartbeat_stop = threading.Event()
+        # set to end the heartbeat's wait early: by close(), and by a
+        # commit that leaves a line of the ring's core to log
+        self._heartbeat_wake = threading.Event()
         self._heartbeat = threading.Thread(target=self._heartbeat_loop,
                                            daemon=True)
         self._heartbeat.start()
@@ -493,6 +500,8 @@ class Stream:
         (see _flight_server): a commit only wakes the ones waiting."""
         from ._clock import now as _now
         committed = self._ring.newest_seq + 1
+        if self._ring.lines_held:
+            self._heartbeat_wake.set()   # the heartbeat thread logs them
         if self._flight_server is not None:
             self._flight_server.notify(self.name)
         with self._lock:
@@ -885,6 +894,7 @@ class Stream:
 
         t0 = time.monotonic()
         self._heartbeat_stop.set()
+        self._heartbeat_wake.set()
         if self._heartbeat is not None:
             self._heartbeat.join(timeout=2.0)
         step("heartbeat", t0)
@@ -916,6 +926,7 @@ class Stream:
             step("ticket", t0)
         if self._owner is not None:
             self._owner.release()        # the next writer may start now
+        self._ring.log_lines()           # the heartbeat has stopped
         _diag.info(f"[{self.name}] closed in "
                    f"{time.monotonic() - t_close:.2f}s: " + ", ".join(steps))
 
@@ -985,6 +996,8 @@ class Stream:
     def _heartbeat_loop(self):
         stop = self._heartbeat_stop
         while not stop.is_set():
+            # the lines the ring's core made on the writer's thread
+            self._ring.log_lines()
             # the beat: the ticket at least every beat (the uploads write
             # it as they land; this covers a stream with nothing new)
             self._write_ticket()
@@ -999,8 +1012,9 @@ class Stream:
             if self._parquet is not None and self._parquet.catalog is not None:
                 self._parquet.catalog.poke()
             # Wait on the event, not a polled sleep: a close() wakes it
-            # at once.
-            stop.wait(self._heartbeat_wait())
+            # at once, and so does a commit with a line to log.
+            self._heartbeat_wake.wait(self._heartbeat_wait())
+            self._heartbeat_wake.clear()
 
 
 #: DuckDB's row group, 60 of its 2,048-row vectors: DuckDB, the

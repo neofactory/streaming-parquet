@@ -444,6 +444,84 @@ def test_segment_boundary_causes_chunk_cut():
         assert col.to_pylist() == words            # content survives them
 
 
+class _Lines:
+    """The records the logger "arrow_ring" gets, while in the with."""
+
+    def __enter__(self):
+        import logging
+        self.records = []
+        self._handler = logging.Handler()
+        self._handler.emit = self.records.append
+        self._logger = logging.getLogger("arrow_ring")
+        self._propagate = self._logger.propagate
+        self._logger.propagate = False
+        self._logger.addHandler(self._handler)
+        return self.records
+
+    def __exit__(self, *exc):
+        self._logger.removeHandler(self._handler)
+        self._logger.propagate = self._propagate
+
+
+def test_core_lines_go_to_the_logger_with_the_cores_time():
+    import logging
+    import time
+    ring = Ring(pa.schema([pa.field('s', pa.utf8(), nullable=False)]),
+                capacity=64, segment_bytes=256)
+    with _Lines() as records:
+        t0 = time.time()
+        row = ring.get_mutable_row()
+        row.s = 'small'
+        assert records == [], "a value that fits makes no line"
+        row = ring.get_mutable_row()
+        row.s = 'B' * 1000
+        t1 = time.time()
+        assert len(records) == 1, records
+        rec = records[0]
+        assert rec.levelno == logging.WARNING and rec.name == "arrow_ring"
+        assert "oversized value: 1000 elements" in rec.getMessage()
+        assert t0 <= rec.created <= t1, (t0, rec.created, t1)
+    ring.commit()
+
+
+def test_held_lines_wait_for_log_lines():
+    import logging
+    ring = Ring(pa.schema([pa.field('s', pa.utf8(), nullable=False)]),
+                capacity=64, segment_bytes=256)
+    ring.hold_lines = True
+    with _Lines() as records:
+        for _ in range(3):
+            row = ring.get_mutable_row()
+            row.s = 'B' * 1000
+        ring.commit()
+        assert records == [], "a held line is not logged by the writer"
+        ring.log_lines()
+        assert [r.levelno for r in records] == [logging.WARNING] * 3
+        assert "(#3)" in records[2].getMessage()
+        ring.log_lines()
+        assert len(records) == 3, "logged once"
+        row = ring.get_mutable_row()
+        row.s = 'B' * 1000
+        taken = ring.take_lines()
+        assert len(taken) == 1 and taken[0][0] == logging.WARNING \
+            and "(#4)" in taken[0][2], taken
+        assert ring.take_lines() == []
+
+
+def test_a_jump_in_the_row_numbers_makes_a_warning_line():
+    schema = pa.schema([pa.field('v', pa.int64(), nullable=False)])
+    ring = Ring(schema, capacity=64)
+    batch = pa.record_batch([pa.array([1, 2, 3], pa.int64())], schema=schema)
+    with _Lines() as records:
+        ring.append_batch(batch, at_seq=0)
+        assert records == []
+        ring.append_batch(batch, at_seq=50)
+        assert len(records) == 1 and \
+            "GAP: jumped seq 3 -> 50 (47 rows never received)" \
+            in records[0].getMessage(), records
+    assert (ring.oldest_seq, ring.newest_seq) == (50, 52)
+
+
 def test_oversized_string_gets_dedicated_segment():
     schema = pa.schema([F('label', pa.utf8(), nullable=False)])
     ring = Ring(schema, capacity=8, segment_bytes=16)

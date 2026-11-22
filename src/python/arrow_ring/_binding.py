@@ -9,6 +9,7 @@ sequences -> packed elements), and pyarrow import of exported streams.
 Everything stateful — slots, cursors, pins, pools — lives in C.
 """
 
+import collections
 import datetime
 import decimal
 import operator
@@ -16,6 +17,7 @@ import logging
 import os
 import re
 import struct
+import threading
 import traceback
 import time
 import subprocess
@@ -35,45 +37,50 @@ _LIB_PATH = os.path.join(_PKG_DIR, 'libarrow_ring.dylib')
 
 ffi = cffi.FFI()
 _CDEF = """
-typedef int ArStatus;
+typedef struct {
+    int32_t level;
+    double wall;
+    double mono;
+    char text[1024];
+} ReportLine;
+typedef struct {
+    int32_t status;
+    int32_t lines;
+    int32_t dropped;
+    char error[512];
+    ReportLine line[4];
+} Report;
 typedef struct ArRing ArRing;
 typedef struct ArRecordSet ArRecordSet;
-typedef struct ArAllocator {
-  void *(*alloc)(void *, int64_t);
-  void (*free)(void *, void *, int64_t);
-  void *ctx;
-} ArAllocator;
 typedef struct ArRingOptions {
   int64_t segment_bytes;
-  ArAllocator allocator;
-  void (*diag)(void *, const char *);
-  void *diag_ctx;
 } ArRingOptions;
 
-ArStatus ar_ring_new(const void *schema, int64_t capacity,
-                     const ArRingOptions *opts, ArRing **out);
+int ar_ring_new(const void *schema, int64_t capacity,
+                const ArRingOptions *opts, ArRing **out, Report *report);
 void ar_ring_free(ArRing *ring);
-const char *ar_last_error(const ArRing *ring);
 int32_t ar_leaf_index(const ArRing *ring, const char *path);
-ArStatus ar_row_begin(ArRing *ring, int64_t block_ms, int64_t *out_seq);
-ArStatus ar_set_i64(ArRing *ring, int32_t leaf, int64_t v);
-ArStatus ar_set_u64(ArRing *ring, int32_t leaf, uint64_t v);
-ArStatus ar_set_f64(ArRing *ring, int32_t leaf, double v);
-ArStatus ar_set_bool(ArRing *ring, int32_t leaf, _Bool v);
-ArStatus ar_set_bytes(ArRing *ring, int32_t leaf, const void *d, int64_t n);
-ArStatus ar_set_list(ArRing *ring, int32_t leaf, const void *e, int64_t n);
-ArStatus ar_set_null(ArRing *ring, int32_t leaf);
-ArStatus ar_commit(ArRing *ring, int64_t *out_count);
-ArStatus ar_get_i64(const ArRing *ring, int64_t seq, int32_t leaf,
-                    int64_t *out, _Bool *is_null);
-ArStatus ar_get_u64(const ArRing *ring, int64_t seq, int32_t leaf,
-                    uint64_t *out, _Bool *is_null);
-ArStatus ar_get_f64(const ArRing *ring, int64_t seq, int32_t leaf,
-                    double *out, _Bool *is_null);
-ArStatus ar_get_bool(const ArRing *ring, int64_t seq, int32_t leaf,
-                     _Bool *out, _Bool *is_null);
-ArStatus ar_get_var(const ArRing *ring, int64_t seq, int32_t leaf,
-                    const void **data, int64_t *n, _Bool *is_null);
+int ar_row_begin(ArRing *ring, int64_t *out_seq, Report *report);
+int ar_set_i64(ArRing *ring, int32_t leaf, int64_t v, Report *report);
+int ar_set_u64(ArRing *ring, int32_t leaf, uint64_t v, Report *report);
+int ar_set_f64(ArRing *ring, int32_t leaf, double v, Report *report);
+int ar_set_bool(ArRing *ring, int32_t leaf, _Bool v, Report *report);
+int ar_set_bytes(ArRing *ring, int32_t leaf, const void *d, int64_t n,
+                 Report *report);
+int ar_set_list(ArRing *ring, int32_t leaf, const void *e, int64_t n,
+                Report *report);
+int ar_set_null(ArRing *ring, int32_t leaf, Report *report);
+int ar_commit(ArRing *ring, int64_t *out_count, Report *report);
+int ar_get_i64(const ArRing *ring, int64_t seq, int32_t leaf,
+               int64_t *out, _Bool *is_null, Report *report);
+int ar_get_u64(const ArRing *ring, int64_t seq, int32_t leaf,
+               uint64_t *out, _Bool *is_null, Report *report);
+int ar_get_f64(const ArRing *ring, int64_t seq, int32_t leaf,
+               double *out, _Bool *is_null, Report *report);
+int ar_get_bool(const ArRing *ring, int64_t seq, int32_t leaf,
+                _Bool *out, _Bool *is_null, Report *report);
+int ar_get_var(const ArRing *ring, int64_t seq, int32_t leaf,
+               const void **data, int64_t *n, _Bool *is_null, Report *report);
 int64_t ar_oldest_seq(const ArRing *ring);
 int64_t ar_newest_seq(const ArRing *ring);
 uint64_t ar_leaf_data_address(const ArRing *ring, int32_t leaf);
@@ -82,10 +89,11 @@ uint64_t ar_var_data_address(const ArRing *ring, int32_t leaf,
                              int64_t elem_seq);
 int32_t ar_pool_segment_count(const ArRing *ring, int32_t leaf);
 int64_t ar_pool_oversized_count(const ArRing *ring, int32_t leaf);
-ArStatus ar_pin(ArRing *ring, int64_t lo, int64_t hi, ArRecordSet **out);
+int ar_pin(ArRing *ring, int64_t lo, int64_t hi, ArRecordSet **out,
+           Report *report);
 int64_t ar_recordset_lo(const ArRecordSet *rs);
 int64_t ar_recordset_hi(const ArRecordSet *rs);
-ArStatus ar_recordset_stream(ArRecordSet *rs, void *out_stream);
+int ar_recordset_stream(ArRecordSet *rs, void *out_stream, Report *report);
 void ar_recordset_release(ArRecordSet *rs);
 void ar_recordset_detach(ArRecordSet *rs);
 struct ArrowArray {
@@ -101,41 +109,97 @@ struct ArrowArray {
     void *private_data;
 };
 typedef struct ArChunkCursor ArChunkCursor;
-ArStatus ar_chunks_open(ArRing *ring, int64_t lo, int64_t hi,
-                        int64_t chunk_rows, ArChunkCursor **out);
-ArStatus ar_chunks_next(ArChunkCursor *cursor, struct ArrowArray *out,
-                        int64_t *first_seq);
+int ar_chunks_open(ArRing *ring, int64_t lo, int64_t hi,
+                   int64_t chunk_rows, ArChunkCursor **out, Report *report);
+int ar_chunks_next(ArChunkCursor *cursor, struct ArrowArray *out,
+                   int64_t *first_seq, Report *report);
 void ar_chunks_free(ArChunkCursor *cursor);
-ArStatus ar_append_batch(ArRing *ring, void *batch);
-ArStatus ar_append_batch_at(ArRing *ring, void *batch, int64_t first_seq);
+int ar_append_batch(ArRing *ring, void *batch, Report *report);
+int ar_append_batch_at(ArRing *ring, void *batch, int64_t first_seq,
+                       Report *report);
 typedef struct ArWireMap ArWireMap;
-ArStatus ar_wiremap_new(const ArRing *ring, const int32_t *leaves,
-                        const int32_t *offsets, const int32_t *sizes,
-                        int32_t n, ArWireMap **out);
+int ar_wiremap_new(const ArRing *ring, const int32_t *leaves,
+                   const int32_t *offsets, const int32_t *sizes,
+                   int32_t n, ArWireMap **out, Report *report);
 void ar_wiremap_free(ArWireMap *map);
-ArStatus ar_from_wire(ArRing *ring, const ArWireMap *map,
-                      const void *frame, int64_t frame_len);
-ArStatus ar_to_wire(const ArRing *ring, const ArWireMap *map, int64_t seq,
-                    void *frame, int64_t frame_len);
+int ar_from_wire(ArRing *ring, const ArWireMap *map,
+                 const void *frame, int64_t frame_len, Report *report);
+int ar_to_wire(const ArRing *ring, const ArWireMap *map, int64_t seq,
+               void *frame, int64_t frame_len, Report *report);
+void ar_test_set_clock(int fixed, double wall, double mono);
 """
 ffi.cdef(_CDEF)
 
 
-#: The core's diagnostic lines (an oversized value, a jump in the row
-#: numbers) go to this logger as warnings: the core calls _diag_line.
+#: The core's lines for the log (an oversized value, a jump in the row
+#: numbers) go to this logger, as warnings, with the time the core made
+#: them. The core does no output: each line comes back in the report of
+#: the call that made it (src/core/report.h).
 _log = logging.getLogger("arrow_ring")
+_LEVELS = {1: logging.INFO, 2: logging.WARNING, 3: logging.ERROR}
 
 
-@ffi.callback("void(void *, const char *)")
-def _diag_line(_ctx, msg):
-    _log.warning(ffi.string(msg).decode("utf-8", "replace"))
+def _log_line(level, wall, text):
+    """Log one line of the core, stamped with the time the core made it."""
+    level = _LEVELS.get(level, logging.WARNING)
+    if not _log.isEnabledFor(level):
+        return
+    record = _log.makeRecord(_log.name, level, "(arrow_ring core)", 0, text,
+                             None, None)
+    record.created = wall
+    record.msecs = (wall - int(wall)) * 1000.0
+    _log.handle(record)
+
+
+class _Lines:
+    """Where a ring's lines go. A ring's writer makes them, and a writer
+    is often a thread that must not do output. `hold` False (a ring on
+    its own): each line is logged at once, by the thread that made it.
+    `hold` True (a host with another thread for output): the lines are
+    kept, at most MOST of them, until that thread calls Ring.log_lines().
+    It has no reference to the ring: the setters keep one of these."""
+    __slots__ = ("hold", "held", "lost")
+    MOST = 256
+
+    def __init__(self):
+        self.hold = False
+        self.held = collections.deque()
+        self.lost = 0
+
+    def take(self, r):
+        """The lines of the call whose report is r."""
+        for i in range(r.lines):
+            line = r.line[i]
+            self.add(line.level, line.wall,
+                     ffi.string(line.text).decode("utf-8", "replace"))
+        if r.dropped:
+            self.lost += r.dropped
+
+    def add(self, level, wall, text):
+        if not self.hold:
+            _log_line(level, wall, text)
+        elif len(self.held) < self.MOST:
+            self.held.append((level, wall, text))
+        else:
+            self.lost += 1
+
+    def drain(self):
+        """[(level, wall time, text)] kept so far, oldest first."""
+        out = []
+        while self.held:
+            out.append(self.held.popleft())
+        lost, self.lost = self.lost, 0
+        if lost:
+            out.append((2, time.time(), f"[arrow_ring] {lost} more lines of "
+                                        f"the core were made and not kept"))
+        return out
 
 
 def _build_if_stale():
     """In a checkout, build the library from src/core into this package
     when a source is newer than it. An installed package has the
     library and no sources: nothing to do."""
-    sources = [os.path.join(_CORE_DIR, n) for n in ('arrow_ring.c', 'arrow_ring.h')]
+    sources = [os.path.join(_CORE_DIR, n) for n in ('arrow_ring.c', 'arrow_ring.h', 'report.h')]
     if not all(os.path.exists(s) for s in sources):
         if os.path.exists(_LIB_PATH):
             return
@@ -164,11 +228,23 @@ lib = ffi.dlopen(_LIB_PATH)
 for _name in sorted(set(re.findall(r"\b(ar_\w+)\s*\(", _CDEF))):
     getattr(lib, _name)
 
-AR_OK = 0
-AR_ERR_STALE = 3
-AR_ERR_PIN_STALLED = 4
-AR_ERR_NOT_NULLABLE = 5
-AR_ERR_WIDTH = 6
+# the statuses of src/core/report.h that this binding tells apart
+REPORT_OK = 0
+REPORT_STALE = 5
+REPORT_BLOCKED = 6
+REPORT_NOT_NULLABLE = 7
+REPORT_WIDTH = 8
+
+_thread = threading.local()
+
+
+def _report():
+    """This thread's Report, for a call that is not the writer's (the
+    writer's calls use the ring's own: Ring._wr)."""
+    r = getattr(_thread, "report", None)
+    if r is None:
+        r = _thread.report = ffi.new("Report *")
+    return r
 
 
 class StaleReadError(Exception):
@@ -179,22 +255,24 @@ class PinStalledError(Exception):
     """The writer needs to recycle a slot that a pin still holds."""
 
 
-def _raise(status):
-    msg = ffi.string(lib.ar_last_error(ffi.NULL)).decode()
-    if status == AR_ERR_STALE:
+def _raise(status, r):
+    """The exception for a call that failed, with the reason its report
+    holds."""
+    msg = ffi.string(r.error).decode("utf-8", "replace")
+    if status == REPORT_STALE:
         raise StaleReadError(msg)
-    if status == AR_ERR_PIN_STALLED:
+    if status == REPORT_BLOCKED:
         raise PinStalledError(msg)
-    if status == AR_ERR_NOT_NULLABLE:
+    if status == REPORT_NOT_NULLABLE:
         raise TypeError(msg)
-    if status == AR_ERR_WIDTH:
+    if status == REPORT_WIDTH:
         raise ValueError(msg)
     raise RuntimeError(msg)
 
 
-def _check(status):
-    if status != AR_OK:
-        _raise(status)
+def _check(status, r):
+    if status != REPORT_OK:
+        _raise(status, r)
 
 
 _EPOCH_DATE = datetime.date(1970, 1, 1).toordinal()
@@ -243,12 +321,14 @@ class Ring:
         schema._export_to_c(int(ffi.cast("uintptr_t", cs)))
         opts = ffi.new("ArRingOptions *")
         opts.segment_bytes = segment_bytes or 0
-        opts.diag = _diag_line          # the core's lines, to the logger
         out = ffi.new("ArRing **")
-        st = lib.ar_ring_new(cs, capacity, opts, out)
-        if st != AR_OK:
-            msg = ffi.string(lib.ar_last_error(ffi.NULL)).decode()
-            raise TypeError(msg)
+        # The writer's Report: a ring has one writer thread, and its
+        # calls (a row, a set, a commit, an append) use this one.
+        self._wr = wr = ffi.new("Report *")
+        self._lines = _Lines()
+        st = lib.ar_ring_new(cs, capacity, opts, out, wr)
+        if st != REPORT_OK:
+            raise TypeError(ffi.string(wr.error).decode("utf-8", "replace"))
         self._c = out[0]
 
         self._li = [lib.ar_leaf_index(self._c, lf.path.encode())
@@ -269,18 +349,59 @@ class Ring:
             lib.ar_ring_free(self._c)
             self._c = None
 
+    # ---- the core's lines for the log -----------------------------------------
+
+    @property
+    def hold_lines(self):
+        """False (the default): a line the core makes for the log (an
+        oversized value, a jump in the row numbers) is logged at once,
+        by the thread whose call made it. True: the lines are kept until
+        log_lines(), for a host whose writer thread must do no output
+        and which has another thread to call log_lines() from."""
+        return self._lines.hold
+
+    @hold_lines.setter
+    def hold_lines(self, hold):
+        self._lines.hold = bool(hold)
+
+    @property
+    def lines_held(self):
+        """True when lines are kept and wait for log_lines()."""
+        return bool(self._lines.held) or self._lines.lost > 0
+
+    def take_lines(self):
+        """The kept lines, oldest first, as (level, wall time, text);
+        level is logging.INFO, WARNING or ERROR. They are no longer
+        kept."""
+        return [(_LEVELS.get(level, logging.WARNING), wall, text)
+                for level, wall, text in self._lines.drain()]
+
+    def log_lines(self):
+        """Log the kept lines to the logger "arrow_ring", each with the
+        time the core made it. Any thread but the writer's."""
+        for level, wall, text in self._lines.drain():
+            _log_line(level, wall, text)
+
     # ---- write side -------------------------------------------------------
 
     def get_mutable_row(self, block_s=0.0):
         """Allocate the next slot and return a MutableRow over it. Write-
-        only handle; blocks up to block_s then raises PinStalledError
-        when a pin holds the slot being recycled."""
-        st = lib.ar_row_begin(self._c, int(block_s * 1000), self._seq_out)
+        only handle; waits up to block_s then raises PinStalledError
+        when a pin holds the slot being recycled. The waiting is done
+        here: the core answers at once."""
+        wr = self._wr
+        st = lib.ar_row_begin(self._c, self._seq_out, wr)
         if st:
-            if st == AR_ERR_PIN_STALLED:
-                msg = ffi.string(lib.ar_last_error(ffi.NULL)).decode()
+            if st == REPORT_BLOCKED and block_s > 0:
+                deadline = time.monotonic() + block_s
+                while st == REPORT_BLOCKED and time.monotonic() < deadline:
+                    time.sleep(0.001)
+                    st = lib.ar_row_begin(self._c, self._seq_out, wr)
+        if st:
+            if st == REPORT_BLOCKED:
+                msg = ffi.string(wr.error).decode("utf-8", "replace")
                 raise PinStalledError(msg + self._pins_report())
-            _raise(st)
+            _raise(st, wr)
         slot = self._seq_out[0] % self.capacity
         for node in self._row_nodes:
             node._slot = slot
@@ -288,7 +409,7 @@ class Ring:
 
     def commit(self):
         n = ffi.new("int64_t *")
-        _check(lib.ar_commit(self._c, n))
+        _check(lib.ar_commit(self._c, n, self._wr), self._wr)
         return n[0]
 
     # ---- read side ----------------------------------------------------------
@@ -325,7 +446,8 @@ class Ring:
         committed is lowered to it. Yours to release — release(),
         detach(), or use as a context manager."""
         out = ffi.new("ArRecordSet **")
-        _check(lib.ar_pin(self._c, int(lo), int(hi), out))
+        r = _report()
+        _check(lib.ar_pin(self._c, int(lo), int(hi), out, r), r)
         rs = out[0]
         rec = RecordSet(self, rs, lib.ar_recordset_lo(rs),
                         lib.ar_recordset_hi(rs))
@@ -370,15 +492,19 @@ class Ring:
         lapped. This is what the DuckDB views read through, so a scan
         holds only its current chunk however long the query runs."""
         out = ffi.new("ArChunkCursor **")
+        r = _report()
         _check(lib.ar_chunks_open(self._c, int(lo),
                                   INT64_MAX if hi is None else int(hi),
-                                  int(chunk_rows), out))
+                                  int(chunk_rows), out, r), r)
         cur = out[0]
         try:
             seq = ffi.new("int64_t *")
             while True:
                 arr = ffi.new("struct ArrowArray *")
-                _check(lib.ar_chunks_next(cur, arr, seq))
+                # this thread's report now: a generator may be pulled
+                # by another thread than the one that made it
+                r = _report()
+                _check(lib.ar_chunks_next(cur, arr, seq, r), r)
                 if arr.release == ffi.NULL:
                     return
                 # Built inside the yield: this frame keeps no reference
@@ -431,8 +557,12 @@ class Ring:
         next expected."""
         ca = ffi.new("char[]", 128)
         batch._export_to_c(int(ffi.cast("uintptr_t", ca)))
-        _check(lib.ar_append_batch_at(
-            self._c, ca, -1 if at_seq is None else int(at_seq)))
+        wr = self._wr
+        st = lib.ar_append_batch_at(
+            self._c, ca, -1 if at_seq is None else int(at_seq), wr)
+        if wr.lines or wr.dropped:
+            self._lines.take(wr)
+        _check(st, wr)
 
     def append_table(self, table):
         for batch in table.to_batches():
@@ -454,9 +584,9 @@ class Ring:
                 raise KeyError(f"no leaf {path!r}")
             leaves[i], offsets[i], sizes[i] = li, off, size
         out = ffi.new("ArWireMap **")
-        st = lib.ar_wiremap_new(self._c, leaves, offsets, sizes, n, out)
-        if st != AR_OK:
-            _raise(st)
+        r = _report()
+        _check(lib.ar_wiremap_new(self._c, leaves, offsets, sizes, n, out, r),
+               r)
         return WireMap(self, out[0])
 
     def from_wire(self, wmap, frame):
@@ -465,12 +595,14 @@ class Ring:
         any buffer (bytearray, memoryview, a ctypes struct): C reads it
         in place, no copy."""
         buf = ffi.from_buffer(frame)
-        _check(lib.ar_from_wire(self._c, wmap._c, buf, len(buf)))
+        _check(lib.ar_from_wire(self._c, wmap._c, buf, len(buf), self._wr),
+               self._wr)
 
     def to_wire(self, wmap, seq, frame_len):
         """Gather a committed row's mapped leaves into a frame (TX)."""
         buf = ffi.new("char[]", frame_len)
-        _check(lib.ar_to_wire(self._c, wmap._c, seq, buf, frame_len))
+        r = _report()
+        _check(lib.ar_to_wire(self._c, wmap._c, seq, buf, frame_len, r), r)
         return bytes(ffi.buffer(buf, frame_len))
 
     # ---- leaf dispatch (called by the _row.py descriptors) ----------------------
@@ -497,6 +629,8 @@ class Ring:
         leaf = self._leaves[i]
         li = self._li[i]
         c = self._c
+        wr = self._wr               # these are the writer's calls
+        lines = self._lines
         cap = self.capacity
         t = leaf.type
         path = leaf.path
@@ -519,7 +653,7 @@ class Ring:
             else:
                 def set_(self_, row, value):
                     if value is None:
-                        _check(lib.ar_set_null(c, li))
+                        _check(lib.ar_set_null(c, li, wr), wr)
                         return
                     setter(value)
             return set_
@@ -527,7 +661,8 @@ class Ring:
         if leaf.kind == 'prim':
             conv = _tick_converter(t)
             if leaf.code == 'e':            # float16: no memoryview format
-                return c_set(lambda v: _check(lib.ar_set_f64(c, li, float(v))))
+                return c_set(
+                    lambda v: _check(lib.ar_set_f64(c, li, float(v), wr), wr))
             view = self._leaf_view(li, cap * leaf.itemsize).cast(leaf.code)
             if valid is None and conv is None:
                 def set_(self_, row, value):
@@ -619,18 +754,26 @@ class Ring:
                     valid[slot >> 3] |= 1 << (slot & 7)
             return set_
         # var: the core owns the segment pool
+        # (a value larger than a pool segment is taken, with a line for
+        # the log in the call's report)
+        def took(st):
+            if wr.lines or wr.dropped:
+                lines.take(wr)
+            if st:
+                _raise(st, wr)
+
         if pa.types.is_string(t) or pa.types.is_large_string(t):
             def set_str(v):
                 b = v.encode('utf-8')
-                _check(lib.ar_set_bytes(c, li, b, len(b)))
+                took(lib.ar_set_bytes(c, li, b, len(b), wr))
             return c_set(set_str)
         if pa.types.is_binary(t) or pa.types.is_large_binary(t):
-            return c_set(lambda v: _check(lib.ar_set_bytes(c, li, v, len(v))))
+            return c_set(lambda v: took(lib.ar_set_bytes(c, li, v, len(v), wr)))
         code = leaf.code
 
         def set_lst(v):
-            _check(lib.ar_set_list(c, li, struct.pack(f'<{len(v)}{code}', *v),
-                                   len(v)))
+            took(lib.ar_set_list(c, li, struct.pack(f'<{len(v)}{code}', *v),
+                                 len(v), wr))
         return c_set(set_lst)
 
     def _make_getter(self, i):
@@ -643,25 +786,29 @@ class Ring:
             if pa.types.is_floating(t):
                 def get_f(seq):
                     out = ffi.new("double *"); nul = ffi.new("_Bool *")
-                    _check(lib.ar_get_f64(c, seq, li, out, nul))
+                    r = _report()
+                    _check(lib.ar_get_f64(c, seq, li, out, nul, r), r)
                     return None if nul[0] else out[0]
                 return get_f
             if pa.types.is_unsigned_integer(t):
                 def get_u(seq):
                     out = ffi.new("uint64_t *"); nul = ffi.new("_Bool *")
-                    _check(lib.ar_get_u64(c, seq, li, out, nul))
+                    r = _report()
+                    _check(lib.ar_get_u64(c, seq, li, out, nul, r), r)
                     return None if nul[0] else out[0]
                 return get_u
 
             def get_i(seq):
                 out = ffi.new("int64_t *"); nul = ffi.new("_Bool *")
-                _check(lib.ar_get_i64(c, seq, li, out, nul))
+                r = _report()
+                _check(lib.ar_get_i64(c, seq, li, out, nul, r), r)
                 return None if nul[0] else out[0]
             return get_i
         if leaf.kind == 'bool':
             def get_b(seq):
                 out = ffi.new("_Bool *"); nul = ffi.new("_Bool *")
-                _check(lib.ar_get_bool(c, seq, li, out, nul))
+                r = _report()
+                _check(lib.ar_get_bool(c, seq, li, out, nul, r), r)
                 return None if nul[0] else bool(out[0])
             return get_b
 
@@ -675,7 +822,8 @@ class Ring:
         def get_v(seq):
             d = ffi.new("const void **"); n = ffi.new("int64_t *")
             nul = ffi.new("_Bool *")
-            _check(lib.ar_get_var(c, seq, li, d, n, nul))
+            r = _report()
+            _check(lib.ar_get_var(c, seq, li, d, n, nul, r), r)
             if nul[0]:
                 return None
             raw = bytes(ffi.buffer(d[0], n[0] * (itemsize or 1))) \
@@ -721,7 +869,8 @@ class RecordSet:
             if self._released:
                 raise RuntimeError("record set released; table gone")
             stream = ffi.new("char[]", 80)
-            _check(lib.ar_recordset_stream(self._c, stream))
+            r = _report()
+            _check(lib.ar_recordset_stream(self._c, stream, r), r)
             reader = pa.RecordBatchReader._import_from_c(
                 int(ffi.cast("uintptr_t", stream)))
             t = reader.read_all()

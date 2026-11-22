@@ -27,7 +27,7 @@ libarrow_ring: $(OUT)/libarrow_ring.dylib
 libpqc: $(OUT)/libpqc.dylib
 libsp: $(OUT)/libsp.dylib
 
-$(OUT)/libarrow_ring.dylib: arrow_ring.c arrow_ring.h
+$(OUT)/libarrow_ring.dylib: arrow_ring.c arrow_ring.h report.h
 	$(CC) $(CFLAGS) -shared -o $@ arrow_ring.c -lpthread
 
 $(OUT)/libpqc.dylib: pqc.c pqc.h report.h
@@ -41,7 +41,7 @@ $(OUT)/libsp.dylib: sp.c sp_catalog.c sp.h report.h
 # ---- AddressSanitizer + UBSan runs (pure C, no Python in the loop) ----
 san: san-arrow_ring san-pqc san-sp
 
-san-arrow_ring: arrow_ring.c arrow_ring.h arrow_ring_san_test.c
+san-arrow_ring: arrow_ring.c arrow_ring.h report.h arrow_ring_san_test.c
 	$(CC) $(SAN) -o arrow_ring_san_test_bin arrow_ring.c arrow_ring_san_test.c -lpthread
 	./arrow_ring_san_test_bin
 

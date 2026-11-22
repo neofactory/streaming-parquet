@@ -4,9 +4,9 @@
  * commit/pins, the segmented var-width pool, and record-set
  * export as ArrowArrayStream (zero-copy chunks).
  *
- * Not yet (loud AR_ERR_INVALID stubs, see core/README.md):
- * ar_append_batch/stream, ArWireMap, ar_recordset_write_ipc, and the
- * parquet shim (separate .so).
+ * How a call reports is report.h: a status, and the reason and the
+ * lines for the host's log in the Report the caller passed. The core
+ * writes nowhere, calls no host function and never waits.
  *
  * C11. Single writer thread per ring; readers on any thread; pins are
  * mutex-guarded; cursors are atomics so readers see committed counts
@@ -22,44 +22,60 @@
 #include <string.h>
 #include <time.h>
 
-/* ---- thread-local error detail ---------------------------------------- */
+/* ---- how a call reports (report.h) -------------------------------------- */
 
-static _Thread_local char g_err[512];
-
-static ArStatus err(ArStatus s, const char *fmt, ...) {
+/* The call failed: the status and the reason, into its report. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((format(printf, 3, 4)))
+#endif
+static int err(Report *report, int s, const char *fmt, ...) {
   __builtin_va_list ap;
   __builtin_va_start(ap, fmt);
-  vsnprintf(g_err, sizeof(g_err), fmt, ap);
+  vsnprintf(report->error, sizeof(report->error), fmt, ap);
   __builtin_va_end(ap);
-  return s;
+  return report->status = s;
 }
 
-const char *ar_last_error(const ArRing *ring) {
-  (void)ring;
-  return g_err;
-}
+/* The first line of every public function that takes a Report. */
+#define BEGIN(report) \
+  do { if (!report_begin(report)) return REPORT_INVALID; } while (0)
 
 /* ---- allocator --------------------------------------------------------- */
 
-static void *default_alloc(void *ctx, int64_t n) {
-  (void)ctx;
+/* For tests: how many more allocations work; under 0, all of them. */
+static atomic_llong g_alloc_budget = -1;
+
+void ar_test_set_alloc_budget(int64_t allow) {
+  atomic_store(&g_alloc_budget, allow);
+}
+
+static void *default_alloc(int64_t n) {
+  long long budget = atomic_load(&g_alloc_budget);
+  if (budget >= 0) {
+    if (budget == 0) return NULL;
+    atomic_store(&g_alloc_budget, budget - 1);
+  }
   void *p = NULL;
   if (posix_memalign(&p, 64, (size_t)(n > 0 ? n : 1)) != 0) return NULL;
   memset(p, 0, (size_t)n);
   return p;
 }
 
-static void default_free(void *ctx, void *p, int64_t n) {
-  (void)ctx; (void)n;
+static void default_free(void *p, int64_t n) {
+  (void)n;
   free(p);
 }
 
-/* ---- monotonic clock ---------------------------------------------------- */
+/* ---- the clock (report.h: TIME) ------------------------------------------ */
 
-static double now_mono(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+static ReportClock g_clock;
+
+static double now_mono(void) { return report_mono(&g_clock); }
+
+void ar_test_set_clock(int fixed, double wall, double mono) {
+  g_clock.fixed = fixed;
+  g_clock.wall = wall;
+  g_clock.mono = mono;
 }
 
 /* ---- half floats --------------------------------------------------------- */
@@ -155,8 +171,6 @@ struct ArRing {
   Pin *pins;
   pthread_mutex_t pin_mu;
   int64_t segment_bytes;
-  ArAllocator alc;
-  void (*diag)(void *, const char *); void *diag_ctx;
 };
 
 struct ArRecordSet {
@@ -262,8 +276,8 @@ static Leaf *flat_add(Flatten *fl) {
   return lf;
 }
 
-static ArStatus flatten(const struct ArrowSchema *s, const char *prefix,
-                        Flatten *fl) {
+static int flatten(const struct ArrowSchema *s, const char *prefix,
+                        Flatten *fl, Report *report) {
   for (int64_t i = 0; i < s->n_children; i++) {
     const struct ArrowSchema *c = s->children[i];
     const char *f = c->format;
@@ -272,16 +286,16 @@ static ArStatus flatten(const struct ArrowSchema *s, const char *prefix,
              c->name ? c->name : "");
     bool nullable = (c->flags & ARROW_FLAG_NULLABLE) != 0;
     if (c->dictionary != NULL)
-      return err(AR_ERR_TYPE_UNSUPPORTED,
+      return err(report, REPORT_UNSUPPORTED,
                  "field '%s': dictionary unsupported (an encoding, not a "
                  "logical type)", path);
     if (strcmp(f, "+s") == 0) {
       if (nullable)
-        return err(AR_ERR_TYPE_UNSUPPORTED,
+        return err(report, REPORT_UNSUPPORTED,
                    "field '%s': nullable struct unsupported (declare the "
                    "struct non-nullable; leaves may be nullable)", path);
-      ArStatus st = flatten(c, path, fl);
-      if (st != AR_OK) return st;
+      int st = flatten(c, path, fl, report);
+      if (st != REPORT_OK) return st;
       continue;
     }
     Leaf lf0;
@@ -304,31 +318,31 @@ static ArStatus flatten(const struct ArrowSchema *s, const char *prefix,
     } else if (strcmp(f, "+l") == 0 || strcmp(f, "+L") == 0 ||
                strncmp(f, "+w:", 3) == 0) {
       if (c->n_children != 1)
-        return err(AR_ERR_INVALID, "field '%s': malformed list", path);
+        return err(report, REPORT_INVALID, "field '%s': malformed list", path);
       const char *cf = c->children[0]->format;
       if (parse_prim(cf, &cls, &isz) != 0)
-        return err(AR_ERR_TYPE_UNSUPPORTED,
+        return err(report, REPORT_UNSUPPORTED,
                    "field '%s': list of '%s' unsupported (fixed-width "
                    "primitive elements only)", path, cf);
       if (f[1] == 'w') {
         lf0.kind = K_FSL; lf0.cls = cls; lf0.itemsize = isz;
         lf0.width = atoll(f + 3);
         if (lf0.width <= 0)
-          return err(AR_ERR_INVALID, "field '%s': bad fixed_size_list", path);
+          return err(report, REPORT_INVALID, "field '%s': bad fixed_size_list", path);
       } else {
         lf0.kind = K_VAR; lf0.cls = cls; lf0.itemsize = isz;
         lf0.is_list = true;
         lf0.large_offsets = (f[1] == 'L');
       }
     } else {
-      return err(AR_ERR_TYPE_UNSUPPORTED,
+      return err(report, REPORT_UNSUPPORTED,
                  "field '%s': type '%s' unsupported (see arrow_ring "
                  "README for the supported set)", path, f);
     }
     lf0.path = dupstr(path);
     *flat_add(fl) = lf0;
   }
-  return AR_OK;
+  return REPORT_OK;
 }
 
 /* ---- pool ------------------------------------------------------------------ */
@@ -340,11 +354,11 @@ static void pool_init(Pool *p, int64_t itemsize, int64_t segment_bytes) {
   if (p->seg_elems < 1) p->seg_elems = 1;
 }
 
-static void pool_destroy(Pool *p, ArRing *r) {
+static void pool_destroy(Pool *p) {
   for (int32_t i = 0; i < p->n_segs; i++)
-    r->alc.free(r->alc.ctx, p->segs[i].data, p->segs[i].nbytes);
+    default_free(p->segs[i].data, p->segs[i].nbytes);
   for (int32_t i = 0; i < p->n_free; i++)
-    r->alc.free(r->alc.ctx, p->freelist[i], p->seg_elems * p->itemsize);
+    default_free(p->freelist[i], p->seg_elems * p->itemsize);
   free(p->segs);
   free(p->freelist);
 }
@@ -379,29 +393,27 @@ static int32_t pool_index_of(const Pool *p, int64_t elem) {
   return -1;
 }
 
-static ArStatus pool_alloc(Pool *p, ArRing *r, const char *path,
-                           const void *data, int64_t nbytes,
-                           int64_t *out_start, int64_t *out_n) {
+static int pool_alloc(Pool *p, const char *path, const void *data,
+                      int64_t nbytes, int64_t *out_start, int64_t *out_n,
+                      Report *report) {
   int64_t n = nbytes / p->itemsize;
-  if (n == 0) { *out_start = p->cursor; *out_n = 0; return AR_OK; }
+  if (n == 0) { *out_start = p->cursor; *out_n = 0; return REPORT_OK; }
   if (n > p->seg_elems) {
     Seg *cur = pool_current(p);
     if (cur) p->cursor = cur->start + cur->n;
-    uint8_t *buf = r->alc.alloc(r->alc.ctx, nbytes);
-    if (!buf) return err(AR_ERR_NOMEM, "pool alloc %lld bytes", (long long)nbytes);
+    uint8_t *buf = default_alloc(nbytes);
+    if (!buf) return err(report, REPORT_NO_MEMORY, "pool alloc %lld bytes", (long long)nbytes);
     memcpy(buf, data, (size_t)nbytes);
     pool_append(p, p->cursor, n, buf, nbytes);
     *out_start = p->cursor;
     p->cursor += n;
     *out_n = n;
     p->oversized++;
-    char msg[256];
-    snprintf(msg, sizeof(msg),
-             "[arrow_ring] oversized value: %lld elements (%lld bytes) in "
-             "%s (#%lld)", (long long)n, (long long)nbytes, path,
-             (long long)p->oversized);
-    if (r->diag) r->diag(r->diag_ctx, msg); else fprintf(stderr, "%s\n", msg);
-    return AR_OK;
+    report_line(report, &g_clock, REPORT_WARNING,
+                "[arrow_ring] oversized value: %lld elements (%lld bytes) in "
+                "%s (#%lld)", (long long)n, (long long)nbytes, path,
+                (long long)p->oversized);
+    return REPORT_OK;
   }
   Seg *cur = pool_current(p);
   if (cur == NULL || (p->cursor - cur->start) + n > cur->n) {
@@ -413,8 +425,8 @@ static ArStatus pool_alloc(Pool *p, ArRing *r, const char *path,
     int64_t nb = p->seg_elems * p->itemsize;
     if (p->n_free) buf = p->freelist[--p->n_free];
     else {
-      buf = r->alc.alloc(r->alc.ctx, nb);
-      if (!buf) return err(AR_ERR_NOMEM, "pool segment %lld bytes", (long long)nb);
+      buf = default_alloc(nb);
+      if (!buf) return err(report, REPORT_NO_MEMORY, "pool segment %lld bytes", (long long)nb);
     }
     cur = pool_append(p, p->cursor, p->seg_elems, buf, nb);
   }
@@ -423,7 +435,7 @@ static ArStatus pool_alloc(Pool *p, ArRing *r, const char *path,
   *out_start = p->cursor;
   p->cursor += n;
   *out_n = n;
-  return AR_OK;
+  return REPORT_OK;
 }
 
 /* Spare segments kept for reuse. Steady state cycles the freelist
@@ -436,7 +448,7 @@ static ArStatus pool_alloc(Pool *p, ArRing *r, const char *path,
  * transients decaying at wrap speed (nothing is immortal). */
 #define POOL_SPARES 2
 
-static void pool_reclaim(Pool *p, ArRing *r, int64_t floor) {
+static void pool_reclaim(Pool *p, int64_t floor) {
   int32_t drop = 0;
   while (drop < p->n_segs &&
          p->segs[drop].start + p->segs[drop].n <= floor)
@@ -451,7 +463,7 @@ static void pool_reclaim(Pool *p, ArRing *r, int64_t floor) {
       }
       p->freelist[p->n_free++] = s->data;
     } else {
-      r->alc.free(r->alc.ctx, s->data, s->nbytes);
+      default_free(s->data, s->nbytes);
     }
   }
   if (drop) {
@@ -484,46 +496,44 @@ static void pool_retire(ArRing *r, Leaf *lf, int64_t oldest) {
   for (Pin *p = r->pins; p; p = p->next)
     if (p->var_lo[vi] < floor) floor = p->var_lo[vi];
   pthread_mutex_unlock(&r->pin_mu);
-  pool_reclaim(&lf->pool, r, floor);
+  pool_reclaim(&lf->pool, floor);
 }
 
 /* ---- ring lifecycle ---------------------------------------------------------- */
 
-ArStatus ar_ring_new(const struct ArrowSchema *schema, int64_t capacity,
-                     const ArRingOptions *opts, ArRing **out) {
+int ar_ring_new(const struct ArrowSchema *schema, int64_t capacity,
+                     const ArRingOptions *opts, ArRing **out,
+                     Report *report) {
+  BEGIN(report);
   *out = NULL;
   if (schema == NULL || strcmp(schema->format, "+s") != 0)
-    return err(AR_ERR_INVALID, "schema must be a struct-typed ArrowSchema");
+    return err(report, REPORT_INVALID, "schema must be a struct-typed ArrowSchema");
   if (schema->n_children == 0)
-    return err(AR_ERR_INVALID, "schema has no fields");
+    return err(report, REPORT_INVALID, "schema has no fields");
   if (capacity <= 0)
-    return err(AR_ERR_INVALID, "capacity must be positive");
+    return err(report, REPORT_INVALID, "capacity must be positive");
 
   ArRing *r = calloc(1, sizeof(ArRing));
-  if (!r) return err(AR_ERR_NOMEM, "ring alloc");
+  if (!r) return err(report, REPORT_NO_MEMORY, "ring alloc");
   atomic_init(&r->refs, 1);
   atomic_init(&r->pending, 0);
   atomic_init(&r->committed, 0);
   pthread_mutex_init(&r->pin_mu, NULL);
   r->capacity = capacity;
   r->segment_bytes = 1 << 20;
-  r->alc.alloc = default_alloc;
-  r->alc.free = default_free;
   if (opts) {
     if (opts->segment_bytes > 0) r->segment_bytes = opts->segment_bytes;
-    if (opts->allocator.alloc) r->alc = opts->allocator;
-    r->diag = opts->diag; r->diag_ctx = opts->diag_ctx;
   }
 
   Flatten fl = {0};
-  ArStatus st = flatten(schema, "", &fl);
-  if (st != AR_OK) { free(fl.leaves); free(r); return st; }
+  int st = flatten(schema, "", &fl, report);
+  if (st != REPORT_OK) { free(fl.leaves); free(r); return st; }
   r->leaves = fl.leaves;
   r->n_leaves = fl.n;
 
   if (schema_copy(schema, &r->schema) != 0) {
     free(r);
-    return err(AR_ERR_NOMEM, "schema copy");
+    return err(report, REPORT_NO_MEMORY, "schema copy");
   }
 
   int64_t nbits = (capacity + 7) / 8;
@@ -533,7 +543,7 @@ ArStatus ar_ring_new(const struct ArrowSchema *schema, int64_t capacity,
     Leaf *lf = &r->leaves[i];
     if (lf->nullable) {
       lf->valid_nbytes = nbits;
-      lf->valid = r->alc.alloc(r->alc.ctx, nbits);
+      lf->valid = default_alloc(nbits);
       if (!lf->valid) oom = true;
     }
     switch (lf->kind) {
@@ -542,15 +552,15 @@ ArStatus ar_ring_new(const struct ArrowSchema *schema, int64_t capacity,
       case K_BYTES: lf->data_nbytes = capacity * lf->width; break;
       case K_FSL: lf->data_nbytes = capacity * lf->width * lf->itemsize; break;
       case K_VAR:
-        lf->starts = r->alc.alloc(r->alc.ctx, capacity * 8);
-        lf->lens = r->alc.alloc(r->alc.ctx, capacity * 8);
+        lf->starts = default_alloc(capacity * 8);
+        lf->lens = default_alloc(capacity * 8);
         if (!lf->starts || !lf->lens) oom = true;
         pool_init(&lf->pool, lf->itemsize, r->segment_bytes);
         r->n_var++;
         break;
     }
     if (lf->data_nbytes) {
-      lf->data = r->alc.alloc(r->alc.ctx, lf->data_nbytes);
+      lf->data = default_alloc(lf->data_nbytes);
       if (!lf->data) oom = true;
     }
     if (lf->nullable) r->n_nullable++;
@@ -560,7 +570,7 @@ ArStatus ar_ring_new(const struct ArrowSchema *schema, int64_t capacity,
                               sizeof(int32_t));
   if (oom || r->var_leaves == NULL || r->nullable_leaves == NULL) {
     ring_free_now(r);
-    return err(AR_ERR_NOMEM, "ring storage allocation failed "
+    return err(report, REPORT_NO_MEMORY, "ring storage allocation failed "
                "(capacity %lld rows)", (long long)capacity);
   }
   int32_t v = 0, nn = 0;
@@ -572,17 +582,17 @@ ArStatus ar_ring_new(const struct ArrowSchema *schema, int64_t capacity,
   if (schema->release)
     ((struct ArrowSchema *)schema)->release((struct ArrowSchema *)schema);
   *out = r;
-  return AR_OK;
+  return REPORT_OK;
 }
 
 static void ring_free_now(ArRing *r) {
   for (int32_t i = 0; i < r->n_leaves; i++) {
     Leaf *lf = &r->leaves[i];
-    if (lf->data) r->alc.free(r->alc.ctx, lf->data, lf->data_nbytes);
-    if (lf->valid) r->alc.free(r->alc.ctx, lf->valid, lf->valid_nbytes);
-    if (lf->starts) r->alc.free(r->alc.ctx, lf->starts, r->capacity * 8);
-    if (lf->lens) r->alc.free(r->alc.ctx, lf->lens, r->capacity * 8);
-    if (lf->kind == K_VAR) pool_destroy(&lf->pool, r);
+    if (lf->data) default_free(lf->data, lf->data_nbytes);
+    if (lf->valid) default_free(lf->valid, lf->valid_nbytes);
+    if (lf->starts) default_free(lf->starts, r->capacity * 8);
+    if (lf->lens) default_free(lf->lens, r->capacity * 8);
+    if (lf->kind == K_VAR) pool_destroy(&lf->pool);
     free(lf->path);
   }
   free(r->leaves);
@@ -626,31 +636,29 @@ static Pin *pin_blocking(ArRing *r, int64_t victim, Pin *copy_out) {
   return NULL;
 }
 
-static ArStatus wait_recyclable(ArRing *r, int64_t seq, int64_t block_ms) {
+/* May the writer reuse the slot of row `seq`? REPORT_BLOCKED when a
+ * pin holds the row a whole ring before it: the reason names the pin.
+ * The core does not wait (report.h): the host waits and calls again. */
+static int recyclable(ArRing *r, int64_t seq, Report *report) {
   int64_t victim = seq - r->capacity;
-  if (victim < 0) return AR_OK;
-  double deadline = now_mono() + (double)block_ms / 1e3;
-  for (;;) {
-    Pin copy;
-    if (pin_blocking(r, victim, &copy) == NULL) return AR_OK;
-    double t = now_mono();
-    if (t >= deadline)
-      return err(AR_ERR_PIN_STALLED,
-                 "writer stalled at seq %lld: recycling seq %lld is blocked "
-                 "by a pin on [%lld, %lld) held %.1fs, a whole ring behind "
-                 "the writer", (long long)seq, (long long)victim,
-                 (long long)copy.lo, (long long)copy.hi, t - copy.t0_mono);
-    struct timespec ts = {0, 1000000};   /* 1 ms */
-    nanosleep(&ts, NULL);
-  }
+  if (victim < 0) return REPORT_OK;
+  Pin copy;
+  if (pin_blocking(r, victim, &copy) == NULL) return REPORT_OK;
+  return err(report, REPORT_BLOCKED,
+             "writer stalled at seq %lld: recycling seq %lld is blocked "
+             "by a pin on [%lld, %lld) held %.1fs, a whole ring behind "
+             "the writer", (long long)seq, (long long)victim,
+             (long long)copy.lo, (long long)copy.hi,
+             now_mono() - copy.t0_mono);
 }
 
 /* ---- write side ---------------------------------------------------------------- */
 
-ArStatus ar_row_begin(ArRing *r, int64_t block_ms, int64_t *out_seq) {
+int ar_row_begin(ArRing *r, int64_t *out_seq, Report *report) {
+  BEGIN(report);
   int64_t pending = atomic_load(&r->pending);
-  ArStatus st = wait_recyclable(r, pending, block_ms);
-  if (st != AR_OK) return st;
+  int st = recyclable(r, pending, report);
+  if (st != REPORT_OK) return st;
   int64_t slot = pending % r->capacity;
   atomic_store(&r->pending, pending + 1);
   for (int32_t i = 0; i < r->n_nullable; i++)
@@ -661,14 +669,15 @@ ArStatus ar_row_begin(ArRing *r, int64_t block_ms, int64_t *out_seq) {
     lf->lens[slot] = 0;
   }
   if (out_seq) *out_seq = pending;
-  return AR_OK;
+  return REPORT_OK;
 }
 
-static ArStatus leaf_check(const ArRing *r, int32_t leaf, Leaf **out) {
+static int leaf_check(const ArRing *r, int32_t leaf, Leaf **out,
+                           Report *report) {
   if (leaf < 0 || leaf >= r->n_leaves)
-    return err(AR_ERR_INVALID, "leaf index %d out of range", leaf);
+    return err(report, REPORT_INVALID, "leaf index %d out of range", leaf);
   *out = &((ArRing *)r)->leaves[leaf];
-  return AR_OK;
+  return REPORT_OK;
 }
 
 static int64_t open_slot(ArRing *r) {
@@ -679,153 +688,162 @@ static void mark_valid(Leaf *lf, int64_t slot) {
   if (lf->valid) bit_set(lf->valid, slot);
 }
 
-static ArStatus store_int(Leaf *lf, int64_t slot, int64_t v, bool from_unsigned,
-                          uint64_t uv) {
+static int store_int(Leaf *lf, int64_t slot, int64_t v, bool from_unsigned,
+                          uint64_t uv, Report *report) {
   uint8_t *p = lf->data + slot * lf->itemsize;
   if (lf->cls == C_FLOAT)
-    return err(AR_ERR_INVALID, "field '%s': integer setter on float leaf",
+    return err(report, REPORT_INVALID, "field '%s': integer setter on float leaf",
                lf->path);
   if (lf->cls == C_UNSIGNED) {
     uint64_t u = from_unsigned ? uv : (uint64_t)v;
     if (!from_unsigned && v < 0)
-      return err(AR_ERR_WIDTH, "field '%s': negative into unsigned", lf->path);
+      return err(report, REPORT_WIDTH, "field '%s': negative into unsigned", lf->path);
     if (lf->itemsize < 8 && u >> (lf->itemsize * 8))
-      return err(AR_ERR_WIDTH, "field '%s': %llu overflows %lld-byte leaf",
+      return err(report, REPORT_WIDTH, "field '%s': %llu overflows %lld-byte leaf",
                  lf->path, (unsigned long long)u, (long long)lf->itemsize);
     memcpy(p, &u, (size_t)lf->itemsize);   /* little-endian hosts */
-    return AR_OK;
+    return REPORT_OK;
   }
   int64_t x = from_unsigned ? (int64_t)uv : v;
   if (from_unsigned && uv > INT64_MAX)
-    return err(AR_ERR_WIDTH, "field '%s': u64 overflows signed leaf", lf->path);
+    return err(report, REPORT_WIDTH, "field '%s': u64 overflows signed leaf", lf->path);
   if (lf->itemsize < 8) {
     int64_t lim = (int64_t)1 << (lf->itemsize * 8 - 1);
     if (x < -lim || x >= lim)
-      return err(AR_ERR_WIDTH, "field '%s': %lld overflows %lld-byte leaf",
+      return err(report, REPORT_WIDTH, "field '%s': %lld overflows %lld-byte leaf",
                  lf->path, (long long)x, (long long)lf->itemsize);
   }
   memcpy(p, &x, (size_t)lf->itemsize);
-  return AR_OK;
+  return REPORT_OK;
 }
 
-ArStatus ar_set_i64(ArRing *r, int32_t leaf, int64_t v) {
-  Leaf *lf; ArStatus st = leaf_check(r, leaf, &lf);
-  if (st != AR_OK) return st;
+int ar_set_i64(ArRing *r, int32_t leaf, int64_t v, Report *report) {
+  BEGIN(report);
+  Leaf *lf; int st = leaf_check(r, leaf, &lf, report);
+  if (st != REPORT_OK) return st;
   if (lf->kind != K_PRIM)
-    return err(AR_ERR_INVALID, "field '%s': not an integer leaf", lf->path);
-  st = store_int(lf, open_slot(r), v, false, 0);
-  if (st == AR_OK) mark_valid(lf, open_slot(r));
+    return err(report, REPORT_INVALID, "field '%s': not an integer leaf", lf->path);
+  st = store_int(lf, open_slot(r), v, false, 0, report);
+  if (st == REPORT_OK) mark_valid(lf, open_slot(r));
   return st;
 }
 
-ArStatus ar_set_u64(ArRing *r, int32_t leaf, uint64_t v) {
-  Leaf *lf; ArStatus st = leaf_check(r, leaf, &lf);
-  if (st != AR_OK) return st;
+int ar_set_u64(ArRing *r, int32_t leaf, uint64_t v,
+                    Report *report) {
+  BEGIN(report);
+  Leaf *lf; int st = leaf_check(r, leaf, &lf, report);
+  if (st != REPORT_OK) return st;
   if (lf->kind != K_PRIM)
-    return err(AR_ERR_INVALID, "field '%s': not an integer leaf", lf->path);
-  st = store_int(lf, open_slot(r), 0, true, v);
-  if (st == AR_OK) mark_valid(lf, open_slot(r));
+    return err(report, REPORT_INVALID, "field '%s': not an integer leaf", lf->path);
+  st = store_int(lf, open_slot(r), 0, true, v, report);
+  if (st == REPORT_OK) mark_valid(lf, open_slot(r));
   return st;
 }
 
-ArStatus ar_set_f64(ArRing *r, int32_t leaf, double v) {
-  Leaf *lf; ArStatus st = leaf_check(r, leaf, &lf);
-  if (st != AR_OK) return st;
+int ar_set_f64(ArRing *r, int32_t leaf, double v, Report *report) {
+  BEGIN(report);
+  Leaf *lf; int st = leaf_check(r, leaf, &lf, report);
+  if (st != REPORT_OK) return st;
   if (lf->kind != K_PRIM || lf->cls != C_FLOAT)
-    return err(AR_ERR_INVALID, "field '%s': not a float leaf", lf->path);
+    return err(report, REPORT_INVALID, "field '%s': not a float leaf", lf->path);
   int64_t slot = open_slot(r);
   uint8_t *p = lf->data + slot * lf->itemsize;
   if (lf->itemsize == 8) memcpy(p, &v, 8);
   else if (lf->itemsize == 4) { float f = (float)v; memcpy(p, &f, 4); }
   else { uint16_t h = f32_to_f16((float)v); memcpy(p, &h, 2); }
   mark_valid(lf, slot);
-  return AR_OK;
+  return REPORT_OK;
 }
 
-ArStatus ar_set_bool(ArRing *r, int32_t leaf, bool v) {
-  Leaf *lf; ArStatus st = leaf_check(r, leaf, &lf);
-  if (st != AR_OK) return st;
+int ar_set_bool(ArRing *r, int32_t leaf, bool v, Report *report) {
+  BEGIN(report);
+  Leaf *lf; int st = leaf_check(r, leaf, &lf, report);
+  if (st != REPORT_OK) return st;
   if (lf->kind != K_BOOL)
-    return err(AR_ERR_INVALID, "field '%s': not a bool leaf", lf->path);
+    return err(report, REPORT_INVALID, "field '%s': not a bool leaf", lf->path);
   int64_t slot = open_slot(r);
   if (v) bit_set(lf->data, slot); else bit_clear(lf->data, slot);
   mark_valid(lf, slot);
-  return AR_OK;
+  return REPORT_OK;
 }
 
-ArStatus ar_set_bytes(ArRing *r, int32_t leaf, const void *data,
-                      int64_t nbytes) {
-  Leaf *lf; ArStatus st = leaf_check(r, leaf, &lf);
-  if (st != AR_OK) return st;
+int ar_set_bytes(ArRing *r, int32_t leaf, const void *data,
+                      int64_t nbytes, Report *report) {
+  BEGIN(report);
+  Leaf *lf; int st = leaf_check(r, leaf, &lf, report);
+  if (st != REPORT_OK) return st;
   int64_t slot = open_slot(r);
   if (lf->kind == K_BYTES) {
     if (nbytes != lf->width)
-      return err(AR_ERR_WIDTH, "field '%s': needs exactly %lld bytes, got "
+      return err(report, REPORT_WIDTH, "field '%s': needs exactly %lld bytes, got "
                  "%lld", lf->path, (long long)lf->width, (long long)nbytes);
     memcpy(lf->data + slot * lf->width, data, (size_t)nbytes);
     mark_valid(lf, slot);
-    return AR_OK;
+    return REPORT_OK;
   }
   if (lf->kind == K_VAR && !lf->is_list) {
     pool_retire(r, lf, atomic_load(&r->pending) - r->capacity);
     int64_t start, n;
-    st = pool_alloc(&lf->pool, r, lf->path, data, nbytes, &start, &n);
-    if (st != AR_OK) return st;
+    st = pool_alloc(&lf->pool, lf->path, data, nbytes, &start, &n, report);
+    if (st != REPORT_OK) return st;
     lf->starts[slot] = start;
     lf->lens[slot] = n;
     mark_valid(lf, slot);
-    return AR_OK;
+    return REPORT_OK;
   }
-  return err(AR_ERR_INVALID, "field '%s': not a bytes leaf", lf->path);
+  return err(report, REPORT_INVALID, "field '%s': not a bytes leaf", lf->path);
 }
 
-ArStatus ar_set_list(ArRing *r, int32_t leaf, const void *elems,
-                     int64_t n_elems) {
-  Leaf *lf; ArStatus st = leaf_check(r, leaf, &lf);
-  if (st != AR_OK) return st;
+int ar_set_list(ArRing *r, int32_t leaf, const void *elems,
+                     int64_t n_elems, Report *report) {
+  BEGIN(report);
+  Leaf *lf; int st = leaf_check(r, leaf, &lf, report);
+  if (st != REPORT_OK) return st;
   int64_t slot = open_slot(r);
   if (lf->kind == K_FSL) {
     if (n_elems != lf->width)
-      return err(AR_ERR_WIDTH, "field '%s': needs exactly %lld elements, "
+      return err(report, REPORT_WIDTH, "field '%s': needs exactly %lld elements, "
                  "got %lld", lf->path, (long long)lf->width,
                  (long long)n_elems);
     memcpy(lf->data + slot * lf->width * lf->itemsize, elems,
            (size_t)(n_elems * lf->itemsize));
     mark_valid(lf, slot);
-    return AR_OK;
+    return REPORT_OK;
   }
   if (lf->kind == K_VAR && lf->is_list) {
     pool_retire(r, lf, atomic_load(&r->pending) - r->capacity);
     int64_t start, n;
-    st = pool_alloc(&lf->pool, r, lf->path, elems, n_elems * lf->itemsize,
-                    &start, &n);
-    if (st != AR_OK) return st;
+    st = pool_alloc(&lf->pool, lf->path, elems, n_elems * lf->itemsize,
+                    &start, &n, report);
+    if (st != REPORT_OK) return st;
     lf->starts[slot] = start;
     lf->lens[slot] = n;
     mark_valid(lf, slot);
-    return AR_OK;
+    return REPORT_OK;
   }
-  return err(AR_ERR_INVALID, "field '%s': not a list leaf", lf->path);
+  return err(report, REPORT_INVALID, "field '%s': not a list leaf", lf->path);
 }
 
-ArStatus ar_set_null(ArRing *r, int32_t leaf) {
-  Leaf *lf; ArStatus st = leaf_check(r, leaf, &lf);
-  if (st != AR_OK) return st;
+int ar_set_null(ArRing *r, int32_t leaf, Report *report) {
+  BEGIN(report);
+  Leaf *lf; int st = leaf_check(r, leaf, &lf, report);
+  if (st != REPORT_OK) return st;
   if (!lf->nullable)
-    return err(AR_ERR_NOT_NULLABLE, "field '%s' is not nullable", lf->path);
+    return err(report, REPORT_NOT_NULLABLE, "field '%s' is not nullable", lf->path);
   int64_t slot = open_slot(r);
   bit_clear(lf->valid, slot);
   if (lf->kind == K_VAR) lf->lens[slot] = 0;
-  return AR_OK;
+  return REPORT_OK;
 }
 
-ArStatus ar_commit(ArRing *r, int64_t *out_count) {
+int ar_commit(ArRing *r, int64_t *out_count, Report *report) {
+  BEGIN(report);
   int64_t pending = atomic_load(&r->pending);
   int64_t committed = atomic_load(&r->committed);
   int64_t n = pending - committed;
   if (n > 0) atomic_store(&r->committed, pending);
   if (out_count) *out_count = n;
-  return AR_OK;
+  return REPORT_OK;
 }
 
 /* ---- read side: single values --------------------------------------------------- */
@@ -841,34 +859,35 @@ int64_t ar_newest_seq(const ArRing *r) {
   return atomic_load(&((ArRing *)r)->committed) - 1;
 }
 
-static ArStatus read_check(const ArRing *r, int64_t seq, int32_t leaf,
+static int read_check(const ArRing *r, int64_t seq, int32_t leaf,
                            Leaf **out, int64_t *slot, bool *is_null,
-                           bool *null_out) {
-  ArStatus st = leaf_check(r, leaf, out);
-  if (st != AR_OK) return st;
+                           bool *null_out, Report *report) {
+  int st = leaf_check(r, leaf, out, report);
+  if (st != REPORT_OK) return st;
   int64_t committed = atomic_load(&((ArRing *)r)->committed);
   if (seq >= committed)
-    return err(AR_ERR_STALE, "seq %lld not committed (newest is %lld)",
+    return err(report, REPORT_STALE, "seq %lld not committed (newest is %lld)",
                (long long)seq, (long long)(committed - 1));
   int64_t oldest = ar_oldest_seq(r);
   if (seq < oldest)
-    return err(AR_ERR_STALE, "seq %lld recycled (oldest readable is %lld)",
+    return err(report, REPORT_STALE, "seq %lld recycled (oldest readable is %lld)",
                (long long)seq, (long long)oldest);
   *slot = seq % r->capacity;
   bool null = (*out)->valid ? !bit_test((*out)->valid, *slot) : false;
   if (is_null) *is_null = null;
   *null_out = null;
-  return AR_OK;
+  return REPORT_OK;
 }
 
-ArStatus ar_get_i64(const ArRing *r, int64_t seq, int32_t leaf, int64_t *out,
-                    bool *is_null) {
+int ar_get_i64(const ArRing *r, int64_t seq, int32_t leaf, int64_t *out,
+                    bool *is_null, Report *report) {
+  BEGIN(report);
   Leaf *lf; int64_t slot; bool null;
-  ArStatus st = read_check(r, seq, leaf, &lf, &slot, is_null, &null);
-  if (st != AR_OK) return st;
-  if (null) { *out = 0; return AR_OK; }
+  int st = read_check(r, seq, leaf, &lf, &slot, is_null, &null, report);
+  if (st != REPORT_OK) return st;
+  if (null) { *out = 0; return REPORT_OK; }
   if (lf->kind != K_PRIM || lf->cls == C_FLOAT)
-    return err(AR_ERR_INVALID, "field '%s': not an integer leaf", lf->path);
+    return err(report, REPORT_INVALID, "field '%s': not an integer leaf", lf->path);
   const uint8_t *p = lf->data + slot * lf->itemsize;
   int64_t v = 0;
   if (lf->cls == C_SIGNED) {
@@ -883,78 +902,83 @@ ArStatus ar_get_i64(const ArRing *r, int64_t seq, int32_t leaf, int64_t *out,
     v = (int64_t)u;
   }
   *out = v;
-  return AR_OK;
+  return REPORT_OK;
 }
 
-ArStatus ar_get_u64(const ArRing *r, int64_t seq, int32_t leaf, uint64_t *out,
-                    bool *is_null) {
+int ar_get_u64(const ArRing *r, int64_t seq, int32_t leaf, uint64_t *out,
+                    bool *is_null, Report *report) {
+  BEGIN(report);
   Leaf *lf; int64_t slot; bool null;
-  ArStatus st = read_check(r, seq, leaf, &lf, &slot, is_null, &null);
-  if (st != AR_OK) return st;
-  if (null) { *out = 0; return AR_OK; }
+  int st = read_check(r, seq, leaf, &lf, &slot, is_null, &null, report);
+  if (st != REPORT_OK) return st;
+  if (null) { *out = 0; return REPORT_OK; }
   if (lf->kind != K_PRIM || lf->cls != C_UNSIGNED)
-    return err(AR_ERR_INVALID, "field '%s': not an unsigned leaf", lf->path);
+    return err(report, REPORT_INVALID, "field '%s': not an unsigned leaf", lf->path);
   uint64_t u = 0;
   memcpy(&u, lf->data + slot * lf->itemsize, (size_t)lf->itemsize);
   *out = u;
-  return AR_OK;
+  return REPORT_OK;
 }
 
-ArStatus ar_get_f64(const ArRing *r, int64_t seq, int32_t leaf, double *out,
-                    bool *is_null) {
+int ar_get_f64(const ArRing *r, int64_t seq, int32_t leaf, double *out,
+                    bool *is_null, Report *report) {
+  BEGIN(report);
   Leaf *lf; int64_t slot; bool null;
-  ArStatus st = read_check(r, seq, leaf, &lf, &slot, is_null, &null);
-  if (st != AR_OK) return st;
-  if (null) { *out = 0.0; return AR_OK; }
+  int st = read_check(r, seq, leaf, &lf, &slot, is_null, &null, report);
+  if (st != REPORT_OK) return st;
+  if (null) { *out = 0.0; return REPORT_OK; }
   if (lf->kind != K_PRIM || lf->cls != C_FLOAT)
-    return err(AR_ERR_INVALID, "field '%s': not a float leaf", lf->path);
+    return err(report, REPORT_INVALID, "field '%s': not a float leaf", lf->path);
   const uint8_t *p = lf->data + slot * lf->itemsize;
   if (lf->itemsize == 8) memcpy(out, p, 8);
   else if (lf->itemsize == 4) { float f; memcpy(&f, p, 4); *out = f; }
   else { uint16_t h; memcpy(&h, p, 2); *out = f16_to_f32(h); }
-  return AR_OK;
+  return REPORT_OK;
 }
 
-ArStatus ar_get_bool(const ArRing *r, int64_t seq, int32_t leaf, bool *out,
-                     bool *is_null) {
+int ar_get_bool(const ArRing *r, int64_t seq, int32_t leaf, bool *out,
+                     bool *is_null, Report *report) {
+  BEGIN(report);
   Leaf *lf; int64_t slot; bool null;
-  ArStatus st = read_check(r, seq, leaf, &lf, &slot, is_null, &null);
-  if (st != AR_OK) return st;
-  if (null) { *out = false; return AR_OK; }
+  int st = read_check(r, seq, leaf, &lf, &slot, is_null, &null, report);
+  if (st != REPORT_OK) return st;
+  if (null) { *out = false; return REPORT_OK; }
   if (lf->kind != K_BOOL)
-    return err(AR_ERR_INVALID, "field '%s': not a bool leaf", lf->path);
+    return err(report, REPORT_INVALID, "field '%s': not a bool leaf", lf->path);
   *out = bit_test(lf->data, slot);
-  return AR_OK;
+  return REPORT_OK;
 }
 
-ArStatus ar_get_var(const ArRing *r, int64_t seq, int32_t leaf,
-                    const void **data, int64_t *n_elems, bool *is_null) {
+int ar_get_var(const ArRing *r, int64_t seq, int32_t leaf,
+                    const void **data, int64_t *n_elems, bool *is_null,
+                    Report *report) {
+  BEGIN(report);
   Leaf *lf; int64_t slot; bool null;
-  ArStatus st = read_check(r, seq, leaf, &lf, &slot, is_null, &null);
-  if (st != AR_OK) return st;
-  if (null) { *data = NULL; *n_elems = 0; return AR_OK; }
+  int st = read_check(r, seq, leaf, &lf, &slot, is_null, &null, report);
+  if (st != REPORT_OK) return st;
+  if (null) { *data = NULL; *n_elems = 0; return REPORT_OK; }
   if (lf->kind == K_BYTES) {
     *data = lf->data + slot * lf->width;
     *n_elems = lf->width;
-    return AR_OK;
+    return REPORT_OK;
   }
   if (lf->kind == K_FSL) {
     *data = lf->data + slot * lf->width * lf->itemsize;
     *n_elems = lf->width;
-    return AR_OK;
+    return REPORT_OK;
   }
   if (lf->kind == K_VAR) {
     int64_t n = lf->lens[slot];
-    if (n == 0) { *data = NULL; *n_elems = 0; return AR_OK; }
+    if (n == 0) { *data = NULL; *n_elems = 0; return REPORT_OK; }
     int32_t si = pool_index_of(&lf->pool, lf->starts[slot]);
     if (si < 0)
-      return err(AR_ERR_STALE, "field '%s': value storage recycled", lf->path);
+      return err(report, REPORT_STALE, "field '%s': value storage recycled", lf->path);
     Seg *s = &lf->pool.segs[si];
     *data = s->data + (lf->starts[slot] - s->start) * lf->itemsize;
     *n_elems = n;
-    return AR_OK;
+    return REPORT_OK;
   }
-  return err(AR_ERR_INVALID, "field '%s': no var view for this leaf", lf->path);
+  return err(report, REPORT_INVALID, "field '%s': no var view for this leaf", lf->path);
 }
 
 uint64_t ar_leaf_data_address(const ArRing *r, int32_t leaf) {
@@ -1033,17 +1057,17 @@ int64_t ar_recordset_hi(const ArRecordSet *rs) { return rs->hi; }
 
 /* The record set over [lo, hi), both already clamped to the readable
  * window: pinned when non-empty. */
-static ArStatus make_record_set(ArRing *r, int64_t lo, int64_t hi,
-                                ArRecordSet **out) {
+static int make_record_set(ArRing *r, int64_t lo, int64_t hi,
+                                ArRecordSet **out, Report *report) {
   ArRecordSet *rs = calloc(1, sizeof(ArRecordSet));
-  if (!rs) return err(AR_ERR_NOMEM, "record set");
+  if (!rs) return err(report, REPORT_NO_MEMORY, "record set");
   atomic_init(&rs->refs, 1);
   rs->ring = r;
   ring_ref(r);
   if (lo >= hi) {
     rs->lo = rs->hi = lo;
     *out = rs;
-    return AR_OK;
+    return REPORT_OK;
   }
   rs->lo = lo; rs->hi = hi;
   Pin *pin = calloc(1, sizeof(Pin));
@@ -1060,13 +1084,14 @@ static ArStatus make_record_set(ArRing *r, int64_t lo, int64_t hi,
   pthread_mutex_unlock(&r->pin_mu);
   rs->pin = pin;
   *out = rs;
-  return AR_OK;
+  return REPORT_OK;
 }
 
-ArStatus ar_pin(ArRing *r, int64_t lo, int64_t hi, ArRecordSet **out) {
+static int pin_rows(ArRing *r, int64_t lo, int64_t hi, ArRecordSet **out,
+                    Report *report) {
   *out = NULL;
   if (lo < 0 || hi < lo)
-    return err(AR_ERR_INVALID, "ar_pin: bad range [%lld, %lld)",
+    return err(report, REPORT_INVALID, "ar_pin: bad range [%lld, %lld)",
                (long long)lo, (long long)hi);
   /* Clamp to the readable window: rows below the oldest are gone (the
    * caller sees rs->lo > lo), rows at or above committed do not exist
@@ -1075,7 +1100,13 @@ ArStatus ar_pin(ArRing *r, int64_t lo, int64_t hi, ArRecordSet **out) {
   int64_t committed = atomic_load(&r->committed);
   if (lo < oldest) lo = oldest;
   if (hi > committed) hi = committed;
-  return make_record_set(r, lo, hi, out);
+  return make_record_set(r, lo, hi, out, report);
+}
+
+int ar_pin(ArRing *r, int64_t lo, int64_t hi, ArRecordSet **out,
+           Report *report) {
+  BEGIN(report);
+  return pin_rows(r, lo, hi, out, report);
 }
 
 /* ---- export: chunk computation ------------------------------------------------- */
@@ -1151,8 +1182,9 @@ static void batch_release(struct ArrowArray *a) {
 }
 
 /* Build the ArrowArray node for one leaf over physical slots [a, a+n). */
-static ArStatus leaf_array(ArRing *r, BatchPriv *bp, int32_t li,
-                           int64_t a, int64_t n, struct ArrowArray *node) {
+static int leaf_array(ArRing *r, BatchPriv *bp, int32_t li,
+                           int64_t a, int64_t n, struct ArrowArray *node,
+                           Report *report) {
   Leaf *lf = &r->leaves[li];
   node->length = n;
   node->offset = 0;
@@ -1164,7 +1196,7 @@ static ArStatus leaf_array(ArRing *r, BatchPriv *bp, int32_t li,
     node->buffers[0] = lf->valid;   /* bit offset via node->offset */
     node->buffers[1] = lf->data;
     node->offset = a;
-    return AR_OK;
+    return REPORT_OK;
   }
   if (lf->kind == K_FSL) {
     node->n_buffers = 1;
@@ -1183,7 +1215,7 @@ static ArStatus leaf_array(ArRing *r, BatchPriv *bp, int32_t li,
     child->buffers[0] = NULL;
     child->buffers[1] = lf->data;
     child->release = child_release;
-    return AR_OK;
+    return REPORT_OK;
   }
   /* K_VAR: fresh offsets (+ fresh validity), zero-copy data segment. */
   int64_t first_nz = -1;
@@ -1194,7 +1226,7 @@ static ArStatus leaf_array(ArRing *r, BatchPriv *bp, int32_t li,
   if (first_nz >= 0) {
     int32_t si = pool_index_of(&lf->pool, lf->starts[first_nz]);
     if (si < 0)
-      return err(AR_ERR_STALE, "field '%s': segment recycled under pin "
+      return err(report, REPORT_STALE, "field '%s': segment recycled under pin "
                  "(internal error)", lf->path);
     Seg *s = &lf->pool.segs[si];
     seg_data = s->data;
@@ -1206,7 +1238,7 @@ static ArStatus leaf_array(ArRing *r, BatchPriv *bp, int32_t li,
   int64_t acc = base;
   for (int64_t i = 0; i <= n; i++) {
     if (!lf->large_offsets && acc > INT32_MAX)
-      return err(AR_ERR_OFFSET_OVERFLOW,
+      return err(report, REPORT_OVERFLOW,
                  "field '%s': chunk exceeds int32 offsets; declare the "
                  "field large_*", lf->path);
     if (lf->large_offsets) ((int64_t *)offs)[i] = acc;
@@ -1242,15 +1274,16 @@ static ArStatus leaf_array(ArRing *r, BatchPriv *bp, int32_t li,
     node->buffers[1] = offs;
     node->buffers[2] = seg_data;
   }
-  return AR_OK;
+  return REPORT_OK;
 }
 
 /* Recursively build nodes following the schema tree; `li` walks the
- * flattened leaves in the same depth-first order flatten() used. */
-static ArStatus build_children(ArRing *r, BatchPriv *bp,
+ * flattened leaves in the same depth-first order flatten(report) used. */
+static int build_children(ArRing *r, BatchPriv *bp,
                                const struct ArrowSchema *s, int32_t *li,
                                int64_t a, int64_t n,
-                               struct ArrowArray *parent) {
+                               struct ArrowArray *parent,
+                               Report *report) {
   parent->n_children = s->n_children;
   parent->children = bp_alloc(bp, (size_t)s->n_children * sizeof(void *));
   for (int64_t i = 0; i < s->n_children; i++) {
@@ -1265,18 +1298,18 @@ static ArStatus build_children(ArRing *r, BatchPriv *bp,
       node->buffers = bp_alloc(bp, sizeof(void *));
       node->buffers[0] = NULL;
       node->release = child_release;
-      ArStatus st = build_children(r, bp, cs, li, a, n, node);
-      if (st != AR_OK) return st;
+      int st = build_children(r, bp, cs, li, a, n, node, report);
+      if (st != REPORT_OK) return st;
     } else {
-      ArStatus st = leaf_array(r, bp, (*li)++, a, n, node);
-      if (st != AR_OK) return st;
+      int st = leaf_array(r, bp, (*li)++, a, n, node, report);
+      if (st != REPORT_OK) return st;
     }
   }
-  return AR_OK;
+  return REPORT_OK;
 }
 
-static ArStatus build_batch(ArRecordSet *rs, int64_t a, int64_t b,
-                            struct ArrowArray *out) {
+static int build_batch(ArRecordSet *rs, int64_t a, int64_t b,
+                            struct ArrowArray *out, Report *report) {
   ArRing *r = rs->ring;
   memset(out, 0, sizeof(*out));
   BatchPriv *bp = calloc(1, sizeof(BatchPriv));
@@ -1290,9 +1323,9 @@ static ArStatus build_batch(ArRecordSet *rs, int64_t a, int64_t b,
   out->buffers = bp_alloc(bp, sizeof(void *));
   out->buffers[0] = NULL;
   int32_t li = 0;
-  ArStatus st = build_children(r, bp, &r->schema, &li, a, b - a, out);
-  if (st != AR_OK) { batch_release(out); return st; }
-  return AR_OK;
+  int st = build_children(r, bp, &r->schema, &li, a, b - a, out, report);
+  if (st != REPORT_OK) { batch_release(out); return st; }
+  return REPORT_OK;
 }
 
 /* ---- export: ArrowArrayStream ------------------------------------------------------ */
@@ -1318,9 +1351,12 @@ static int stream_get_next(struct ArrowArrayStream *s,
     return 0;
   }
   Chunk c = sp->chunks[sp->idx++];
-  ArStatus st = build_batch(sp->rs, c.a, c.b, out);
-  if (st != AR_OK) {
-    snprintf(sp->errbuf, sizeof(sp->errbuf), "%s", g_err);
+  Report why;                  /* this callback's own: the consumer
+                                  reads the reason by get_last_error */
+  report_begin(&why);
+  int st = build_batch(sp->rs, c.a, c.b, out, &why);
+  if (st != REPORT_OK) {
+    snprintf(sp->errbuf, sizeof(sp->errbuf), "%s", why.error);
     return 5;   /* EIO-style */
   }
   return 0;
@@ -1350,26 +1386,28 @@ struct ArChunkCursor {
   bool started;
 };
 
-ArStatus ar_chunks_open(ArRing *r, int64_t lo, int64_t hi, int64_t chunk_rows,
-                        ArChunkCursor **out) {
+int ar_chunks_open(ArRing *r, int64_t lo, int64_t hi, int64_t chunk_rows,
+                        ArChunkCursor **out, Report *report) {
+  BEGIN(report);
   *out = NULL;
   if (lo < 0 || hi < lo || chunk_rows <= 0)
-    return err(AR_ERR_INVALID, "ar_chunks_open: bad range [%lld, %lld) or "
+    return err(report, REPORT_INVALID, "ar_chunks_open: bad range [%lld, %lld) or "
                "chunk_rows %lld", (long long)lo, (long long)hi,
                (long long)chunk_rows);
   ArChunkCursor *c = calloc(1, sizeof(*c));
-  if (!c) return err(AR_ERR_NOMEM, "chunk cursor");
+  if (!c) return err(report, REPORT_NO_MEMORY, "chunk cursor");
   c->r = r;
   ring_ref(r);
   c->hi = hi;
   c->next = lo;
   c->chunk_rows = chunk_rows;
   *out = c;
-  return AR_OK;
+  return REPORT_OK;
 }
 
-ArStatus ar_chunks_next(ArChunkCursor *c, struct ArrowArray *out,
-                        int64_t *first_seq) {
+int ar_chunks_next(ArChunkCursor *c, struct ArrowArray *out,
+                        int64_t *first_seq, Report *report) {
+  BEGIN(report);
   ArRing *r = c->r;
   memset(out, 0, sizeof(*out));          /* release == NULL: the end */
   if (!c->started) {
@@ -1383,22 +1421,22 @@ ArStatus ar_chunks_next(ArChunkCursor *c, struct ArrowArray *out,
     if (c->next < oldest) c->next = oldest;
   }
   *first_seq = c->next;
-  if (c->next >= c->hi) return AR_OK;
+  if (c->next >= c->hi) return REPORT_OK;
   int64_t oldest = ar_oldest_seq(r);
   if (c->next < oldest)
-    return err(AR_ERR_STALE, "chunked read lapped by the writer: rows "
+    return err(report, REPORT_STALE, "chunked read lapped by the writer: rows "
                "[%lld, %lld) recycled before the read reached them",
                (long long)c->next,
                (long long)(oldest < c->hi ? oldest : c->hi));
   int64_t end = c->next + c->chunk_rows;
   if (end > c->hi) end = c->hi;
   ArRecordSet *rs;
-  ArStatus st = ar_pin(r, c->next, end, &rs);
-  if (st != AR_OK) return st;
+  int st = pin_rows(r, c->next, end, &rs, report);
+  if (st != REPORT_OK) return st;
   if (rs->lo > c->next) {                /* recycled between the check and the pin */
     int64_t gone = rs->lo;
     ar_recordset_release(rs);
-    return err(AR_ERR_STALE, "chunked read lapped by the writer: rows "
+    return err(report, REPORT_STALE, "chunked read lapped by the writer: rows "
                "[%lld, %lld) recycled before the read reached them",
                (long long)c->next, (long long)gone);
   }
@@ -1406,11 +1444,11 @@ ArStatus ar_chunks_next(ArChunkCursor *c, struct ArrowArray *out,
   Chunk *chunks = compute_chunks(r, rs->lo, rs->hi, &n);
   Chunk ch = chunks[0];                  /* the first physical run; the rest next time */
   free(chunks);
-  st = build_batch(rs, ch.a, ch.b, out);
-  if (st != AR_OK) { ar_recordset_release(rs); return st; }
+  st = build_batch(rs, ch.a, ch.b, out, report);
+  if (st != REPORT_OK) { ar_recordset_release(rs); return st; }
   c->next += ch.b - ch.a;
   ar_recordset_detach(rs);               /* the pin rides this batch alone */
-  return AR_OK;
+  return REPORT_OK;
 }
 
 void ar_chunks_free(ArChunkCursor *c) {
@@ -1419,9 +1457,11 @@ void ar_chunks_free(ArChunkCursor *c) {
   free(c);
 }
 
-ArStatus ar_recordset_stream(ArRecordSet *rs, struct ArrowArrayStream *out) {
+int ar_recordset_stream(ArRecordSet *rs, struct ArrowArrayStream *out,
+                             Report *report) {
+  BEGIN(report);
   StreamPriv *sp = calloc(1, sizeof(StreamPriv));
-  if (!sp) return err(AR_ERR_NOMEM, "stream");
+  if (!sp) return err(report, REPORT_NO_MEMORY, "stream");
   sp->rs = rs;
   rs_ref(rs);
   if (rs->hi > rs->lo)
@@ -1431,7 +1471,7 @@ ArStatus ar_recordset_stream(ArRecordSet *rs, struct ArrowArrayStream *out) {
   out->get_last_error = stream_get_last_error;
   out->release = stream_release;
   out->private_data = sp;
-  return AR_OK;
+  return REPORT_OK;
 }
 
 /* ---- ingest: Arrow batches in (the memcpy path) --------------------------------- */
@@ -1454,15 +1494,16 @@ static bool any_null_bits(const uint8_t *valid, int64_t off, int64_t n) {
 /* Ingest rows [row0, row0+n) of leaf array `a` (whose logical element
  * offset, including all parent struct offsets, is `eo`) into ring slots
  * starting at dest_slot (span guaranteed unwrapped by the caller). */
-static ArStatus ingest_leaf(ArRing *r, Leaf *lf, const struct ArrowArray *a,
+static int ingest_leaf(ArRing *r, Leaf *lf, const struct ArrowArray *a,
                             int64_t eo, int64_t row0, int64_t n,
-                            int64_t dest_slot, int64_t oldest) {
+                            int64_t dest_slot, int64_t oldest,
+                            Report *report) {
   const uint8_t *src_valid = a->n_buffers > 0 ? a->buffers[0] : NULL;
   int64_t so = eo + row0;
   if (lf->valid) {
     copy_bits(lf->valid, dest_slot, src_valid, so, n);
   } else if (src_valid && any_null_bits(src_valid, so, n)) {
-    return err(AR_ERR_INVALID, "field '%s': null values into a "
+    return err(report, REPORT_INVALID, "field '%s': null values into a "
                "non-nullable leaf", lf->path);
   }
   switch (lf->kind) {
@@ -1470,22 +1511,22 @@ static ArStatus ingest_leaf(ArRing *r, Leaf *lf, const struct ArrowArray *a,
       memcpy(lf->data + dest_slot * lf->itemsize,
              (const uint8_t *)a->buffers[1] + so * lf->itemsize,
              (size_t)(n * lf->itemsize));
-      return AR_OK;
+      return REPORT_OK;
     case K_BYTES:
       memcpy(lf->data + dest_slot * lf->width,
              (const uint8_t *)a->buffers[1] + so * lf->width,
              (size_t)(n * lf->width));
-      return AR_OK;
+      return REPORT_OK;
     case K_BOOL:
       copy_bits(lf->data, dest_slot, a->buffers[1], so, n);
-      return AR_OK;
+      return REPORT_OK;
     case K_FSL: {
       const struct ArrowArray *c = a->children[0];
       memcpy(lf->data + dest_slot * lf->width * lf->itemsize,
              (const uint8_t *)c->buffers[1] +
                  (c->offset + so * lf->width) * lf->itemsize,
              (size_t)(n * lf->width * lf->itemsize));
-      return AR_OK;
+      return REPORT_OK;
     }
     case K_VAR: {
       int64_t first, last1;   /* element range [first, last1) in values */
@@ -1497,18 +1538,20 @@ static ArStatus ingest_leaf(ArRing *r, Leaf *lf, const struct ArrowArray *a,
         const int32_t *off = a->buffers[1];
         first = off[so]; last1 = off[so + n];
       }
+      /* a batch whose values are all empty may have no values buffer */
       if (lf->is_list) {
         const struct ArrowArray *c = a->children[0];
-        vals = (const uint8_t *)c->buffers[1] +
-               (c->offset + first) * lf->itemsize;
+        const uint8_t *base = c->buffers[1];
+        vals = base ? base + (c->offset + first) * lf->itemsize : NULL;
       } else {
-        vals = (const uint8_t *)a->buffers[2] + first * lf->itemsize;
+        const uint8_t *base = a->buffers[2];
+        vals = base ? base + first * lf->itemsize : NULL;
       }
       int64_t start, total;
       pool_retire(r, lf, oldest);
-      ArStatus st = pool_alloc(&lf->pool, r, lf->path, vals,
-                               (last1 - first) * lf->itemsize, &start, &total);
-      if (st != AR_OK) return st;
+      int st = pool_alloc(&lf->pool, lf->path, vals,
+                               (last1 - first) * lf->itemsize, &start, &total, report);
+      if (st != REPORT_OK) return st;
       for (int64_t i = 0; i < n; i++) {
         int64_t o0, o1;
         if (lf->large_offsets) {
@@ -1521,19 +1564,20 @@ static ArStatus ingest_leaf(ArRing *r, Leaf *lf, const struct ArrowArray *a,
         lf->starts[dest_slot + i] = start + (o0 - first);
         lf->lens[dest_slot + i] = o1 - o0;
       }
-      return AR_OK;
+      return REPORT_OK;
     }
   }
-  return err(AR_ERR_INVALID, "field '%s': unknown kind", lf->path);
+  return err(report, REPORT_INVALID, "field '%s': unknown kind", lf->path);
 }
 
 /* Walk schema/array trees in the flatten DFS order. */
-static ArStatus ingest_children(ArRing *r, const struct ArrowSchema *s,
+static int ingest_children(ArRing *r, const struct ArrowSchema *s,
                                 const struct ArrowArray *a, int64_t eo,
                                 int32_t *li, int64_t row0, int64_t n,
-                                int64_t dest_slot, int64_t oldest) {
+                                int64_t dest_slot, int64_t oldest,
+                                Report *report) {
   if (a->n_children != s->n_children)
-    return err(AR_ERR_INVALID, "batch structure does not match ring schema "
+    return err(report, REPORT_INVALID, "batch structure does not match ring schema "
                "(%lld children vs %lld)", (long long)a->n_children,
                (long long)s->n_children);
   for (int64_t i = 0; i < s->n_children; i++) {
@@ -1541,50 +1585,47 @@ static ArStatus ingest_children(ArRing *r, const struct ArrowSchema *s,
     const struct ArrowArray *ca = a->children[i];
     int64_t ceo = eo + ca->offset;
     if (strcmp(cs->format, "+s") == 0) {
-      ArStatus st = ingest_children(r, cs, ca, ceo, li, row0, n, dest_slot,
-                                    oldest);
-      if (st != AR_OK) return st;
+      int st = ingest_children(r, cs, ca, ceo, li, row0, n, dest_slot,
+                                    oldest, report);
+      if (st != REPORT_OK) return st;
     } else {
-      ArStatus st = ingest_leaf(r, &r->leaves[(*li)++], ca, ceo, row0, n,
-                                dest_slot, oldest);
-      if (st != AR_OK) return st;
+      int st = ingest_leaf(r, &r->leaves[(*li)++], ca, ceo, row0, n,
+                                dest_slot, oldest, report);
+      if (st != REPORT_OK) return st;
     }
   }
-  return AR_OK;
+  return REPORT_OK;
 }
 
-ArStatus ar_append_batch_at(ArRing *r, struct ArrowArray *batch,
-                            int64_t first_seq) {
+static int append_at(ArRing *r, struct ArrowArray *batch,
+                     int64_t first_seq, Report *report) {
   if (batch == NULL || batch->release == NULL)
-    return err(AR_ERR_INVALID, "append: released/NULL batch");
+    return err(report, REPORT_INVALID, "append: released/NULL batch");
   if (first_seq < -1)
-    return err(AR_ERR_INVALID, "append_at: first_seq %lld is invalid "
+    return err(report, REPORT_INVALID, "append_at: first_seq %lld is invalid "
                "(-1 = plain append, >= 0 = explicit axis)",
                (long long)first_seq);
   int64_t n = batch->length;
-  ArStatus st = AR_OK;
+  int st = REPORT_OK;
   if (first_seq >= 0) {
     int64_t next = atomic_load(&r->pending);
     if (first_seq < next) {
-      st = err(AR_ERR_INVALID, "append_at: seq %lld regresses (next "
+      st = err(report, REPORT_INVALID, "append_at: seq %lld regresses (next "
                "expected is %lld)", (long long)first_seq,
                (long long)next);
       goto done;
     }
     if (first_seq > next) {
       if (atomic_load(&r->committed) != next) {
-        st = err(AR_ERR_INVALID, "append_at: cannot gap-advance with "
+        st = err(report, REPORT_INVALID, "append_at: cannot gap-advance with "
                  "open (uncommitted) rows");
         goto done;
       }
       if (next > 0) {          /* a real gap, not a fresh-ring start */
-        char msg[192];
-        snprintf(msg, sizeof(msg),
-                 "[arrow_ring] GAP: jumped seq %lld -> %lld (%lld rows "
-                 "never received)", (long long)next,
-                 (long long)first_seq, (long long)(first_seq - next));
-        if (r->diag) r->diag(r->diag_ctx, msg);
-        else fprintf(stderr, "%s\n", msg);
+        report_line(report, &g_clock, REPORT_WARNING,
+                    "[arrow_ring] GAP: jumped seq %lld -> %lld (%lld rows "
+                    "never received)", (long long)next,
+                    (long long)first_seq, (long long)(first_seq - next));
       }
       atomic_store(&r->pending, first_seq);
       atomic_store(&r->committed, first_seq);
@@ -1592,7 +1633,7 @@ ArStatus ar_append_batch_at(ArRing *r, struct ArrowArray *batch,
     }
   }
   if (n > r->capacity) {
-    st = err(AR_ERR_INVALID, "append: batch of %lld rows exceeds ring "
+    st = err(report, REPORT_INVALID, "append: batch of %lld rows exceeds ring "
              "capacity %lld", (long long)n, (long long)r->capacity);
     goto done;
   }
@@ -1600,8 +1641,8 @@ ArStatus ar_append_batch_at(ArRing *r, struct ArrowArray *batch,
     int64_t pending = atomic_load(&r->pending);
     /* Recycling check for the whole span (no blocking on ingest). */
     for (int64_t seq = pending; seq < pending + n; seq++) {
-      st = wait_recyclable(r, seq, 0);
-      if (st != AR_OK) goto done;
+      st = recyclable(r, seq, report);
+      if (st != REPORT_OK) goto done;
     }
     int64_t done_rows = 0;
     while (done_rows < n) {
@@ -1613,8 +1654,8 @@ ArStatus ar_append_batch_at(ArRing *r, struct ArrowArray *batch,
        * whose slot this span does not touch */
       st = ingest_children(r, &r->schema, batch, batch->offset, &li,
                            done_rows, span, dest_slot,
-                           pending + done_rows + span - r->capacity);
-      if (st != AR_OK) goto done;
+                           pending + done_rows + span - r->capacity, report);
+      if (st != REPORT_OK) goto done;
       done_rows += span;
     }
     atomic_store(&r->pending, pending + n);
@@ -1625,25 +1666,34 @@ done:
   return st;
 }
 
-ArStatus ar_append_batch(ArRing *r, struct ArrowArray *batch) {
-  return ar_append_batch_at(r, batch, -1);
+int ar_append_batch_at(ArRing *r, struct ArrowArray *batch,
+                       int64_t first_seq, Report *report) {
+  BEGIN(report);
+  return append_at(r, batch, first_seq, report);
 }
 
-ArStatus ar_append_stream(ArRing *r, struct ArrowArrayStream *stream) {
+int ar_append_batch(ArRing *r, struct ArrowArray *batch, Report *report) {
+  BEGIN(report);
+  return append_at(r, batch, -1, report);
+}
+
+int ar_append_stream(ArRing *r, struct ArrowArrayStream *stream,
+                          Report *report) {
+  BEGIN(report);
   if (stream == NULL || stream->release == NULL)
-    return err(AR_ERR_INVALID, "append: released/NULL stream");
-  ArStatus st = AR_OK;
+    return err(report, REPORT_INVALID, "append: released/NULL stream");
+  int st = REPORT_OK;
   for (;;) {
     struct ArrowArray batch;
     if (stream->get_next(stream, &batch) != 0) {
       const char *msg = stream->get_last_error
           ? stream->get_last_error(stream) : NULL;
-      st = err(AR_ERR_IO, "append: stream error: %s", msg ? msg : "unknown");
+      st = err(report, REPORT_REFUSED, "append: stream error: %s", msg ? msg : "unknown");
       break;
     }
     if (batch.release == NULL) break;   /* end of stream */
-    st = ar_append_batch(r, &batch);
-    if (st != AR_OK) break;
+    st = append_at(r, &batch, -1, report);
+    if (st != REPORT_OK) break;
   }
   stream->release(stream);
   return st;
@@ -1666,11 +1716,12 @@ static int64_t leaf_row_bytes(const Leaf *lf) {
   }
 }
 
-ArStatus ar_wiremap_new(const ArRing *r, const int32_t *leaves,
+int ar_wiremap_new(const ArRing *r, const int32_t *leaves,
                         const int32_t *offsets, const int32_t *sizes,
-                        int32_t n, ArWireMap **out) {
+                        int32_t n, ArWireMap **out, Report *report) {
+  BEGIN(report);
   *out = NULL;
-  if (n <= 0) return err(AR_ERR_INVALID, "wiremap: empty map");
+  if (n <= 0) return err(report, REPORT_INVALID, "wiremap: empty map");
   ArWireMap *m = calloc(1, sizeof(ArWireMap));
   m->n = n;
   m->leaves = malloc((size_t)n * 4);
@@ -1679,26 +1730,26 @@ ArStatus ar_wiremap_new(const ArRing *r, const int32_t *leaves,
   for (int32_t i = 0; i < n; i++) {
     if (leaves[i] < 0 || leaves[i] >= r->n_leaves) {
       ar_wiremap_free(m);
-      return err(AR_ERR_INVALID, "wiremap: leaf index %d out of range",
+      return err(report, REPORT_INVALID, "wiremap: leaf index %d out of range",
                  leaves[i]);
     }
     const Leaf *lf = &r->leaves[leaves[i]];
     int64_t want = leaf_row_bytes(lf);
     if (want < 0) {
       ar_wiremap_free(m);
-      return err(AR_ERR_TYPE_UNSUPPORTED,
+      return err(report, REPORT_UNSUPPORTED,
                  "wiremap: field '%s' is not wire-mappable (fixed-width "
                  "prim/decimal/fixed_size_binary/fixed_size_list only)",
                  lf->path);
     }
     if (sizes[i] != want) {
       ar_wiremap_free(m);
-      return err(AR_ERR_WIDTH, "wiremap: field '%s' is %lld bytes, map "
+      return err(report, REPORT_WIDTH, "wiremap: field '%s' is %lld bytes, map "
                  "says %d", lf->path, (long long)want, sizes[i]);
     }
     if (offsets[i] < 0) {
       ar_wiremap_free(m);
-      return err(AR_ERR_INVALID, "wiremap: negative offset");
+      return err(report, REPORT_INVALID, "wiremap: negative offset");
     }
     m->leaves[i] = leaves[i];
     m->offsets[i] = offsets[i];
@@ -1707,7 +1758,7 @@ ArStatus ar_wiremap_new(const ArRing *r, const int32_t *leaves,
       m->min_frame = offsets[i] + sizes[i];
   }
   *out = m;
-  return AR_OK;
+  return REPORT_OK;
 }
 
 void ar_wiremap_free(ArWireMap *m) {
@@ -1718,10 +1769,11 @@ void ar_wiremap_free(ArWireMap *m) {
   free(m);
 }
 
-ArStatus ar_from_wire(ArRing *r, const ArWireMap *m, const void *frame,
-                      int64_t frame_len) {
+int ar_from_wire(ArRing *r, const ArWireMap *m, const void *frame,
+                      int64_t frame_len, Report *report) {
+  BEGIN(report);
   if (frame_len < m->min_frame)
-    return err(AR_ERR_WIDTH, "from_wire: frame %lld bytes, map needs %lld",
+    return err(report, REPORT_WIDTH, "from_wire: frame %lld bytes, map needs %lld",
                (long long)frame_len, (long long)m->min_frame);
   int64_t slot = open_slot(r);
   const uint8_t *f = frame;
@@ -1731,20 +1783,21 @@ ArStatus ar_from_wire(ArRing *r, const ArWireMap *m, const void *frame,
            (size_t)m->sizes[i]);
     if (lf->valid) bit_set(lf->valid, slot);
   }
-  return AR_OK;
+  return REPORT_OK;
 }
 
-ArStatus ar_to_wire(const ArRing *r, const ArWireMap *m, int64_t seq,
-                    void *frame, int64_t frame_len) {
+int ar_to_wire(const ArRing *r, const ArWireMap *m, int64_t seq,
+                    void *frame, int64_t frame_len, Report *report) {
+  BEGIN(report);
   if (frame_len < m->min_frame)
-    return err(AR_ERR_WIDTH, "to_wire: frame %lld bytes, map needs %lld",
+    return err(report, REPORT_WIDTH, "to_wire: frame %lld bytes, map needs %lld",
                (long long)frame_len, (long long)m->min_frame);
   int64_t committed = atomic_load(&((ArRing *)r)->committed);
   if (seq >= committed)
-    return err(AR_ERR_STALE, "seq %lld not committed", (long long)seq);
+    return err(report, REPORT_STALE, "seq %lld not committed", (long long)seq);
   int64_t oldest = ar_oldest_seq(r);
   if (seq < oldest)
-    return err(AR_ERR_STALE, "seq %lld recycled (oldest readable %lld)",
+    return err(report, REPORT_STALE, "seq %lld recycled (oldest readable %lld)",
                (long long)seq, (long long)oldest);
   int64_t slot = seq % r->capacity;
   uint8_t *f = frame;
@@ -1753,13 +1806,5 @@ ArStatus ar_to_wire(const ArRing *r, const ArWireMap *m, int64_t seq,
     memcpy(f + m->offsets[i], lf->data + slot * m->sizes[i],
            (size_t)m->sizes[i]);
   }
-  return AR_OK;
-}
-
-/* ---- not yet implemented (loud stubs) ---------------------------------------------- */
-
-ArStatus ar_recordset_write_ipc(ArRecordSet *rs, ArWriteFn write, void *ctx) {
-  (void)rs; (void)write; (void)ctx;
-  return err(AR_ERR_INVALID, "ar_recordset_write_ipc: not implemented in "
-             "core v1 (feed ar_recordset_stream to a host IPC writer)");
+  return REPORT_OK;
 }
