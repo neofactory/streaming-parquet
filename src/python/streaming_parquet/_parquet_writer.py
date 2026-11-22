@@ -372,8 +372,7 @@ class ParquetWriter:
         """`rows` of file `name` are in the store, unfinished there, in
         the checkpoint version `ckpt` (its object name)."""
         with self._store_lock:
-            self._store.stored(name, self._version(ckpt), ckpt, rows,
-                               _wall_time())
+            self._store.stored(name, self._version(ckpt), ckpt, rows)
 
     def _await_catalog(self, name, sink, ckpt, rows=0):
         """File `name` is finished in `sink`; its checkpoint version
@@ -409,7 +408,7 @@ class ParquetWriter:
         if not done:
             return
         with self._store_lock:
-            self._store.dropped(time.monotonic())
+            self._store.dropped()
         self.discard_due()
 
     def discard_due(self):
@@ -419,7 +418,7 @@ class ParquetWriter:
         the catalog drops files; nothing runs on a timer."""
         with self._store_lock:
             due = [(n, self._ckpt_sink.get(n))
-                   for n in self._store.due(time.monotonic())]
+                   for n in self._store.due()]
         for n, sink in due:
             try:
                 if sink is not None:

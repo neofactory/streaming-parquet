@@ -19,7 +19,6 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 )
 
 // ownership is the held lock. The operating system releases it when
@@ -83,8 +82,7 @@ func (t *Telemetry) claim(name, run string) (*ownership, error) {
 		t.log.Warn(ownershipUnread(name, t.root, err))
 		return owned, nil
 	}
-	decision, message := ownershipDecision(who, name, t.root, ticket, host,
-		float64(time.Now().UnixNano())/1e9)
+	decision, message := ownershipDecision(who, name, t.root, ticket, host)
 	switch decision {
 	case ownRefused:
 		owned.release()

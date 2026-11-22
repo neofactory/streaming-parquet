@@ -425,7 +425,7 @@ class Catalog:
             got = self._published.get()
             data, self.etag = got if got is not None else (b"", None)
             try:
-                self._cat = _core.Catalog(data, self.folder, _clock_now())
+                self._cat = _core.Catalog(data, self.folder)
             except _core.CatalogError as e:
                 raise RuntimeError(f"{self.folder}{CATALOG} is not a "
                                    f"catalog this library reads: {e}") from None
@@ -440,7 +440,7 @@ class Catalog:
                 self._listed = names
             self._copy_pass()
             return
-        data = cat.to_bytes(_clock_now())
+        data = cat.to_bytes()
         self.etag = self._published.put(data, self.etag)
         self.files = len(paths)         # what the PUBLISHED catalog lists
         self._listed = names

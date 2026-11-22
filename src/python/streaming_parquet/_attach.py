@@ -545,13 +545,12 @@ class _Feeder:
         """Look for the stream, in this process and then in the store,
         and take the core's step for what was found."""
         from . import _core
-        now, mono = time.time(), time.monotonic()
         local, local_folder = (self._local() if self._local is not None
                                else (None, False))
         if local is not None:
             self._local_stream = local
             return self._took(self._core.poll(_core.FOUND_LOCAL, None, None,
-                                              now, mono, 0.0))
+                                              0.0))
         self._local_stream = None
         if self._direct is not None:
             found, ticket, why = _core.FOUND_TICKET, self._direct, None
@@ -565,7 +564,7 @@ class _Feeder:
                 found, ticket, why = _core.FOUND_UNREADABLE, None, e
         self._ticket = ticket            # None = the writer closed, or none
         step = self._core.poll(
-            found, ticket, why, now, mono,
+            found, ticket, why,
             _tickets.stale_after(ticket) if ticket is not None else 0.0)
         if step.action == _core.DO_LIST:
             try:
@@ -573,9 +572,9 @@ class _Feeder:
                     self._store, self._core.folder))
             except Exception as e:
                 step = self._core.poll(_core.FOUND_UNREADABLE, None, e,
-                                       now, mono, 0.0)
+                                       0.0)
             else:
-                step = self._core.folder_is(exists, mono)
+                step = self._core.folder_is(exists)
         return self._took(step)
 
     def _drop_ring(self):
@@ -610,7 +609,7 @@ class _Feeder:
                     break
                 self._local_stream = None
                 self.data = None         # the ring was the writer's
-                step = self._took(self._core.lost(None, time.monotonic()))
+                step = self._took(self._core.lost(None))
                 continue
 
             # DO_CONNECT. A fresh ring (above) when the writer started
@@ -649,7 +648,7 @@ class _Feeder:
                        f"{ticket.get('port')} failed: {e}")
             if self._closed:
                 break
-            step = self._took(self._core.lost(why, time.monotonic()))
+            step = self._took(self._core.lost(why))
 
         self._core.close()
         self._state = "closed"

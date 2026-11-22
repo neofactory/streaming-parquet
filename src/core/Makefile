@@ -35,7 +35,7 @@ $(OUT)/libpqc.dylib: pqc.c pqc.h
 
 # The catalog (sp_catalog.c) is a SQLite database: the system's SQLite
 # library and its header (Ubuntu: libsqlite3-dev).
-$(OUT)/libsp.dylib: sp.c sp_catalog.c sp.h
+$(OUT)/libsp.dylib: sp.c sp_catalog.c sp.h report.h
 	$(CC) $(CFLAGS) -shared -o $@ sp.c sp_catalog.c -lm -lsqlite3
 
 # ---- AddressSanitizer + UBSan runs (pure C, no Python in the loop) ----
@@ -49,7 +49,7 @@ san-pqc: pqc.c pqc.h pqc_san_test.c
 	$(CC) $(SAN) -o pqc_san_test_bin pqc.c pqc_san_test.c
 	./pqc_san_test_bin
 
-san-sp: sp.c sp_catalog.c sp.h sp_san_test.c
+san-sp: sp.c sp_catalog.c sp.h report.h sp_test_calls.h sp_san_test.c
 	$(CC) $(SAN) -o sp_san_test_bin sp.c sp_catalog.c sp_san_test.c -lm -lsqlite3
 	./sp_san_test_bin
 
@@ -72,7 +72,7 @@ fuzz-pqc: pqc.c pqc.h pqc_fuzz.c
 
 # sp's ticket reader takes text from the store, and its catalog takes
 # parquet footers: real tickets and footers (sp_corpus/), mutated.
-fuzz-sp: sp.c sp_catalog.c sp.h sp_fuzz.c
+fuzz-sp: sp.c sp_catalog.c sp.h report.h sp_test_calls.h sp_fuzz.c
 	$(CC) $(SAN) -o sp_fuzz_bin sp.c sp_catalog.c sp_fuzz.c -lm -lsqlite3
 	./sp_fuzz_bin $${FUZZ_ITERS:-300000} sp_corpus/flat.footer sp_corpus/nested.footer
 

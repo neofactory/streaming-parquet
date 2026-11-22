@@ -2408,8 +2408,9 @@ def _():
          "ts": 1000.0, "stale_after": 45.0, "stored_row": 10, "files": []}
 
     def look(window):
-        rules.plan(t, [], "r1", window, 1001.0, 5.0, 30.0, 600.0)
+        rules.plan(t, [], "r1", window, 30.0, 600.0)
         return rules.messages()
+    _core.test_set_clock(1001.0, 5.0)
     said = look((200, 599, 400))
     assert "too short for the store's lag of 589 rows" in rules.ring_note, rules.ring_note
     assert "MemoryOptions(lookback=786)" in rules.ring_note, rules.ring_note
@@ -2419,6 +2420,7 @@ def _():
     said = look((0, 20, 400))
     assert rules.ring_note is None and [lv for lv, _ in said] == [_core.LOG_INFO] \
         and "the ring is in use again" in said[0][1], said
+    _core.test_system_clock()
 
 
 @test("row_ids=True: sp_run_start_time and sp_run_row_number name every "
@@ -3174,8 +3176,13 @@ def _():
     old = _core.ticket_from_text('{"name": "a", "host": "h", "port": 1, '
                                  '"ts": 5.0, "archive": "s3://b/x", "new": [1]}')
     assert old["archive"] == "s3://b/x" and old["run"] is None
-    assert _core.ticket_is_stale(old, 35.0, 30.0)
-    assert not _core.ticket_is_stale(old, 34.9, 30.0)
+    try:
+        _core.test_set_clock(35.0, 0.0)
+        assert _core.ticket_is_stale(old, 30.0)
+        _core.test_set_clock(34.9, 0.0)
+        assert not _core.ticket_is_stale(old, 30.0)
+    finally:
+        _core.test_system_clock()
 
 
 print("\n--- the reader's rules (src/core/sp.h: THE READER) ---")

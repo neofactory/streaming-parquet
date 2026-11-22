@@ -496,7 +496,7 @@ class Stream:
         if self._flight_server is not None:
             self._flight_server.notify(self.name)
         with self._lock:
-            kind, begins = self._plan.commit(committed, time.monotonic())
+            kind, begins = self._plan.commit(committed)
             archive = kind != _core.NOTHING
             if begins:
                 # The pending rows begin: this commit's row is the
@@ -615,8 +615,7 @@ class Stream:
         pin. force: a row group whatever is due (a cut, a start's mark,
         a stop). Caller holds the lock."""
         before = self._plan.cursor
-        kind, lo, hi, lost = self._plan.plan(force, rel.lo, committed,
-                                             time.monotonic())
+        kind, lo, hi, lost = self._plan.plan(force, rel.lo, committed)
         if lost:
             _diag.error(
                 f"[{self.name}] ARCHIVE LOSS: rows [{before}, "

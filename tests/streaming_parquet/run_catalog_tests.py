@@ -90,7 +90,7 @@ for p in paths:
 con.execute("DETACH lk"); con.close()
 
 # the core's
-cat = _core.Catalog(b"", here + "/", time.time())
+cat = _core.Catalog(b"", here + "/")
 blob = None
 for i, p in enumerate(paths):
     size = os.path.getsize(p)
@@ -99,9 +99,9 @@ for i, p in enumerate(paths):
         f.seek(size - 8 - n); footer = f.read(n)
     cat.add(p, size, footer)
     if i == 2:                 # a pass ends here; the catalog is opened again from its bytes
-        blob = cat.to_bytes(time.time())
-        cat = _core.Catalog(blob, here + "/", time.time())
-blob = cat.to_bytes(time.time())
+        blob = cat.to_bytes()
+        cat = _core.Catalog(blob, here + "/")
+blob = cat.to_bytes()
 assert cat.files() == paths, cat.files()
 with open(f"{here}/core.sqlite", "wb") as f:
     f.write(blob)

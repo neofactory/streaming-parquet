@@ -341,7 +341,7 @@ func min64(a, b int64) int64 {
 // is due.
 func (a *archiver) plan() error {
 	committed := a.ring.NewestSeq() + 1
-	if a.wp.commit(committed, monoNow()) == writeNothing {
+	if a.wp.commit(committed) == writeNothing {
 		return nil
 	}
 	return a.enqueue(false, committed)
@@ -360,7 +360,7 @@ func (a *archiver) enqueue(force bool, committed int64) error {
 	if err != nil {
 		return err
 	}
-	kind, lo, hi, lost := a.wp.plan(force, rs.Lo, min64(committed, rs.Hi), monoNow())
+	kind, lo, hi, lost := a.wp.plan(force, rs.Lo, min64(committed, rs.Hi))
 	if lost > 0 {
 		// rows reused before their write: loud, counted, then on from
 		// what the ring still has

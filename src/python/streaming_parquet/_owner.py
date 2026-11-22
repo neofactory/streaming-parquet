@@ -27,7 +27,6 @@ in the spool (the default spool when the stream has none).
 
 import fcntl
 import os
-import time
 
 from . import _core, _tickets
 from ._diag import _diag
@@ -79,7 +78,7 @@ def claim(name, lock_dir, store, host, port, run):
         _diag.warning(_core.ownership_unread(name, store, e))
         return owned
     decision, message = _core.ownership(who, name, store, ticket, host,
-                                        time.time(), _tickets.stale_after({}))
+                                        _tickets.stale_after({}))
     if decision == _core.REFUSED:
         owned.release()
         raise RuntimeError(message)

@@ -67,7 +67,6 @@ import re
 import shutil
 import tempfile
 import threading
-import time
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -325,7 +324,7 @@ class StoreView:
         plan = self._rules.plan(
             t, [_file_of(f["checkpoint"]) for f in (t or {}).get("files") or ()],
             src.run(), self._window() if self._with_memory else None,
-            time.time(), time.monotonic(), parquet_checkpoint.dead_after(),
+            parquet_checkpoint.dead_after(),
             parquet_checkpoint.SUPERSEDED_KEEP_S)
         self._say()
         if not plan.build:
@@ -423,7 +422,7 @@ class StoreView:
         src = self._source
         while not self._stop.is_set():
             with self._lock:
-                wait = self._rules.wait_seconds(time.time())
+                wait = self._rules.wait_seconds()
             if src.revisions is not None:
                 seen = self._seen_revision
                 got = src.revisions.wait_ticket_revision(

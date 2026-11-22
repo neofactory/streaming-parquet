@@ -2,7 +2,7 @@
  * fuzz`: real tickets, mutated, each read under the sanitizers. A
  * ticket that is read is written and read again, and must come back
  * the same text. */
-#include "sp.h"
+#include "sp_test_calls.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,7 +35,7 @@ static int fuzz_footers(long iters, int n_seeds, char **seeds) {
     long taken = 0;
     size_t image_len = 0;
     char err[256];
-    SpCatalog *base = sp_catalog_open(NULL, 0, "/d/", 1.0, err, sizeof err);
+    SpCatalog *base = t_catalog_open(NULL, 0, "/d/", 1.0, err, sizeof err);
     uint8_t **seed = calloc((size_t)n_seeds, sizeof *seed);
     size_t *seed_len = calloc((size_t)n_seeds, sizeof *seed_len);
     for (int i = 0; i < n_seeds; i++) {
@@ -46,17 +46,17 @@ static int fuzz_footers(long iters, int n_seeds, char **seeds) {
         fclose(f);
         char path[32];
         snprintf(path, sizeof path, "/d/seed%d.parquet", i);
-        if (i == 0 && sp_catalog_add(base, path, 1000, seed[i], seed_len[i],
+        if (i == 0 && t_catalog_add(base, path, 1000, seed[i], seed_len[i],
                                      err, sizeof err) != 0) {
             fprintf(stderr, "FAIL: the seed %s is refused: %s\n", seeds[i], err);
             return 1;
         }
     }
     /* a catalog with the first seed listed: where every round starts */
-    uint8_t *image = sp_catalog_bytes(base, 2.0, &image_len, err, sizeof err);
+    uint8_t *image = t_catalog_bytes(base, 2.0, &image_len, err, sizeof err);
     sp_catalog_free(base);
     if (!image) { fprintf(stderr, "FAIL: %s\n", err); return 1; }
-    SpCatalog *c = sp_catalog_open(image, image_len, "/d/", 3.0, err, sizeof err);
+    SpCatalog *c = t_catalog_open(image, image_len, "/d/", 3.0, err, sizeof err);
     for (long i = 0; i < iters; i++) {
         int which = (int)(rnd() % (uint32_t)n_seeds);
         size_t n = seed_len[which];
@@ -77,22 +77,22 @@ static int fuzz_footers(long iters, int n_seeds, char **seeds) {
         memcpy(exact, buf, n);
         char path[32];
         snprintf(path, sizeof path, "/d/f%ld.parquet", i);
-        if (sp_catalog_add(c, path, 1000, exact, n, err, sizeof err) == 0) taken++;
+        if (t_catalog_add(c, path, 1000, exact, n, err, sizeof err) == 0) taken++;
         free(exact);
         free(buf);
         if (i % 2000 == 1999) {           /* the catalog stays one that opens */
             size_t len;
-            uint8_t *out = sp_catalog_bytes(c, 4.0, &len, err, sizeof err);
+            uint8_t *out = t_catalog_bytes(c, 4.0, &len, err, sizeof err);
             if (!out) { fprintf(stderr, "FAIL: no bytes: %s\n", err); return 1; }
             sp_catalog_free(c);
-            c = sp_catalog_open(out, len, "/d/", 5.0, err, sizeof err);
+            c = t_catalog_open(out, len, "/d/", 5.0, err, sizeof err);
             sp_free(out);
             if (!c) {
                 fprintf(stderr, "FAIL: wrote a catalog it cannot open: %s\n", err);
                 return 1;
             }
             sp_catalog_free(c);           /* and start again from the seed's */
-            c = sp_catalog_open(image, image_len, "/d/", 3.0, err, sizeof err);
+            c = t_catalog_open(image, image_len, "/d/", 3.0, err, sizeof err);
         }
     }
     sp_catalog_free(c);
@@ -130,39 +130,39 @@ int main(int argc, char **argv) {
         char err[128];
         /* the lock file's text is read the same way, and never refused */
         char held[512];
-        sp_lock_refusal("w", "p", exact, n, held, sizeof held);
-        SpTicket *t = sp_ticket_read(exact, n, err, sizeof err);
+        t_lock_refusal("w", "p", exact, n, held, sizeof held);
+        SpTicket *t = t_ticket_read(exact, n, err, sizeof err);
         if (t) {
             read_ok++;
-            sp_ownership("w", "n", "s", t, "10.0.0.9", 1762979480.0, 30,
+            t_ownership("w", "n", "s", t, "10.0.0.9", 1762979480.0, 30,
                          held, sizeof held);
             /* the view's rules take any ticket that reads */
             int64_t window[3] = {(int64_t)(rnd() % 2000), (int64_t)(rnd() % 3000),
                                  (int64_t)(rnd() % 1000)};
-            SpView *v = sp_view_new("v", "n", rnd() % 2 ? "m" : NULL,
+            SpView *v = t_view_new("v", "n", rnd() % 2 ? "m" : NULL,
                                     rnd() % 2 ? "e" : NULL);
             SpViewPlan plan;
             sp_view_set_row_ids(v, (int)(rnd() % 2));
             for (int k = 0; k < 2; k++) {
-                sp_view_plan(v, t, NULL, "2026-11-12T20:31:12.123456Z",
+                t_view_plan(v, t, NULL, "2026-11-12T20:31:12.123456Z",
                              rnd() % 4 ? window : NULL, 1762979480.0 + k * 40,
                              (double)k, 30, 600, &plan);
-                char *sql = sp_view_sql(v, rnd() % 2 ? "c" : NULL, held, sizeof held);
+                char *sql = t_view_sql(v, rnd() % 2 ? "c" : NULL, held, sizeof held);
                 if (sql) sp_view_built(v);
                 sp_free(sql);
-                sp_view_wait_seconds(v, 1762979480.0);
+                t_view_wait_seconds(v, 1762979480.0);
                 window[1] += 100;
             }
-            while (sp_view_message(v, held, sizeof held)) {}
+            while (t_view_message(v, held, sizeof held)) {}
             sp_view_free(v);
             size_t len;
-            char *text = sp_ticket_write(t, &len);
-            SpTicket *back = sp_ticket_read(text, len, err, sizeof err);
+            char *text = t_ticket_write(t, &len);
+            SpTicket *back = t_ticket_read(text, len, err, sizeof err);
             if (!back) {
                 fprintf(stderr, "FAIL: wrote a ticket it cannot read: %s\n%s\n", err, text);
                 return 1;
             }
-            char *again = sp_ticket_write(back, NULL);
+            char *again = t_ticket_write(back, NULL);
             if (strcmp(text, again) != 0) {
                 fprintf(stderr, "FAIL: a ticket changed on the way round:\n%s\n%s\n", text, again);
                 return 1;

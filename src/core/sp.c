@@ -1,4 +1,7 @@
 /* sp.c -- the stream core. sp.h is the spec; read it first. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L   /* clock_gettime under -std=c11 */
+#endif
 #include "sp.h"
 
 #include <errno.h>
@@ -10,13 +13,43 @@
 
 /* ---- small things ------------------------------------------------------- */
 
-static void fail(char *err, size_t errlen, const char *fmt, ...) {
-    if (!err || errlen == 0) return;
+/* The core's clock (report.h: TIME): the system's, or a test's. */
+static ReportClock g_clock;
+
+void sp_test_set_clock(int fixed, double wall, double mono) {
+    g_clock.fixed = fixed;
+    g_clock.wall = wall;
+    g_clock.mono = mono;
+}
+
+double sp__wall(void) { return report_wall(&g_clock); }
+double sp__mono(void) { return report_mono(&g_clock); }
+
+/* The call failed: the status and the reason. Returns -1, for the
+ * functions inside the core; a public function returns report->status. */
+static int fail(Report *report, int status, const char *fmt, ...) {
+    if (!report) return -1;
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(err, errlen, fmt, ap);
+    vsnprintf(report->error, sizeof report->error, fmt, ap);
     va_end(ap);
+    report->status = status;
+    return -1;
 }
+
+/* The end of a public function that makes something: what was made goes
+ * out, and a failure with no reason of its own is memory. */
+#define MADE(report, out, value, what) do { \
+        *(out) = (value); \
+        if (!*(out) && !(report)->status) \
+            fail((report), REPORT_NO_MEMORY, "%s: memory is out", (what)); \
+        return (report)->status; \
+    } while (0)
+
+/* The start of a public function that takes a Report. */
+#define BEGIN(report) do { \
+        if (!report_begin(report)) return REPORT_INVALID; \
+    } while (0)
 
 void sp_free(void *p) { free(p); }
 
@@ -169,7 +202,13 @@ int sp_ticket_field_kind(int field) {
     return field_ok(field) ? FIELD[field].kind : -1;
 }
 
-SpTicket *sp_ticket_new(void) { return calloc(1, sizeof(SpTicket)); }
+static SpTicket *ticket_new(void) { return calloc(1, sizeof(SpTicket)); }
+
+int sp_ticket_new(SpTicket **out, Report *report) {
+    BEGIN(report);
+    if (!out) { fail(report, REPORT_INVALID, "ticket: nowhere to put it"); return report->status; }
+    MADE(report, out, ticket_new(), "ticket");
+}
 
 void sp_ticket_free(SpTicket *t) {
     if (!t) return;
@@ -179,39 +218,39 @@ void sp_ticket_free(SpTicket *t) {
     free(t);
 }
 
-int sp_ticket_clear(SpTicket *t, int field) {
-    if (!t || !field_ok(field)) return -1;
+void sp_ticket_clear(SpTicket *t, int field) {
+    if (!t || !field_ok(field)) return;
     free(t->m[field].text);
     memset(&t->m[field], 0, sizeof t->m[field]);
-    return 0;
 }
 
 static int want(const SpTicket *t, int field, int kind, const char *what,
-                char *err, size_t errlen) {
-    if (!t) { fail(err, errlen, "ticket: no ticket"); return -1; }
+                Report *report) {
+    if (!t) { fail(report, REPORT_INVALID, "ticket: no ticket"); return -1; }
     if (!field_ok(field)) {
-        fail(err, errlen, "ticket: no member number %d", field);
+        fail(report, REPORT_INVALID, "ticket: no member number %d", field);
         return -1;
     }
     int is = FIELD[field].kind;
     if (is == kind || (kind == SP_INTEGER && is == SP_NUMBER)) return 0;
-    fail(err, errlen, "ticket: %s is %s, and was given %s", FIELD[field].name,
+    fail(report, REPORT_REFUSED, "ticket: %s is %s, and was given %s", FIELD[field].name,
          is == SP_TEXT ? "text" : is == SP_INTEGER ? "an integer" : "a number",
          what);
     return -1;
 }
 
 int sp_ticket_set_text(SpTicket *t, int field, const char *text,
-                       char *err, size_t errlen) {
-    if (want(t, field, SP_TEXT, "text", err, errlen)) return -1;
-    if (!text) return sp_ticket_clear(t, field);
+                       Report *report) {
+    BEGIN(report);
+    if (want(t, field, SP_TEXT, "text", report)) return report->status;
+    if (!text) { sp_ticket_clear(t, field); return 0; }
     size_t n = strlen(text);
     if (!is_utf8((const unsigned char *)text, n)) {
-        fail(err, errlen, "ticket: %s is not UTF-8 text", FIELD[field].name);
-        return -1;
+        fail(report, REPORT_REFUSED, "ticket: %s is not UTF-8 text", FIELD[field].name);
+        return report->status;
     }
     char *copy = copy_text(text, n);
-    if (!copy) { fail(err, errlen, "ticket: out of memory"); return -1; }
+    if (!copy) { fail(report, REPORT_NO_MEMORY, "ticket: out of memory"); return report->status; }
     free(t->m[field].text);
     t->m[field].text = copy;
     t->m[field].known = 1;
@@ -219,8 +258,9 @@ int sp_ticket_set_text(SpTicket *t, int field, const char *text,
 }
 
 int sp_ticket_set_integer(SpTicket *t, int field, int64_t value,
-                          char *err, size_t errlen) {
-    if (want(t, field, SP_INTEGER, "an integer", err, errlen)) return -1;
+                          Report *report) {
+    BEGIN(report);
+    if (want(t, field, SP_INTEGER, "an integer", report)) return report->status;
     t->m[field].known = 1;
     t->m[field].integer = value;
     t->m[field].number = (double)value;
@@ -228,50 +268,60 @@ int sp_ticket_set_integer(SpTicket *t, int field, int64_t value,
 }
 
 int sp_ticket_set_number(SpTicket *t, int field, double value,
-                         char *err, size_t errlen) {
-    if (want(t, field, SP_NUMBER, "a number", err, errlen)) return -1;
+                         Report *report) {
+    BEGIN(report);
+    if (want(t, field, SP_NUMBER, "a number", report)) return report->status;
     if (FIELD[field].kind != SP_NUMBER) {
-        fail(err, errlen, "ticket: %s is an integer, and was given a number",
+        fail(report, REPORT_REFUSED, "ticket: %s is an integer, and was given a number",
              FIELD[field].name);
-        return -1;
+        return report->status;
     }
     if (!isfinite(value)) {
-        fail(err, errlen, "ticket: %s is not a finite number",
+        fail(report, REPORT_REFUSED, "ticket: %s is not a finite number",
              FIELD[field].name);
-        return -1;
+        return report->status;
     }
     t->m[field].known = 1;
     t->m[field].number = value;
     return 0;
 }
 
-int sp_ticket_add_file(SpTicket *t, const char *checkpoint,
-                       const int64_t *first_row, const int64_t *final_rows,
-                       const int64_t *rows, char *err, size_t errlen) {
+static int ticket_add_file(SpTicket *t, const char *checkpoint,
+                           const int64_t *first_row,
+                           const int64_t *final_rows, const int64_t *rows,
+                           Report *report) {
     if (!t || !checkpoint) {
-        fail(err, errlen, "ticket: a file needs its checkpoint path");
+        fail(report, REPORT_REFUSED, "ticket: a file needs its checkpoint path");
         return -1;
     }
     size_t n = strlen(checkpoint);
     if (!is_utf8((const unsigned char *)checkpoint, n)) {
-        fail(err, errlen, "ticket: a file's checkpoint path is not UTF-8 text");
+        fail(report, REPORT_REFUSED, "ticket: a file's checkpoint path is not UTF-8 text");
         return -1;
     }
     if (t->n_files == t->cap_files) {
         int32_t cap = t->cap_files ? t->cap_files * 2 : 4;
         TicketFile *p = realloc(t->files, (size_t)cap * sizeof *p);
-        if (!p) { fail(err, errlen, "ticket: out of memory"); return -1; }
+        if (!p) { fail(report, REPORT_NO_MEMORY, "ticket: out of memory"); return -1; }
         t->files = p;
         t->cap_files = cap;
     }
     TicketFile f = {0};
     f.checkpoint = copy_text(checkpoint, n);
-    if (!f.checkpoint) { fail(err, errlen, "ticket: out of memory"); return -1; }
+    if (!f.checkpoint) { fail(report, REPORT_NO_MEMORY, "ticket: out of memory"); return -1; }
     if (first_row) { f.first_row = *first_row; f.has_first_row = 1; }
     if (final_rows) { f.final_rows = *final_rows; f.has_final_rows = 1; }
     if (rows) { f.rows = *rows; f.has_rows = 1; }
     t->files[t->n_files++] = f;
     return 0;
+}
+
+int sp_ticket_add_file(SpTicket *t, const char *checkpoint,
+                       const int64_t *first_row, const int64_t *final_rows,
+                       const int64_t *rows, Report *report) {
+    BEGIN(report);
+    ticket_add_file(t, checkpoint, first_row, final_rows, rows, report);
+    return report->status;
 }
 
 const char *sp_ticket_text(const SpTicket *t, int field) {
@@ -328,7 +378,7 @@ static void write_optional(Text *b, int has, int64_t v) {
     else text_str(b, "null");
 }
 
-char *sp_ticket_write(const SpTicket *t, size_t *out_len) {
+static char *ticket_write(const SpTicket *t, size_t *out_len) {
     if (!t) return NULL;
     Text b = {0};
     text_str(&b, "{");
@@ -376,19 +426,19 @@ char *sp_ticket_write(const SpTicket *t, size_t *out_len) {
 
 typedef struct {
     const char *p, *end;
-    char *err;
-    size_t errlen;
+    Report *report;           /* NULL: the reason is not wanted */
     int failed;
 } Reader;
 
 static void refuse(Reader *r, const char *fmt, ...) {
     if (r->failed) return;
     r->failed = 1;
-    if (!r->err || r->errlen == 0) return;
+    if (!r->report) return;
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(r->err, r->errlen, fmt, ap);
+    vsnprintf(r->report->error, sizeof r->report->error, fmt, ap);
     va_end(ap);
+    r->report->status = REPORT_REFUSED;
 }
 
 static void skip_space(Reader *r) {
@@ -648,10 +698,10 @@ static void read_files(Reader *r, SpTicket *t) {
             refuse(r, "ticket: a file with no checkpoint");
             return;
         }
-        int rc = sp_ticket_add_file(t, f.checkpoint,
-                                    f.has_first_row ? &f.first_row : NULL,
-                                    f.has_final_rows ? &f.final_rows : NULL,
-                                    f.has_rows ? &f.rows : NULL, NULL, 0);
+        int rc = ticket_add_file(t, f.checkpoint,
+                                 f.has_first_row ? &f.first_row : NULL,
+                                 f.has_final_rows ? &f.final_rows : NULL,
+                                 f.has_rows ? &f.rows : NULL, NULL);
         free(f.checkpoint);
         if (rc) { refuse(r, "ticket: out of memory"); return; }
     } while (take(r, ','));
@@ -704,12 +754,17 @@ static void read_member(Reader *r, SpTicket *t, const char *key) {
     t->m[field].known = 1;
 }
 
-SpTicket *sp_ticket_read(const char *text, size_t len,
-                         char *err, size_t errlen) {
-    Reader r = {text, text ? text + len : NULL, err, errlen, 0};
-    if (err && errlen) err[0] = 0;
-    SpTicket *t = sp_ticket_new();
-    if (!t) { fail(err, errlen, "ticket: out of memory"); return NULL; }
+int sp_ticket_write(const SpTicket *t, char **out, size_t *out_len,
+                    Report *report) {
+    BEGIN(report);
+    if (!t || !out) { fail(report, REPORT_INVALID, "ticket: no ticket to write"); return report->status; }
+    MADE(report, out, ticket_write(t, out_len), "ticket");
+}
+
+static SpTicket *ticket_read(const char *text, size_t len, Report *report) {
+    Reader r = {text, text ? text + len : NULL, report, 0};
+    SpTicket *t = ticket_new();
+    if (!t) { fail(report, REPORT_NO_MEMORY, "ticket: out of memory"); return NULL; }
     if (!text) refuse(&r, "ticket: no text");
     else if (!take(&r, '{')) refuse(&r, "ticket: not a JSON object");
     else if (!take(&r, '}')) {
@@ -730,6 +785,13 @@ SpTicket *sp_ticket_read(const char *text, size_t len,
     return t;
 }
 
+int sp_ticket_read(const char *text, size_t len, SpTicket **out,
+                   Report *report) {
+    BEGIN(report);
+    if (!out) { fail(report, REPORT_INVALID, "ticket: nowhere to put it"); return report->status; }
+    MADE(report, out, ticket_read(text, len, report), "ticket");
+}
+
 /* ---- the stale rule ----------------------------------------------------- */
 
 double sp_ticket_stale_after(const SpTicket *t, double if_absent) {
@@ -738,16 +800,20 @@ double sp_ticket_stale_after(const SpTicket *t, double if_absent) {
     return if_absent;
 }
 
-int sp_ticket_is_stale(const SpTicket *t, double now, double if_absent) {
+static int ticket_is_stale(const SpTicket *t, double now, double if_absent) {
     double ts;
     if (!sp_ticket_number(t, SP_T_TS, &ts)) return 1;
     return now - ts >= sp_ticket_stale_after(t, if_absent);
 }
 
+int sp_ticket_is_stale(const SpTicket *t, double if_absent) {
+    return ticket_is_stale(t, sp__wall(), if_absent);
+}
+
 /* ---- the ownership decision --------------------------------------------- */
 
-char *sp_lock_record(int64_t pid, const char *host, int64_t port,
-                     const char *run, size_t *out_len) {
+static char *lock_record(int64_t pid, const char *host, int64_t port,
+                         const char *run, size_t *out_len) {
     Text b = {0};
     text_str(&b, "{\"pid\":");
     text_integer(&b, pid);
@@ -768,7 +834,7 @@ char *sp_lock_record(int64_t pid, const char *host, int64_t port,
  * caller frees *run. */
 static void lock_holder(const char *text, size_t len, int64_t *pid,
                         int *has_pid, char **run) {
-    Reader r = {text, text ? text + len : NULL, NULL, 0, 0};
+    Reader r = {text, text ? text + len : NULL, NULL, 0};
     *has_pid = 0;
     *run = NULL;
     if (!text || !take(&r, '{') || take(&r, '}')) return;
@@ -794,30 +860,41 @@ static void lock_holder(const char *text, size_t len, int64_t *pid,
     } while (!r.failed && take(&r, ','));
 }
 
-void sp_lock_refusal(const char *who, const char *lock_path,
-                     const char *holder, size_t holder_len,
-                     char *msg, size_t msglen) {
+int sp_lock_record(int64_t pid, const char *host, int64_t port,
+                   const char *run, char **out, size_t *out_len,
+                   Report *report) {
+    BEGIN(report);
+    if (!out) { fail(report, REPORT_INVALID, "lock record: nowhere to put it"); return report->status; }
+    MADE(report, out, lock_record(pid, host, port, run, out_len), "lock record");
+}
+
+int sp_lock_refusal(const char *who, const char *lock_path,
+                    const char *holder, size_t holder_len, Report *report) {
+    BEGIN(report);
     int64_t pid = 0;
     int has_pid;
     char *run;
     char pid_text[32] = "?";
     lock_holder(holder, holder_len, &pid, &has_pid, &run);
     if (has_pid) snprintf(pid_text, sizeof pid_text, "%lld", (long long)pid);
-    fail(msg, msglen,
+    fail(report, REPORT_REFUSED,
          "%s: another process on this server writes this stream: pid %s, "
          "run %s holds %s. One writer per stream: stop that process first.",
          who ? who : "?", pid_text, run ? run : "?",
          lock_path ? lock_path : "?");
     free(run);
+    return report->status;
 }
 
 int sp_ownership(const char *who, const char *name, const char *store,
                  const SpTicket *ticket, const char *host,
-                 double now, double if_absent, char *msg, size_t msglen) {
-    if (msg && msglen) msg[0] = 0;
-    if (!ticket) return SP_OWN;
+                 double if_absent, int *decision, Report *report) {
+    BEGIN(report);
+    double now = sp__wall();
+    if (decision) *decision = SP_OWN;
+    if (!ticket) return REPORT_OK;
     const char *theirs = sp_ticket_text(ticket, SP_T_HOST);
-    if (theirs && host && strcmp(theirs, host) == 0) return SP_OWN;
+    if (theirs && host && strcmp(theirs, host) == 0) return REPORT_OK;
 
     char port[32] = "?";
     int64_t p;
@@ -829,31 +906,35 @@ int sp_ownership(const char *who, const char *name, const char *store,
     double age = now - ts;
     double stale = sp_ticket_stale_after(ticket, if_absent);
 
-    if (!sp_ticket_is_stale(ticket, now, if_absent)) {
-        fail(msg, msglen,
+    if (!ticket_is_stale(ticket, now, if_absent)) {
+        if (decision) *decision = SP_REFUSED;
+        fail(report, REPORT_REFUSED,
              "%s: the server at %s:%s writes this stream: its ticket in %s "
              "is %.0fs old (run %s; a ticket is stale after %.0fs). One "
              "writer per stream: stop it there, or wait until its ticket "
              "is stale.",
              who ? who : "?", theirs ? theirs : "?", port,
              store ? store : "?", age, run ? run : "?", stale);
-        return SP_REFUSED;
+        return report->status;
     }
-    fail(msg, msglen,
+    if (decision) *decision = SP_TAKE_OVER;
+    report_line(report, &g_clock, REPORT_WARNING,
          "[%s] taking over from %s:%s: its ticket in %s is %.0fs old "
          "(run %s); stale after %.0fs",
          name ? name : "?", theirs ? theirs : "?", port,
          store ? store : "?", age, run ? run : "?", stale);
-    return SP_TAKE_OVER;
+    return REPORT_OK;
 }
 
-void sp_ownership_unread(const char *name, const char *store,
-                         const char *why, char *msg, size_t msglen) {
-    fail(msg, msglen,
+int sp_ownership_unread(const char *name, const char *store,
+                        const char *why, Report *report) {
+    BEGIN(report);
+    report_line(report, &g_clock, REPORT_WARNING,
          "[%s] ownership: the ticket in %s could not be read (%s); "
          "starting on this server's lock alone -- another server writing "
          "this stream would not be seen",
          name ? name : "?", store ? store : "?", why ? why : "?");
+    return REPORT_OK;
 }
 
 /* ---- the write plan ----------------------------------------------------- */
@@ -869,10 +950,12 @@ struct SpWrites {
     double planned_at;    /* when the last write was planned */
 };
 
-SpWrites *sp_writes_new(void) {
+int sp_writes_new(SpWrites **out, Report *report) {
+    BEGIN(report);
+    if (!out) { fail(report, REPORT_INVALID, "write plan: nowhere to put it"); return report->status; }
     SpWrites *w = calloc(1, sizeof(SpWrites));
     if (w) w->row_group_rows = 1;
-    return w;
+    MADE(report, out, w, "write plan");
 }
 
 void sp_writes_free(SpWrites *w) { free(w); }
@@ -880,22 +963,23 @@ void sp_writes_free(SpWrites *w) { free(w); }
 int sp_writes_set_options(SpWrites *w, int64_t row_group_rows,
                           const double *row_group_seconds,
                           const double *checkpoint_seconds,
-                          char *err, size_t errlen) {
-    if (!w) { fail(err, errlen, "write plan: no plan"); return -1; }
+                          Report *report) {
+    BEGIN(report);
+    if (!w) { fail(report, REPORT_INVALID, "write plan: no plan"); return report->status; }
     if (row_group_rows < 1) {
-        fail(err, errlen, "write plan: row_group_rows is %lld; it must be "
+        fail(report, REPORT_INVALID, "write plan: row_group_rows is %lld; it must be "
              "1 or more", (long long)row_group_rows);
-        return -1;
+        return report->status;
     }
     if (row_group_seconds && !(isfinite(*row_group_seconds)
                                && *row_group_seconds >= 0)) {
-        fail(err, errlen, "write plan: row_group_seconds must be 0 or more");
-        return -1;
+        fail(report, REPORT_INVALID, "write plan: row_group_seconds must be 0 or more");
+        return report->status;
     }
     if (checkpoint_seconds && !(isfinite(*checkpoint_seconds)
                                 && *checkpoint_seconds >= 0)) {
-        fail(err, errlen, "write plan: checkpoint_seconds must be 0 or more");
-        return -1;
+        fail(report, REPORT_INVALID, "write plan: checkpoint_seconds must be 0 or more");
+        return report->status;
     }
     w->row_group_rows = row_group_rows;
     w->has_group_seconds = row_group_seconds != NULL;
@@ -917,7 +1001,7 @@ void sp_writes_stop(SpWrites *w) {
     if (w) w->on = 0;
 }
 
-int sp_writes_due(const SpWrites *w, int64_t committed, double now) {
+static int writes_due(const SpWrites *w, int64_t committed, double now) {
     if (!w || !w->on || committed <= w->cursor) return SP_W_NOTHING;
     /* the subtraction cannot overflow: both are row counts, 0 or more */
     if (committed - w->cursor >= w->row_group_rows) return SP_W_ROW_GROUP;
@@ -936,11 +1020,15 @@ int sp_writes_due(const SpWrites *w, int64_t committed, double now) {
     return SP_W_NOTHING;
 }
 
-int sp_writes_commit(SpWrites *w, int64_t committed, double now,
-                     int *begins) {
+int sp_writes_due(const SpWrites *w, int64_t committed) {
+    return writes_due(w, committed, sp__mono());
+}
+
+int sp_writes_commit(SpWrites *w, int64_t committed, int *begins) {
     if (begins) *begins = 0;
     if (!w) return SP_W_NOTHING;
-    int due = sp_writes_due(w, committed, now);
+    double now = sp__mono();
+    int due = writes_due(w, committed, now);
     if (w->on && committed > w->cursor && !w->has_open) {
         w->has_open = 1;
         w->open_at = now;
@@ -950,11 +1038,12 @@ int sp_writes_commit(SpWrites *w, int64_t committed, double now,
 }
 
 void sp_writes_plan(SpWrites *w, int force_row_group, int64_t lo,
-                    int64_t hi, double now, SpWrite *out) {
+                    int64_t hi, SpWrite *out) {
     SpWrite none = {SP_W_NOTHING, 0, 0, 0};
     if (out) *out = none;
     if (!w || !out || !w->on || hi <= w->cursor) return;
-    int kind = force_row_group ? SP_W_ROW_GROUP : sp_writes_due(w, hi, now);
+    double now = sp__mono();
+    int kind = force_row_group ? SP_W_ROW_GROUP : writes_due(w, hi, now);
     if (kind == SP_W_NOTHING) return;
     if (lo > w->cursor) {
         if (kind == SP_W_CHECKPOINT) return;   /* the next row group counts them */
@@ -1010,17 +1099,36 @@ struct SpStore {
     char *catalog;            /* the catalog version the ticket names */
 };
 
-SpStore *sp_store_new(double keep_seconds) {
-    if (!(isfinite(keep_seconds) && keep_seconds >= 0)) return NULL;
-    SpStore *s = calloc(1, sizeof(SpStore));
-    if (!s) return NULL;
-    s->keep_seconds = keep_seconds;
-    s->stored_row = -1;
-    return s;
+/* A store call that has no more to say than this. */
+static int store_fail(Report *report) {
+    fail(report, REPORT_INVALID, "store: no store or no name was given, or "
+         "memory is out");
+    return report->status;
 }
 
-int sp_store_set_keep_seconds(SpStore *s, double keep_seconds) {
-    if (!s || !(isfinite(keep_seconds) && keep_seconds >= 0)) return -1;
+int sp_store_new(double keep_seconds, SpStore **out, Report *report) {
+    BEGIN(report);
+    if (!out || !(isfinite(keep_seconds) && keep_seconds >= 0)) {
+        fail(report, REPORT_INVALID, "store: keep_seconds must be 0 or more "
+             "and finite");
+        return report->status;
+    }
+    SpStore *s = calloc(1, sizeof(SpStore));
+    if (s) {
+        s->keep_seconds = keep_seconds;
+        s->stored_row = -1;
+    }
+    MADE(report, out, s, "store");
+}
+
+int sp_store_set_keep_seconds(SpStore *s, double keep_seconds,
+                              Report *report) {
+    BEGIN(report);
+    if (!s || !(isfinite(keep_seconds) && keep_seconds >= 0)) {
+        fail(report, REPORT_INVALID, "store: keep_seconds must be 0 or more "
+             "and finite");
+        return report->status;
+    }
     s->keep_seconds = keep_seconds;
     return 0;
 }
@@ -1044,10 +1152,11 @@ void sp_store_free(SpStore *s) {
     free(s);
 }
 
-int sp_store_catalog(SpStore *s, const char *version) {
-    if (!s) return -1;
+int sp_store_catalog(SpStore *s, const char *version, Report *report) {
+    BEGIN(report);
+    if (!s) return store_fail(report);
     char *mine = version ? copy_text(version, strlen(version)) : NULL;
-    if (version && !mine) return -1;
+    if (version && !mine) return store_fail(report);
     free(s->catalog);
     s->catalog = mine;
     return 0;
@@ -1092,26 +1201,30 @@ static void store_settle(SpStore *s, StoreFile *f) {
     if (!f->in_store && !f->awaiting && !f->superseded) store_remove(s, f);
 }
 
-int sp_store_begins(SpStore *s, const char *file, int64_t first_row) {
+int sp_store_begins(SpStore *s, const char *file, int64_t first_row,
+                    Report *report) {
+    BEGIN(report);
     StoreFile *f = store_get(s, file);
-    if (!f) return -1;
+    if (!f) return store_fail(report);
     f->has_first = 1;
     f->first_row = first_row;
     return 0;
 }
 
 int sp_store_covers(SpStore *s, const char *file, int64_t version,
-                    const char *checkpoint, int64_t final_rows, int64_t rows) {
-    if (!checkpoint) return -1;
+                    const char *checkpoint, int64_t final_rows, int64_t rows,
+                    Report *report) {
+    BEGIN(report);
+    if (!checkpoint) return store_fail(report);
     StoreFile *f = store_get(s, file);
-    if (!f) return -1;
+    if (!f) return store_fail(report);
     StoreVersion *v = NULL;
     for (int32_t i = 0; i < f->n_versions; i++)
         if (f->versions[i].version == version) v = &f->versions[i];
     if (!v) {
         StoreVersion *grown = realloc(f->versions,
                                       (size_t)(f->n_versions + 1) * sizeof *grown);
-        if (!grown) return -1;
+        if (!grown) return store_fail(report);
         f->versions = grown;
         v = &f->versions[f->n_versions];
         v->checkpoint = NULL;
@@ -1121,7 +1234,7 @@ int sp_store_covers(SpStore *s, const char *file, int64_t version,
     char *copy = copy_text(checkpoint, strlen(checkpoint));
     if (!copy) {
         if (!v->checkpoint) f->n_versions--;      /* the new one: take it back */
-        return -1;
+        return store_fail(report);
     }
     free(v->checkpoint);
     v->checkpoint = copy;
@@ -1131,12 +1244,13 @@ int sp_store_covers(SpStore *s, const char *file, int64_t version,
 }
 
 int sp_store_stored(SpStore *s, const char *file, int64_t version,
-                    const char *checkpoint, int64_t rows, double wall) {
-    if (!checkpoint) return -1;
+                    const char *checkpoint, int64_t rows, Report *report) {
+    BEGIN(report);
+    if (!checkpoint) return store_fail(report);
     StoreFile *f = store_get(s, file);
-    if (!f) return -1;
+    if (!f) return store_fail(report);
     char *copy = copy_text(checkpoint, strlen(checkpoint));
-    if (!copy) return -1;
+    if (!copy) return store_fail(report);
     free(f->in_store);
     f->in_store = copy;
     /* the versions before it are named by no later ticket */
@@ -1149,14 +1263,15 @@ int sp_store_stored(SpStore *s, const char *file, int64_t version,
     if (f->has_first && rows > 0 && f->first_row <= INT64_MAX - rows
             && f->first_row + rows - 1 > s->stored_row) {
         s->stored_row = f->first_row + rows - 1;
-        s->stored_at = wall;
+        s->stored_at = sp__wall();
         s->has_stored_at = 1;
     }
     return 0;
 }
 
-int sp_store_finished(SpStore *s, const char *file) {
-    if (!s || !file) return -1;
+int sp_store_finished(SpStore *s, const char *file, Report *report) {
+    BEGIN(report);
+    if (!s || !file) return store_fail(report);
     StoreFile *f = store_find(s, file);
     if (!f) return 0;
     free(f->in_store);
@@ -1165,9 +1280,10 @@ int sp_store_finished(SpStore *s, const char *file) {
     return 0;
 }
 
-int sp_store_awaits(SpStore *s, const char *file) {
+int sp_store_awaits(SpStore *s, const char *file, Report *report) {
+    BEGIN(report);
     StoreFile *f = store_get(s, file);
-    if (!f) return -1;
+    if (!f) return store_fail(report);
     f->awaiting = 1;
     return 0;
 }
@@ -1181,9 +1297,10 @@ int sp_store_listed(SpStore *s, const char *file) {
     return 1;
 }
 
-int sp_store_dropped(SpStore *s, double now) {
+int sp_store_dropped(SpStore *s) {
     int n = 0;
     if (!s) return 0;
+    double now = sp__mono();
     for (int32_t i = 0; i < s->n_files; i++) {
         StoreFile *f = &s->files[i];
         if (!f->awaiting || !f->listed) continue;
@@ -1195,8 +1312,9 @@ int sp_store_dropped(SpStore *s, double now) {
     return n;
 }
 
-const char *sp_store_due(const SpStore *s, double now, int32_t index) {
+const char *sp_store_due(const SpStore *s, int32_t index) {
     if (!s || index < 0) return NULL;
+    double now = sp__mono();
     for (int32_t i = 0; i < s->n_files; i++) {
         const StoreFile *f = &s->files[i];
         if (f->superseded && now - f->superseded_at >= s->keep_seconds
@@ -1206,8 +1324,9 @@ const char *sp_store_due(const SpStore *s, double now, int32_t index) {
     return NULL;
 }
 
-int sp_store_discarded(SpStore *s, const char *file) {
-    if (!s || !file) return -1;
+int sp_store_discarded(SpStore *s, const char *file, Report *report) {
+    BEGIN(report);
+    if (!s || !file) return store_fail(report);
     StoreFile *f = store_find(s, file);
     if (!f) return 0;
     f->superseded = 0;
@@ -1232,22 +1351,23 @@ static int by_name(const void *a, const void *b) {
 }
 
 int sp_store_fill(const SpStore *s, SpTicket *t, const char *where,
-                  char *err, size_t errlen) {
-    if (!s || !t) { fail(err, errlen, "store: nothing to fill"); return -1; }
+                  Report *report) {
+    BEGIN(report);
+    if (!s || !t) { fail(report, REPORT_INVALID, "store: nothing to fill"); return report->status; }
     if (!where) where = "";
-    if (sp_ticket_set_integer(t, SP_T_STORED_ROW, s->stored_row, err, errlen)
+    if (sp_ticket_set_integer(t, SP_T_STORED_ROW, s->stored_row, report)
             || sp_ticket_set_number(t, SP_T_KEEP_SECONDS, s->keep_seconds,
-                                    err, errlen))
-        return -1;
+                                    report))
+        return report->status;
     if (s->has_stored_at) {
-        if (sp_ticket_set_number(t, SP_T_STORED_AT, s->stored_at, err, errlen))
-            return -1;
+        if (sp_ticket_set_number(t, SP_T_STORED_AT, s->stored_at, report))
+            return report->status;
     } else {
         sp_ticket_clear(t, SP_T_STORED_AT);
     }
     if (s->catalog) {
-        if (sp_ticket_set_text(t, SP_T_CATALOG_ETAG, s->catalog, err, errlen))
-            return -1;
+        if (sp_ticket_set_text(t, SP_T_CATALOG_ETAG, s->catalog, report))
+            return report->status;
     } else {
         sp_ticket_clear(t, SP_T_CATALOG_ETAG);
     }
@@ -1255,7 +1375,7 @@ int sp_store_fill(const SpStore *s, SpTicket *t, const char *where,
     t->n_files = 0;
     if (s->n_files == 0) return 0;
     const StoreFile **order = malloc((size_t)s->n_files * sizeof *order);
-    if (!order) { fail(err, errlen, "store: out of memory"); return -1; }
+    if (!order) { fail(report, REPORT_NO_MEMORY, "store: out of memory"); return report->status; }
     int32_t n = 0;
     for (int32_t i = 0; i < s->n_files; i++)
         if (s->files[i].in_store) order[n++] = &s->files[i];
@@ -1272,13 +1392,13 @@ int sp_store_fill(const SpStore *s, SpTicket *t, const char *where,
         text_str(&path, f->in_store);
         if (path.oom || !path.p) {
             free(path.p);
-            fail(err, errlen, "store: out of memory");
+            fail(report, REPORT_NO_MEMORY, "store: out of memory");
             rc = -1;
             break;
         }
         rc = sp_ticket_add_file(t, path.p, f->has_first ? &f->first_row : NULL,
                                 v ? &v->final_rows : NULL, v ? &v->rows : NULL,
-                                err, errlen);
+                                report);
         free(path.p);
     }
     free(order);
@@ -1288,7 +1408,6 @@ int sp_store_fill(const SpStore *s, SpTicket *t, const char *where,
 /* ---- the reader --------------------------------------------------------- */
 
 #define READER_TEXT 640
-#define READER_MESSAGES 4
 #define BACKOFF_FIRST 0.5
 #define BACKOFF_MOST 10.0
 
@@ -1307,8 +1426,7 @@ struct SpReader {
     double waiting_since;
     int unreadable;           /* the store's error is logged */
     char reason[READER_TEXT];
-    int n_messages;
-    struct { int level; char text[READER_TEXT]; } messages[READER_MESSAGES];
+    Report *report;           /* of the call in hand: where its lines go */
 };
 
 static const char *const READER_STATE[] = {
@@ -1322,17 +1440,10 @@ const char *sp_reader_state_name(int state) {
 }
 
 static void reader_say(SpReader *r, int level, const char *fmt, ...) {
-    if (r->n_messages == READER_MESSAGES) {       /* keep the newest */
-        memmove(&r->messages[0], &r->messages[1],
-                (READER_MESSAGES - 1) * sizeof r->messages[0]);
-        r->n_messages--;
-    }
-    r->messages[r->n_messages].level = level;
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(r->messages[r->n_messages].text, READER_TEXT, fmt, ap);
+    report_vline(r->report, &g_clock, level, fmt, ap);
     va_end(ap);
-    r->n_messages++;
 }
 
 static void reader_reason(SpReader *r, const char *fmt, ...) {
@@ -1346,8 +1457,8 @@ static const char *reader_store(const SpReader *r) {
     return r->store ? r->store : "(a direct ticket)";
 }
 
-SpReader *sp_reader_new(const char *who, const char *name, const char *store,
-                        int direct) {
+static SpReader *reader_new(const char *who, const char *name,
+                            const char *store, int direct) {
     if (!name) return NULL;
     SpReader *r = calloc(1, sizeof(SpReader));
     if (!r) return NULL;
@@ -1369,6 +1480,16 @@ SpReader *sp_reader_new(const char *who, const char *name, const char *store,
     return r;
 }
 
+int sp_reader_new(const char *who, const char *name, const char *store,
+                  int direct, SpReader **out, Report *report) {
+    BEGIN(report);
+    if (!out || !name) {
+        fail(report, REPORT_INVALID, "reader: no name of a stream");
+        return report->status;
+    }
+    MADE(report, out, reader_new(who, name, store, direct), "reader");
+}
+
 void sp_reader_free(SpReader *r) {
     if (!r) return;
     free(r->who);
@@ -1385,17 +1506,6 @@ const char *sp_reader_reason(const SpReader *r) {
     return (r && r->state != SP_R_STREAMING) ? r->reason : "";
 }
 const char *sp_reader_run(const SpReader *r) { return r ? r->run : NULL; }
-
-int sp_reader_message(SpReader *r, char *msg, size_t msglen) {
-    if (msg && msglen) msg[0] = 0;
-    if (!r || r->n_messages == 0) return 0;
-    int level = r->messages[0].level;
-    fail(msg, msglen, "%s", r->messages[0].text);
-    r->n_messages--;
-    memmove(&r->messages[0], &r->messages[1],
-            (size_t)r->n_messages * sizeof r->messages[0]);
-    return level;
-}
 
 static void step_set(SpReader *r, SpStep *step, int action, int state,
                      double wait) {
@@ -1416,12 +1526,12 @@ static void reader_wait(SpReader *r, SpStep *step, int state, double mono,
         r->warned = 0;
         r->waiting_since = mono;
         if (!quiet)
-            reader_say(r, SP_LOG_INFO, "[%s] %s: waiting for a writer",
+            reader_say(r, REPORT_INFO, "[%s] %s: waiting for a writer",
                        r->name, r->reason);
     } else if (!r->warned
                && mono - r->waiting_since >= SP_READER_WARN_SECONDS) {
         r->warned = 1;
-        reader_say(r, SP_LOG_WARNING,
+        reader_say(r, REPORT_WARNING,
                    "[%s] %s has waited %.0f s for a writer: %s. A reader "
                    "waits for any name whose folder exists; if no writer "
                    "is to come, check the name.",
@@ -1435,11 +1545,9 @@ static void reader_drop_ring(SpReader *r, SpStep *step) {
     r->has_ring = 0;
 }
 
-void sp_reader_poll(SpReader *r, int found, const SpTicket *ticket,
-                    const char *why, double now, double mono,
-                    double if_absent, SpStep *step) {
-    if (step) memset(step, 0, sizeof *step);
-    if (!r) return;
+static void reader_poll(SpReader *r, int found, const SpTicket *ticket,
+                        const char *why, double now, double mono,
+                        double if_absent, SpStep *step) {
     if (r->state == SP_R_CLOSED) {
         step_set(r, step, SP_DO_WAIT, SP_R_CLOSED, 0);
         return;
@@ -1451,7 +1559,7 @@ void sp_reader_poll(SpReader *r, int found, const SpTicket *ticket,
                       why ? why : "?");
         if (!r->unreadable) {
             r->unreadable = 1;
-            reader_say(r, SP_LOG_ERROR, "[%s] STORE UNREADABLE: %s: %s",
+            reader_say(r, REPORT_ERROR, "[%s] STORE UNREADABLE: %s: %s",
                        r->name, reader_store(r), why ? why : "?");
         }
         r->asked_folder = 0;
@@ -1462,7 +1570,7 @@ void sp_reader_poll(SpReader *r, int found, const SpTicket *ticket,
     }
     if (r->unreadable) {
         r->unreadable = 0;
-        reader_say(r, SP_LOG_INFO, "[%s] store readable again: %s",
+        reader_say(r, REPORT_INFO, "[%s] store readable again: %s",
                    r->name, reader_store(r));
     }
 
@@ -1500,7 +1608,7 @@ void sp_reader_poll(SpReader *r, int found, const SpTicket *ticket,
         snprintf(port, sizeof port, "%lld", (long long)p);
     double ts;
     if (!r->direct && sp_ticket_number(ticket, SP_T_TS, &ts)
-            && sp_ticket_is_stale(ticket, now, if_absent)) {
+            && ticket_is_stale(ticket, now, if_absent)) {
         reader_reason(r, "ticket stale: the writer at %s:%s last wrote it "
                       "%.0f s ago (stale after %.0f s)",
                       host ? host : "?", port, now - ts,
@@ -1511,7 +1619,7 @@ void sp_reader_poll(SpReader *r, int found, const SpTicket *ticket,
 
     const char *run = sp_ticket_text(ticket, SP_T_RUN);
     if (r->has_ring && r->run && (!run || strcmp(run, r->run) != 0)) {
-        reader_say(r, SP_LOG_ERROR,
+        reader_say(r, REPORT_ERROR,
                    "[%s] WRITER RESTARTED: the ticket at %s:%s names run %s, "
                    "this reader streamed run %s; starting again on a fresh "
                    "ring. Rows of the earlier run are dropped here (the "
@@ -1528,9 +1636,29 @@ void sp_reader_poll(SpReader *r, int found, const SpTicket *ticket,
     step_set(r, step, SP_DO_CONNECT, SP_R_CONNECTING, 0);
 }
 
-void sp_reader_folder_is(SpReader *r, int exists, double mono, SpStep *step) {
-    if (step) memset(step, 0, sizeof *step);
-    if (!r) return;
+/* The start of a reader's step: the report takes the step's lines. */
+#define READER_STEP(r, step, report) do { \
+        BEGIN(report); \
+        if (step) memset((step), 0, sizeof *(step)); \
+        if (!(r) || !(step)) { \
+            fail((report), REPORT_INVALID, "reader: no reader or no step"); \
+            return (report)->status; \
+        } \
+        (r)->report = (report); \
+    } while (0)
+
+int sp_reader_poll(SpReader *r, int found, const SpTicket *ticket,
+                   const char *why, double if_absent, SpStep *step,
+                   Report *report) {
+    READER_STEP(r, step, report);
+    reader_poll(r, found, ticket, why, sp__wall(), sp__mono(), if_absent,
+                step);
+    r->report = NULL;
+    return REPORT_OK;
+}
+
+static void reader_folder_is(SpReader *r, int exists, double mono,
+                             SpStep *step) {
     if (r->state == SP_R_CLOSED) {
         step_set(r, step, SP_DO_WAIT, SP_R_CLOSED, 0);
         return;
@@ -1550,6 +1678,14 @@ void sp_reader_folder_is(SpReader *r, int exists, double mono, SpStep *step) {
     reader_wait(r, step, SP_R_NO_TICKET, mono, 0);
 }
 
+int sp_reader_folder_is(SpReader *r, int exists, SpStep *step,
+                        Report *report) {
+    READER_STEP(r, step, report);
+    reader_folder_is(r, exists, sp__mono(), step);
+    r->report = NULL;
+    return REPORT_OK;
+}
+
 void sp_reader_connected(SpReader *r) {
     if (!r || r->state == SP_R_CLOSED) return;
     r->state = SP_R_STREAMING;
@@ -1559,10 +1695,7 @@ void sp_reader_connected(SpReader *r) {
     r->reason[0] = 0;
 }
 
-void sp_reader_lost(SpReader *r, const char *why, double mono, SpStep *step) {
-    (void)mono;
-    if (step) memset(step, 0, sizeof *step);
-    if (!r) return;
+static void reader_lost(SpReader *r, const char *why, SpStep *step) {
     if (r->state == SP_R_CLOSED) {
         step_set(r, step, SP_DO_WAIT, SP_R_CLOSED, 0);
         return;
@@ -1576,7 +1709,7 @@ void sp_reader_lost(SpReader *r, const char *why, double mono, SpStep *step) {
     }
     if (why) {
         reader_reason(r, "the connection for %s failed: %s", r->name, why);
-        reader_say(r, SP_LOG_ERROR, "[%s] READER CONNECTION: %s", r->name,
+        reader_say(r, REPORT_ERROR, "[%s] READER CONNECTION: %s", r->name,
                    why);
     } else {
         reader_reason(r, "the connection for %s ended", r->name);
@@ -1586,6 +1719,14 @@ void sp_reader_lost(SpReader *r, const char *why, double mono, SpStep *step) {
     step_set(r, step, SP_DO_WAIT, SP_R_RECONNECTING, wait);
 }
 
+int sp_reader_lost(SpReader *r, const char *why, SpStep *step,
+                   Report *report) {
+    READER_STEP(r, step, report);
+    reader_lost(r, why, step);
+    r->report = NULL;
+    return REPORT_OK;
+}
+
 void sp_reader_close(SpReader *r) {
     if (r) r->state = SP_R_CLOSED;
 }
@@ -1593,7 +1734,6 @@ void sp_reader_close(SpReader *r) {
 /* ---- the view ----------------------------------------------------------- */
 
 #define VIEW_TEXT 1024
-#define VIEW_MESSAGES 4
 
 /* One unfinished file the text reads: the checkpoint version named,
  * and the file's last row to read (unknown: the whole file). */
@@ -1636,8 +1776,7 @@ struct SpView {
     double ts, beat;
     int failed;
     char note[VIEW_TEXT];
-    int n_messages;
-    struct { int level; char text[VIEW_TEXT]; } messages[VIEW_MESSAGES];
+    Report *report;           /* of the call in hand: where its lines go */
 };
 
 static void facts_clear(ViewFacts *f) {
@@ -1669,32 +1808,14 @@ static int facts_same(const ViewFacts *a, const ViewFacts *b) {
 }
 
 static void view_say(SpView *v, int level, const char *fmt, ...) {
-    if (v->n_messages == VIEW_MESSAGES) {         /* keep the newest */
-        memmove(&v->messages[0], &v->messages[1],
-                (VIEW_MESSAGES - 1) * sizeof v->messages[0]);
-        v->n_messages--;
-    }
-    v->messages[v->n_messages].level = level;
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(v->messages[v->n_messages].text, VIEW_TEXT, fmt, ap);
+    report_vline(v->report, &g_clock, level, fmt, ap);
     va_end(ap);
-    v->n_messages++;
 }
 
-int sp_view_message(SpView *v, char *msg, size_t msglen) {
-    if (msg && msglen) msg[0] = 0;
-    if (!v || v->n_messages == 0) return 0;
-    int level = v->messages[0].level;
-    fail(msg, msglen, "%s", v->messages[0].text);
-    v->n_messages--;
-    memmove(&v->messages[0], &v->messages[1],
-            (size_t)v->n_messages * sizeof v->messages[0]);
-    return level;
-}
-
-SpView *sp_view_new(const char *view, const char *stream, const char *memory,
-                    const char *empty) {
+static SpView *view_new(const char *view, const char *stream,
+                        const char *memory, const char *empty) {
     if (!view || !stream) return NULL;
     SpView *v = calloc(1, sizeof(SpView));
     if (!v) return NULL;
@@ -1709,6 +1830,17 @@ SpView *sp_view_new(const char *view, const char *stream, const char *memory,
     }
     v->plan.seam = v->built.seam = -1;
     return v;
+}
+
+int sp_view_new(const char *view, const char *stream, const char *memory,
+                const char *empty, SpView **out, Report *report) {
+    BEGIN(report);
+    if (!out || !view || !stream) {
+        fail(report, REPORT_INVALID, "view: no name of the view or of the "
+             "stream");
+        return report->status;
+    }
+    MADE(report, out, view_new(view, stream, memory, empty), "view");
 }
 
 static void named_clear(ViewNamed *named, int32_t n) {
@@ -1810,21 +1942,20 @@ static void view_note_ring(SpView *v, int why, int64_t stored,
     }
     if ((note[0] == 0) != (v->note[0] == 0)) {
         if (note[0])
-            view_say(v, SP_LOG_WARNING, "[%s] view %s: %s", v->stream,
+            view_say(v, REPORT_WARNING, "[%s] view %s: %s", v->stream,
                      v->name, note);
         else
-            view_say(v, SP_LOG_INFO, "[%s] view %s: the ring is in use again",
+            view_say(v, REPORT_INFO, "[%s] view %s: the ring is in use again",
                      v->stream, v->name);
     }
     memcpy(v->note, note, sizeof note);
 }
 
-int sp_view_plan(SpView *v, const SpTicket *t, const char *const *files,
-                 const char *ring_run, const int64_t *window, double now,
-                 double mono, double if_absent, double keep_if_absent,
-                 SpViewPlan *out) {
+static int view_plan(SpView *v, const SpTicket *t, const char *const *files,
+                     const char *ring_run, const int64_t *window, double now,
+                     double mono, double if_absent, double keep_if_absent,
+                     SpViewPlan *out) {
     if (out) memset(out, 0, sizeof *out);
-    if (!v) return -1;
     int64_t revision, stored = -1;
     double keep = 0;
     /* A live writer's ticket names the catalog version to read. No
@@ -1832,7 +1963,7 @@ int sp_view_plan(SpView *v, const SpTicket *t, const char *const *files,
      * one without a revision (an older writer) vouches for none: the
      * view reads the store's current catalog. */
     int live = t && sp_ticket_integer(t, SP_T_REVISION, &revision)
-        && !sp_ticket_is_stale(t, now, if_absent);
+        && !ticket_is_stale(t, now, if_absent);
     const char *etag = live ? sp_ticket_text(t, SP_T_CATALOG_ETAG) : NULL;
     const char *run = t ? sp_ticket_text(t, SP_T_RUN) : NULL;
     if (t) sp_ticket_integer(t, SP_T_STORED_ROW, &stored);
@@ -1938,6 +2069,21 @@ int sp_view_plan(SpView *v, const SpTicket *t, const char *const *files,
     return 0;
 }
 
+int sp_view_plan(SpView *v, const SpTicket *t, const char *const *files,
+                 const char *ring_run, const int64_t *window,
+                 double if_absent, double keep_if_absent, SpViewPlan *out,
+                 Report *report) {
+    BEGIN(report);
+    if (!v) { fail(report, REPORT_INVALID, "view: no view"); return report->status; }
+    v->report = report;
+    int rc = view_plan(v, t, files, ring_run, window, sp__wall(), sp__mono(),
+                       if_absent, keep_if_absent, out);
+    v->report = NULL;
+    if (rc != 0)
+        fail(report, REPORT_NO_MEMORY, "%s: memory is out", v->name);
+    return report->status;
+}
+
 void sp_view_set_row_ids(SpView *v, int on) {
     if (v) v->row_ids = on != 0;
 }
@@ -1963,9 +2109,8 @@ static void text_footer_key(Text *b, const char *path, const char *key) {
     text_str(b, "' LIMIT 1)");
 }
 
-char *sp_view_sql(const SpView *v, const char *catalog, char *err,
-                  size_t errlen) {
-    if (!v) { fail(err, errlen, "no view"); return NULL; }
+static char *view_sql(const SpView *v, const char *catalog, Report *report) {
+    if (!v) { fail(report, REPORT_INVALID, "view: no view"); return NULL; }
     const ViewFacts *f = &v->plan;
     Text b = {0};
     int pieces = 0;
@@ -2065,7 +2210,7 @@ char *sp_view_sql(const SpView *v, const char *catalog, char *err,
     if (!pieces) {
         if (!v->empty) {
             free(b.p);
-            fail(err, errlen, "%s: '%s' has no catalog, no unfinished file "
+            fail(report, REPORT_REFUSED, "%s: '%s' has no catalog, no unfinished file "
                  "and no memory yet; nothing to read the columns from",
                  v->name, v->stream);
             return NULL;
@@ -2081,13 +2226,20 @@ char *sp_view_sql(const SpView *v, const char *catalog, char *err,
 #undef PIECE
     if (b.oom) {
         free(b.p);
-        fail(err, errlen, "%s: memory is out", v->name);
+        fail(report, REPORT_NO_MEMORY, "%s: memory is out", v->name);
         return NULL;
     }
     return b.p;
 }
 
-char *sp_view_live_sql(const char *view, const char *memory) {
+int sp_view_sql(const SpView *v, const char *catalog, char **out,
+                Report *report) {
+    BEGIN(report);
+    if (!out) { fail(report, REPORT_INVALID, "view: nowhere to put the text"); return report->status; }
+    MADE(report, out, view_sql(v, catalog, report), "view");
+}
+
+static char *view_live_sql(const char *view, const char *memory) {
     if (!view || !memory) return NULL;
     Text b = {0};
     text_str(&b, "CREATE OR REPLACE VIEW \"");
@@ -2098,6 +2250,17 @@ char *sp_view_live_sql(const char *view, const char *memory) {
     text_str(&b, "\"");
     if (b.oom) { free(b.p); return NULL; }
     return b.p;
+}
+
+int sp_view_live_sql(const char *view, const char *memory, char **out,
+                     Report *report) {
+    BEGIN(report);
+    if (!out || !view || !memory) {
+        fail(report, REPORT_INVALID, "view: no name of the view or of the "
+             "ring's relation");
+        return report->status;
+    }
+    MADE(report, out, view_live_sql(view, memory), "view");
 }
 
 void sp_view_built(SpView *v) {
@@ -2138,10 +2301,11 @@ int64_t sp_view_seam_row(const SpView *v) {
 
 const char *sp_view_ring_note(const SpView *v) { return v ? v->note : ""; }
 
-double sp_view_wait_seconds(const SpView *v, double now) {
+double sp_view_wait_seconds(const SpView *v) {
     /* no live writer: nothing says when the store changes next */
     if (!v || !v->has_ticket || !v->plan.live)
         return SP_VIEW_POLL_DEFAULT_SECONDS;
+    double now = sp__wall();
     double due = (v->has_ts ? v->ts : 0) + v->beat
         + SP_VIEW_POLL_MARGIN_SECONDS - now;
     if (due < SP_VIEW_POLL_MIN_SECONDS) due = SP_VIEW_POLL_MIN_SECONDS;
@@ -2149,18 +2313,27 @@ double sp_view_wait_seconds(const SpView *v, double now) {
     return due < most ? due : most;
 }
 
-double sp_view_failed(SpView *v, const char *why) {
+int sp_view_failed(SpView *v, const char *why, double *wait_seconds,
+                   Report *report) {
+    BEGIN(report);
+    if (wait_seconds) *wait_seconds = SP_VIEW_POLL_MIN_SECONDS;
     if (v && !v->failed) {
         v->failed = 1;
-        view_say(v, SP_LOG_ERROR, "[%s] view %s could not follow the "
+        v->report = report;
+        view_say(v, REPORT_ERROR, "[%s] view %s could not follow the "
                  "ticket: %s", v->stream, v->name, why ? why : "?");
+        v->report = NULL;
     }
-    return SP_VIEW_POLL_MIN_SECONDS;
+    return REPORT_OK;
 }
 
-void sp_view_followed(SpView *v) {
-    if (!v || !v->failed) return;
+int sp_view_followed(SpView *v, Report *report) {
+    BEGIN(report);
+    if (!v || !v->failed) return REPORT_OK;
     v->failed = 0;
-    view_say(v, SP_LOG_INFO, "[%s] view %s current again", v->stream,
+    v->report = report;
+    view_say(v, REPORT_INFO, "[%s] view %s current again", v->stream,
              v->name);
+    v->report = NULL;
+    return REPORT_OK;
 }

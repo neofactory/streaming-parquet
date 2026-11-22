@@ -1,9 +1,12 @@
 /* sp_catalog.c -- the stream core's catalog: the list of a stream's
  * finished files, as a DuckLake 1.0 catalog in a SQLite database. See
- * sp.h, THE CATALOG. No disk, no network, no clock: the host brings the
+ * sp.h, THE CATALOG. No disk and no network: the host brings the
  * catalog's bytes and each file's footer, and stores the bytes it gets
- * back. */
+ * back. SQLite works in memory alone (temp_store is memory too), so it
+ * opens no file. */
 #include "sp.h"
+
+double sp__wall(void);          /* sp.c: the core's clock */
 
 #include <math.h>
 #include <sqlite3.h>
@@ -12,13 +15,26 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void fail(char *err, size_t errlen, const char *fmt, ...) {
-    if (!err || errlen == 0) return;
+/* The call failed: the status and the reason. A NULL report: the reason
+ * is not wanted. */
+static void fail(Report *report, int status, const char *fmt, ...) {
+    if (!report) return;
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(err, errlen, fmt, ap);
+    vsnprintf(report->error, sizeof report->error, fmt, ap);
     va_end(ap);
+    report->status = status;
 }
+
+#define BEGIN(report) do { \
+        if (!report_begin(report)) return REPORT_INVALID; \
+    } while (0)
+#define MADE(report, out, value, what) do { \
+        *(out) = (value); \
+        if (!*(out) && !(report)->status) \
+            fail((report), REPORT_NO_MEMORY, "%s: memory is out", (what)); \
+        return (report)->status; \
+    } while (0)
 
 static char *copy_bytes(const uint8_t *s, size_t n) {
     char *p = malloc(n + 1);
@@ -424,7 +440,7 @@ static void name_types(PqFooter *f);
 
 /* Read a footer (the thrift bytes alone). 0, or -1 with the reason. */
 static int footer_read(const uint8_t *bytes, size_t len, PqFooter *f,
-                       char *err, size_t errlen) {
+                       Report *report) {
     memset(f, 0, sizeof *f);
     Tr t = { bytes, bytes + len, 0, 0 };
     int id = 0, ft, owed = 0;
@@ -458,7 +474,7 @@ static int footer_read(const uint8_t *bytes, size_t len, PqFooter *f,
     }
     if (t.bad || !f->nodes || f->num_rows < 0) {
         footer_free(f);
-        fail(err, errlen, "not a parquet footer");
+        fail(report, REPORT_REFUSED, "not a parquet footer");
         return -1;
     }
     return 0;
@@ -856,19 +872,23 @@ static char *value_text(const PqNode *n, const uint8_t *p, size_t len) {
 
 /* ---- the footer's place in a file --------------------------------------- */
 
-int64_t sp_parquet_footer_length(const uint8_t *tail, size_t len,
-                                 char *err, size_t errlen) {
+int sp_parquet_footer_length(const uint8_t *tail, size_t len, int64_t *out,
+                             Report *report) {
+    BEGIN(report);
+    if (!out) { fail(report, REPORT_INVALID, "nowhere to put the length"); return report->status; }
+    *out = 0;
     if (!tail || len < 8 || memcmp(tail + len - 4, "PAR1", 4) != 0) {
-        fail(err, errlen, "not a parquet file: it does not end in PAR1");
-        return -1;
+        fail(report, REPORT_REFUSED, "not a parquet file: it does not end in PAR1");
+        return report->status;
     }
     uint64_t n = 0;
     for (int i = 0; i < 4; i++) n |= (uint64_t)tail[len - 8 + (size_t)i] << (8 * i);
     if (n == 0) {
-        fail(err, errlen, "not a parquet file: its footer is empty");
-        return -1;
+        fail(report, REPORT_REFUSED, "not a parquet file: its footer is empty");
+        return report->status;
     }
-    return (int64_t)n;
+    *out = (int64_t)n;
+    return REPORT_OK;
 }
 
 /* ---- the catalog --------------------------------------------------------- */
@@ -933,16 +953,16 @@ struct SpCatalog {
     int64_t staged;           /* files added and not yet in the bytes */
 };
 
-static int cat_exec(SpCatalog *c, char *err, size_t errlen, const char *fmt, ...) {
+static int cat_exec(SpCatalog *c, Report *report, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     char *sql = sqlite3_vmprintf(fmt, ap);
     va_end(ap);
-    if (!sql) { fail(err, errlen, "catalog: memory is out"); return -1; }
+    if (!sql) { fail(report, REPORT_NO_MEMORY, "catalog: memory is out"); return -1; }
     char *msg = NULL;
     int rc = sqlite3_exec(c->db, sql, NULL, NULL, &msg);
     if (rc != SQLITE_OK)
-        fail(err, errlen, "catalog: %s", msg ? msg : sqlite3_errmsg(c->db));
+        fail(report, REPORT_REFUSED, "catalog: %s", msg ? msg : sqlite3_errmsg(c->db));
     sqlite3_free(msg);
     sqlite3_free(sql);
     return rc == SQLITE_OK ? 0 : -1;
@@ -1004,13 +1024,13 @@ static void time_text(double wall, char *out, size_t outlen) {
              (int)(secs % 60), (long long)micros);
 }
 
-static int cat_begin(SpCatalog *c, char *err, size_t errlen) {
+static int cat_begin(SpCatalog *c, Report *report) {
     int found;
     c->snapshot = 0;
     c->created = c->altered = c->inserted = 0;
     c->staged = 0;
     int64_t last = cat_int(c, &found, "SELECT max(snapshot_id) FROM ducklake_snapshot");
-    if (!found) { fail(err, errlen, "catalog: it has no snapshot"); return -1; }
+    if (!found) { fail(report, REPORT_REFUSED, "catalog: it has no snapshot"); return -1; }
     c->schema_version = cat_int(c, NULL,
         "SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = %lld", (long long)last);
     c->next_catalog_id = cat_int(c, NULL,
@@ -1021,25 +1041,28 @@ static int cat_begin(SpCatalog *c, char *err, size_t errlen) {
     cat_int(c, &c->has_table,
             "SELECT table_id FROM ducklake_table WHERE table_id = %d "
             "AND end_snapshot IS NULL", TABLE_ID);
-    return cat_exec(c, err, errlen, "BEGIN");
+    return cat_exec(c, report, "BEGIN");
 }
 
-SpCatalog *sp_catalog_open(const uint8_t *bytes, size_t len,
-                           const char *data_path, double now,
-                           char *err, size_t errlen) {
-    if (!data_path) { fail(err, errlen, "catalog: no data path"); return NULL; }
+static SpCatalog *catalog_open(const uint8_t *bytes, size_t len,
+                               const char *data_path, double now,
+                               Report *report) {
+    if (!data_path) { fail(report, REPORT_INVALID, "catalog: no data path"); return NULL; }
     SpCatalog *c = calloc(1, sizeof *c);
-    if (!c) { fail(err, errlen, "catalog: memory is out"); return NULL; }
+    if (!c) { fail(report, REPORT_NO_MEMORY, "catalog: memory is out"); return NULL; }
     c->data_path = copy_bytes((const uint8_t *)data_path, strlen(data_path));
     if (!c->data_path || sqlite3_open(":memory:", &c->db) != SQLITE_OK) {
-        fail(err, errlen, "catalog: memory is out");
+        fail(report, REPORT_NO_MEMORY, "catalog: memory is out");
         sp_catalog_free(c);
         return NULL;
     }
+    /* temporary data in memory too: SQLite opens no file, whatever the
+     * size of a statement's work */
+    sqlite3_exec(c->db, "PRAGMA temp_store = MEMORY", NULL, NULL, NULL);
     if (bytes && len) {
         unsigned char *mine = sqlite3_malloc64(len);
         if (!mine) {
-            fail(err, errlen, "catalog: memory is out");
+            fail(report, REPORT_NO_MEMORY, "catalog: memory is out");
             sp_catalog_free(c);
             return NULL;
         }
@@ -1056,7 +1079,7 @@ SpCatalog *sp_catalog_open(const uint8_t *bytes, size_t len,
         if (rc != SQLITE_OK || !found || !ours
             || cat_int(c, NULL, "SELECT count(*) FROM ducklake_metadata "
                                 "WHERE \"key\" = 'version' AND \"value\" = '1.0'") != 1) {
-            fail(err, errlen, "catalog: these %zu bytes are not a stream's "
+            fail(report, REPORT_REFUSED, "catalog: these %zu bytes are not a stream's "
                  "catalog (a SQLite database with a DuckLake 1.0 catalog and "
                  "the stream core's tables)", len);
             sp_catalog_free(c);
@@ -1066,12 +1089,12 @@ SpCatalog *sp_catalog_open(const uint8_t *bytes, size_t len,
         char schema[37], when[40];
         name_uuid(data_path, "schema", schema);
         time_text(now, when, sizeof when);
-        int rc = cat_exec(c, err, errlen, "PRAGMA page_size = 4096; BEGIN");
+        int rc = cat_exec(c, report, "PRAGMA page_size = 4096; BEGIN");
         for (int i = 0; rc == 0 && DUCKLAKE_1_0[i]; i++)
-            rc = cat_exec(c, err, errlen, "%s", DUCKLAKE_1_0[i]);
+            rc = cat_exec(c, report, "%s", DUCKLAKE_1_0[i]);
         for (int i = 0; rc == 0 && SP_TABLES[i]; i++)
-            rc = cat_exec(c, err, errlen, "%s", SP_TABLES[i]);
-        if (rc == 0) rc = cat_exec(c, err, errlen,
+            rc = cat_exec(c, report, "%s", SP_TABLES[i]);
+        if (rc == 0) rc = cat_exec(c, report,
             "INSERT INTO ducklake_metadata VALUES ('version', '1.0', NULL, NULL),"
             " ('created_by', 'streaming-parquet', NULL, NULL),"
             " ('data_path', %Q, NULL, NULL), ('encrypted', 'false', NULL, NULL);"
@@ -1082,8 +1105,16 @@ SpCatalog *sp_catalog_open(const uint8_t *bytes, size_t len,
             "COMMIT", data_path, schema, when);
         if (rc != 0) { sp_catalog_free(c); return NULL; }
     }
-    if (cat_begin(c, err, errlen) != 0) { sp_catalog_free(c); return NULL; }
+    if (cat_begin(c, report) != 0) { sp_catalog_free(c); return NULL; }
     return c;
+}
+
+int sp_catalog_open(const uint8_t *bytes, size_t len, const char *data_path,
+                    SpCatalog **out, Report *report) {
+    BEGIN(report);
+    if (!out) { fail(report, REPORT_INVALID, "catalog: nowhere to put it"); return report->status; }
+    MADE(report, out, catalog_open(bytes, len, data_path, sp__wall(), report),
+         "catalog");
 }
 
 int sp_catalog_lists(const SpCatalog *c, const char *path) {
@@ -1099,7 +1130,7 @@ int64_t sp_catalog_files(const SpCatalog *c) {
         "SELECT count(*) FROM ducklake_data_file WHERE end_snapshot IS NULL");
 }
 
-char *sp_catalog_file(const SpCatalog *c, int64_t index) {
+static char *catalog_file(const SpCatalog *c, int64_t index) {
     if (!c || index < 0) return NULL;
     sqlite3_stmt *st = NULL;
     char *out = NULL;
@@ -1173,13 +1204,13 @@ static void path_text(const PqFooter *f, int at, char *out, size_t outlen) {
  * -1 with the reason for a type the catalog does not take or a column
  * whose type changed. */
 static int match_column(SpCatalog *c, PqFooter *f, int at, int64_t parent,
-                        int add, const char *path, char *err, size_t errlen) {
+                        int add, const char *path, Report *report) {
     at = column_node(f, at);
     PqNode *x = &f->nodes[at];
     char where[256];
     path_text(f, at, where, sizeof where);
     if (!x->type[0]) {
-        fail(err, errlen, "catalog: %s: the column %s has a parquet type the "
+        fail(report, REPORT_REFUSED, "catalog: %s: the column %s has a parquet type the "
              "catalog does not take (physical type %d, converted type %d, "
              "logical type %d%s)", path, where, x->physical, x->converted,
              x->logical, x->repeated ? ", repeated" : "");
@@ -1189,7 +1220,7 @@ static int match_column(SpCatalog *c, PqFooter *f, int at, int64_t parent,
     const char *name = column_name(f, at);
     int64_t id = cat_column(c, name, parent, &have);
     if (id >= 0 && strcmp(have, x->type) != 0) {
-        fail(err, errlen, "catalog: %s: the column %s is %s in this file and "
+        fail(report, REPORT_REFUSED, "catalog: %s: the column %s is %s in this file and "
              "%s in the catalog; a column's type does not change. The file is "
              "not listed.", path, where, x->type, have);
         sqlite3_free(have);
@@ -1198,7 +1229,7 @@ static int match_column(SpCatalog *c, PqFooter *f, int at, int64_t parent,
     sqlite3_free(have);
     if (id < 0) {
         if (!add) {
-            fail(err, errlen, "catalog: %s: the column %s is new inside a "
+            fail(report, REPORT_REFUSED, "catalog: %s: the column %s is new inside a "
                  "column the catalog has; a list or a struct keeps its "
                  "members. The file is not listed.", path, where);
             return -1;
@@ -1208,7 +1239,7 @@ static int match_column(SpCatalog *c, PqFooter *f, int at, int64_t parent,
         int nested = x->physical < 0;
         char above[24] = "NULL";
         if (parent) snprintf(above, sizeof above, "%lld", (long long)parent);
-        if (cat_exec(c, err, errlen,
+        if (cat_exec(c, report,
                 "INSERT INTO ducklake_column VALUES (%lld, %lld, NULL, %d, %lld, "
                 "%Q, %Q, NULL, 'NULL', 1, %s, %Q, 'duckdb')",
                 (long long)id, (long long)c->snapshot, TABLE_ID, (long long)id,
@@ -1222,7 +1253,7 @@ static int match_column(SpCatalog *c, PqFooter *f, int at, int64_t parent,
     if (x->physical < 0) {
         int child = at + 1;
         for (int k = 0; k < x->num_children; k++) {
-            if (match_column(c, f, child, id, add, path, err, errlen) != 0) return -1;
+            if (match_column(c, f, child, id, add, path, report) != 0) return -1;
             child = next_sibling(f, child);
         }
     }
@@ -1243,16 +1274,15 @@ static char *file_shape(const PqFooter *f) {
 
 /* The name mapping for this shape of file: the one the catalog has, or
  * a new one. -1 on failure. */
-static int64_t file_mapping(SpCatalog *c, const PqFooter *f, char *err,
-                            size_t errlen) {
+static int64_t file_mapping(SpCatalog *c, const PqFooter *f, Report *report) {
     char *shape = file_shape(f);
-    if (!shape) { fail(err, errlen, "catalog: memory is out"); return -1; }
+    if (!shape) { fail(report, REPORT_NO_MEMORY, "catalog: memory is out"); return -1; }
     int found;
     int64_t id = cat_int(c, &found, "SELECT mapping_id FROM sp_mapping "
                                     "WHERE shape = %Q", shape);
     if (found) { sqlite3_free(shape); return id; }
     id = c->next_file_id++;
-    int rc = cat_exec(c, err, errlen,
+    int rc = cat_exec(c, report,
         "INSERT INTO ducklake_column_mapping VALUES (%lld, %d, 'map_by_name');"
         "INSERT INTO sp_mapping VALUES (%lld, %Q)",
         (long long)id, TABLE_ID, (long long)id, shape);
@@ -1260,7 +1290,7 @@ static int64_t file_mapping(SpCatalog *c, const PqFooter *f, char *err,
     /* one row for each node the reader meets: a list's repeated group
      * stands for its element */
     int64_t *local = calloc((size_t)f->n, sizeof *local);
-    if (!local) { fail(err, errlen, "catalog: memory is out"); return -1; }
+    if (!local) { fail(report, REPORT_NO_MEMORY, "catalog: memory is out"); return -1; }
     int64_t row = 0;
     for (int i = 1; rc == 0 && i < f->n; i++) {
         const PqNode *x = &f->nodes[i];
@@ -1272,12 +1302,12 @@ static int64_t file_mapping(SpCatalog *c, const PqFooter *f, char *err,
         int up = x->parent;
         local[i] = row;
         if (up > 0)
-            rc = cat_exec(c, err, errlen,
+            rc = cat_exec(c, report,
                 "INSERT INTO ducklake_name_mapping VALUES (%lld, %lld, %Q, %lld, %lld, 0)",
                 (long long)id, (long long)row, x->name,
                 (long long)f->nodes[target].column_id, (long long)local[up]);
         else
-            rc = cat_exec(c, err, errlen,
+            rc = cat_exec(c, report,
                 "INSERT INTO ducklake_name_mapping VALUES (%lld, %lld, %Q, %lld, NULL, 0)",
                 (long long)id, (long long)row, x->name,
                 (long long)f->nodes[target].column_id);
@@ -1294,8 +1324,7 @@ static int bind_text_or_null(sqlite3_stmt *st, int at, char *text) {
 
 /* One leaf's rows: the file's numbers, and the table's with them. */
 static int leaf_stats(SpCatalog *c, const PqNode *x, int64_t file_id,
-                      int64_t rows, int64_t rows_before, char *err,
-                      size_t errlen) {
+                      int64_t rows, int64_t rows_before, Report *report) {
     int ranged = x->kind != K_NONE && !x->no_range && x->has_min && x->has_max;
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(c->db,
@@ -1402,18 +1431,18 @@ static int leaf_stats(SpCatalog *c, const PqNode *x, int64_t file_id,
     free(old_lo);
     free(old_hi);
     if (rc != SQLITE_OK) {
-        fail(err, errlen, "catalog: %s", sqlite3_errmsg(c->db));
+        fail(report, REPORT_REFUSED, "catalog: %s", sqlite3_errmsg(c->db));
         return -1;
     }
     return 0;
 }
 
 static int add_file(SpCatalog *c, const char *path, int64_t file_size,
-                    PqFooter *f, size_t footer_len, char *err, size_t errlen) {
+                    PqFooter *f, size_t footer_len, Report *report) {
     if (!c->has_table) {
         char table[37];
         name_uuid(c->data_path, "table", table);
-        if (cat_exec(c, err, errlen,
+        if (cat_exec(c, report,
                 "INSERT INTO ducklake_table VALUES (%d, %Q, %lld, NULL, 0, %Q, 'data/', 1)",
                 TABLE_ID, table, (long long)c->snapshot, TABLE_NAME) != 0)
             return -1;
@@ -1423,27 +1452,27 @@ static int add_file(SpCatalog *c, const char *path, int64_t file_size,
     PqNode *root = &f->nodes[0];
     int child = 1;
     for (int k = 0; k < root->num_children; k++) {
-        if (match_column(c, f, child, 0, 1, path, err, errlen) != 0) return -1;
+        if (match_column(c, f, child, 0, 1, path, report) != 0) return -1;
         child = next_sibling(f, child);
     }
     c->has_table = 1;
-    int64_t mapping = file_mapping(c, f, err, errlen);
+    int64_t mapping = file_mapping(c, f, report);
     if (mapping < 0) return -1;
     int64_t file_id = c->next_file_id++;
     int had;
     int64_t row_id = cat_int(c, &had, "SELECT next_row_id FROM ducklake_table_stats "
                                       "WHERE table_id = %d", TABLE_ID);
-    if (cat_exec(c, err, errlen,
+    if (cat_exec(c, report,
             "INSERT INTO ducklake_data_file VALUES (%lld, %d, %lld, NULL, NULL, %Q, "
             "0, 'parquet', %lld, %lld, %lld, %lld, NULL, NULL, %lld, NULL)",
             (long long)file_id, TABLE_ID, (long long)c->snapshot, path,
             (long long)f->num_rows, (long long)file_size, (long long)footer_len,
             (long long)row_id, (long long)mapping) != 0)
         return -1;
-    if (!had && cat_exec(c, err, errlen,
+    if (!had && cat_exec(c, report,
             "INSERT INTO ducklake_table_stats VALUES (%d, 0, 0, 0)", TABLE_ID) != 0)
         return -1;
-    if (cat_exec(c, err, errlen,
+    if (cat_exec(c, report,
             "UPDATE ducklake_table_stats SET record_count = record_count + %lld, "
             "next_row_id = next_row_id + %lld, file_size_bytes = file_size_bytes "
             "+ %lld WHERE table_id = %d",
@@ -1452,11 +1481,11 @@ static int add_file(SpCatalog *c, const char *path, int64_t file_size,
         return -1;
     for (int i = 0; i < f->n_leaves; i++)
         if (leaf_stats(c, &f->nodes[f->leaves[i]], file_id, f->num_rows,
-                       row_id, err, errlen) != 0)
+                       row_id, report) != 0)
             return -1;
     /* a column of the catalog that this file lacks is null in all of
      * the file's rows */
-    if (cat_exec(c, err, errlen,
+    if (cat_exec(c, report,
             "INSERT INTO ducklake_file_column_stats SELECT %lld, %d, column_id, 0, 0, "
             "%lld, NULL, NULL, NULL, NULL FROM ducklake_column WHERE table_id = %d "
             "AND end_snapshot IS NULL AND column_type NOT IN ('list', 'struct') "
@@ -1470,33 +1499,47 @@ static int add_file(SpCatalog *c, const char *path, int64_t file_size,
             (long long)file_id, TABLE_ID, (long long)file_id) != 0)
         return -1;
     if (f->has_first_row)
-        return cat_exec(c, err, errlen, "INSERT INTO sp_file VALUES (%lld, %Q, %lld)",
+        return cat_exec(c, report, "INSERT INTO sp_file VALUES (%lld, %Q, %lld)",
                         (long long)file_id, f->run, (long long)f->first_row);
-    return cat_exec(c, err, errlen, "INSERT INTO sp_file VALUES (%lld, %Q, NULL)",
+    return cat_exec(c, report, "INSERT INTO sp_file VALUES (%lld, %Q, NULL)",
                     (long long)file_id, f->run);
+}
+
+int sp_catalog_file(const SpCatalog *c, int64_t index, char **out,
+                    Report *report) {
+    BEGIN(report);
+    if (!out || !c || index < 0 || index >= sp_catalog_files(c)) {
+        fail(report, REPORT_INVALID, "catalog: no file number %lld",
+             (long long)index);
+        return report->status;
+    }
+    MADE(report, out, catalog_file(c, index), "catalog");
 }
 
 int sp_catalog_add(SpCatalog *c, const char *path, int64_t file_size,
                    const uint8_t *footer, size_t footer_len,
-                   char *err, size_t errlen) {
-    if (!c || !path || !footer) { fail(err, errlen, "catalog: nothing to add"); return -1; }
+                   Report *report) {
+    BEGIN(report);
+    if (!c || !path || !footer) { fail(report, REPORT_INVALID, "catalog: nothing to add"); return report->status; }
     if (sp_catalog_lists(c, path)) return 0;
     PqFooter f;
-    char why[160];
-    if (footer_read(footer, footer_len, &f, why, sizeof why) != 0) {
-        fail(err, errlen, "catalog: %s: %s", path, why);
-        return -1;
+    Report why;
+    report_begin(&why);
+    if (footer_read(footer, footer_len, &f, &why) != 0) {
+        fail(report, why.status ? why.status : REPORT_REFUSED,
+             "catalog: %s: %s", path, why.error);
+        return report->status;
     }
     /* all of a file's rows or none: the counters go back with them */
     int64_t next_file = c->next_file_id, next_catalog = c->next_catalog_id;
     int created = c->created, altered = c->altered, has_table = c->has_table;
-    int rc = cat_exec(c, err, errlen, "SAVEPOINT one_file");
+    int rc = cat_exec(c, report, "SAVEPOINT one_file");
     if (rc == 0) {
-        rc = add_file(c, path, file_size, &f, footer_len, err, errlen);
+        rc = add_file(c, path, file_size, &f, footer_len, report);
         if (rc == 0) {
-            rc = cat_exec(c, err, errlen, "RELEASE one_file");
+            rc = cat_exec(c, report, "RELEASE one_file");
         } else {
-            cat_exec(c, NULL, 0, "ROLLBACK TO one_file; RELEASE one_file");
+            cat_exec(c, NULL, "ROLLBACK TO one_file; RELEASE one_file");
             c->next_file_id = next_file;
             c->next_catalog_id = next_catalog;
             c->created = created;
@@ -1506,20 +1549,22 @@ int sp_catalog_add(SpCatalog *c, const char *path, int64_t file_size,
     }
     footer_free(&f);
     if (rc == 0) { c->inserted = 1; c->staged++; }
-    return rc;
+    if (rc != 0 && !report->status)
+        fail(report, REPORT_REFUSED, "catalog: %s is not listed", path);
+    return report->status;
 }
 
-uint8_t *sp_catalog_bytes(SpCatalog *c, double now, size_t *out_len,
-                          char *err, size_t errlen) {
+static uint8_t *catalog_bytes(SpCatalog *c, double now, size_t *out_len,
+                              Report *report) {
     if (out_len) *out_len = 0;
-    if (!c) { fail(err, errlen, "no catalog"); return NULL; }
+    if (!c) { fail(report, REPORT_INVALID, "catalog: no catalog"); return NULL; }
     int rc = 0;
     if (c->created || c->altered || c->inserted) {
         char when[40];
         time_text(now, when, sizeof when);
         if (c->created || c->altered) {
             c->schema_version++;
-            rc = cat_exec(c, err, errlen,
+            rc = cat_exec(c, report,
                 "INSERT INTO ducklake_schema_versions VALUES (%lld, %lld, %d)",
                 (long long)c->snapshot, (long long)c->schema_version, TABLE_ID);
         }
@@ -1535,24 +1580,31 @@ uint8_t *sp_catalog_bytes(SpCatalog *c, double now, size_t *out_len,
         if (c->inserted)
             snprintf(changes + at, sizeof changes - (size_t)at,
                      "%sinserted_into_table:%d", at ? "," : "", TABLE_ID);
-        if (rc == 0) rc = cat_exec(c, err, errlen,
+        if (rc == 0) rc = cat_exec(c, report,
             "INSERT INTO ducklake_snapshot VALUES (%lld, %Q, %lld, %lld, %lld);"
             "INSERT INTO ducklake_snapshot_changes VALUES (%lld, %Q, NULL, NULL, NULL)",
             (long long)c->snapshot, when, (long long)c->schema_version,
             (long long)c->next_catalog_id, (long long)c->next_file_id,
             (long long)c->snapshot, changes);
     }
-    if (rc == 0) rc = cat_exec(c, err, errlen, "COMMIT");
+    if (rc == 0) rc = cat_exec(c, report, "COMMIT");
     if (rc != 0) return NULL;
     sqlite3_int64 n = 0;
     unsigned char *image = sqlite3_serialize(c->db, "main", &n, 0);
     uint8_t *out = image ? malloc(n > 0 ? (size_t)n : 1) : NULL;
     if (out) memcpy(out, image, (size_t)n);
     sqlite3_free(image);
-    if (!out) { fail(err, errlen, "catalog: memory is out"); return NULL; }
-    if (cat_begin(c, err, errlen) != 0) { free(out); return NULL; }
+    if (!out) { fail(report, REPORT_NO_MEMORY, "catalog: memory is out"); return NULL; }
+    if (cat_begin(c, report) != 0) { free(out); return NULL; }
     if (out_len) *out_len = (size_t)n;
     return out;
+}
+
+int sp_catalog_bytes(SpCatalog *c, uint8_t **out, size_t *out_len,
+                     Report *report) {
+    BEGIN(report);
+    if (!out) { fail(report, REPORT_INVALID, "catalog: nowhere to put the bytes"); return report->status; }
+    MADE(report, out, catalog_bytes(c, sp__wall(), out_len, report), "catalog");
 }
 
 int64_t sp_catalog_staged(const SpCatalog *c) { return c ? c->staged : 0; }

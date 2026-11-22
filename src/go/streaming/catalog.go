@@ -54,8 +54,6 @@ const catalogTailBytes = 64 * 1024
 // catalogCloseWait: how long Close waits for a pass before it stops it.
 const catalogCloseWait = 3 * time.Second
 
-const catalogErrLen = 512
-
 var errCatalogStopped = errors.New("stopped by close")
 
 type catalog struct {
@@ -170,8 +168,6 @@ func (c *catalog) drop() {
 	}
 }
 
-func wallNow() float64 { return float64(time.Now().UnixNano()) / 1e9 }
-
 // pass answers the names of the files the published catalog lists.
 func (c *catalog) pass() (map[string]bool, error) {
 	var names map[string]bool
@@ -193,7 +189,7 @@ func (c *catalog) pass() (map[string]bool, error) {
 }
 
 func (c *catalog) passOnce() (map[string]bool, error) {
-	var eb [catalogErrLen]C.char
+	var r report
 	if c.cat == nil {
 		data, etag, err := c.vs.GetVersion(catalogObject)
 		if err != nil {
@@ -204,11 +200,12 @@ func (c *catalog) passOnce() (map[string]bool, error) {
 		if len(data) > 0 {
 			p = (*C.uint8_t)(unsafe.Pointer(&data[0]))
 		}
-		c.cat = C.sp_catalog_open(p, C.size_t(len(data)), cf, C.double(wallNow()), &eb[0], catalogErrLen)
+		rc := C.sp_catalog_open(p, C.size_t(len(data)), cf, &c.cat, &r.c)
 		C.free(unsafe.Pointer(cf))
-		if c.cat == nil {
-			return nil, fmt.Errorf("%s%s is not a catalog this library reads: %s",
-				c.folder, catalogObject, C.GoString(&eb[0]))
+		if rc != 0 {
+			c.cat = nil
+			return nil, fmt.Errorf("%s%s is not a catalog this library reads: %v",
+				c.folder, catalogObject, r.err())
 		}
 		c.mu.Lock()
 		c.etag = etag
@@ -243,9 +240,9 @@ func (c *catalog) passOnce() (map[string]bool, error) {
 	names := map[string]bool{}
 	count := int(C.sp_catalog_files(c.cat))
 	for i := 0; i < count; i++ {
-		p := C.sp_catalog_file(c.cat, C.int64_t(i))
-		if p == nil {
-			break
+		var p *C.char
+		if C.sp_catalog_file(c.cat, C.int64_t(i), &p, &r.c) != 0 {
+			return nil, r.err()
 		}
 		path := C.GoString(p)
 		C.sp_free(unsafe.Pointer(p))
@@ -262,9 +259,9 @@ func (c *catalog) passOnce() (map[string]bool, error) {
 		return names, nil
 	}
 	var n C.size_t
-	p := C.sp_catalog_bytes(c.cat, C.double(wallNow()), &n, &eb[0], catalogErrLen)
-	if p == nil {
-		return nil, fmt.Errorf("%s", C.GoString(&eb[0]))
+	var p *C.uint8_t
+	if C.sp_catalog_bytes(c.cat, &p, &n, &r.c) != 0 {
+		return nil, r.err()
 	}
 	data := C.GoBytes(unsafe.Pointer(p), C.int(n))
 	C.sp_free(unsafe.Pointer(p))
@@ -286,7 +283,7 @@ func (c *catalog) passOnce() (map[string]bool, error) {
 
 // add reads the footer of the file `name` and lists the file.
 func (c *catalog) add(name string) error {
-	var eb [catalogErrLen]C.char
+	var r report
 	size, err := c.sink.Size(name)
 	if err != nil {
 		return err
@@ -302,11 +299,12 @@ func (c *catalog) add(name string) error {
 	if len(tail) < 8 {
 		return fmt.Errorf("%s%s: %d bytes is not a parquet file", c.folder, name, len(tail))
 	}
-	n := int64(C.sp_parquet_footer_length((*C.uint8_t)(unsafe.Pointer(&tail[0])),
-		C.size_t(len(tail)), &eb[0], catalogErrLen))
-	if n < 0 {
-		return fmt.Errorf("%s%s: %s", c.folder, name, C.GoString(&eb[0]))
+	var length C.int64_t
+	if C.sp_parquet_footer_length((*C.uint8_t)(unsafe.Pointer(&tail[0])),
+		C.size_t(len(tail)), &length, &r.c) != 0 {
+		return fmt.Errorf("%s%s: %v", c.folder, name, r.err())
 	}
+	n := int64(length)
 	var footer []byte
 	if n+8 <= int64(len(tail)) {
 		footer = tail[int64(len(tail))-8-n : len(tail)-8]
@@ -323,8 +321,8 @@ func (c *catalog) add(name string) error {
 	cp := C.CString(c.folder + name)
 	defer C.free(unsafe.Pointer(cp))
 	if C.sp_catalog_add(c.cat, cp, C.int64_t(size), (*C.uint8_t)(unsafe.Pointer(&footer[0])),
-		C.size_t(len(footer)), &eb[0], catalogErrLen) != 0 {
-		return fmt.Errorf("%s", C.GoString(&eb[0]))
+		C.size_t(len(footer)), &r.c) != 0 {
+		return r.err()
 	}
 	return nil
 }

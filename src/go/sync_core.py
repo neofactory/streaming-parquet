@@ -26,6 +26,9 @@ COPIES = [
     ("sp.c", "streaming/sp_core.c"),
     ("sp_catalog.c", "streaming/sp_catalog.c"),
     ("sp.h", "streaming/sp.h"),
+    ("report.h", "ring/report.h"),
+    ("report.h", "pqc/report.h"),
+    ("report.h", "streaming/report.h"),
 ]
 
 

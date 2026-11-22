@@ -521,14 +521,19 @@ func TestTicketIsTheCores(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(*got, want) {
 		t.Fatalf("round trip: %+v, %v\nwant %+v", got, err, want)
 	}
-	if got.isStale(want.Ts+44.9) || !got.isStale(want.Ts+45) {
+	staleAt := func(t *Ticket, wall float64) bool {
+		setCoreClock(wall, 0)
+		defer systemCoreClock()
+		return t.isStale()
+	}
+	if staleAt(got, want.Ts+44.9) || !staleAt(got, want.Ts+45) {
 		t.Fatal("stale at the wrong time: want exactly stale_after past ts")
 	}
 	old, err := ticketFromText([]byte(`{"name":"air/dfw","host":"h","port":1,"ts":100,"archive":"s3://b/x","later":[1]}`))
 	if err != nil || old.Archive != "s3://b/x" || old.StoredRow != nil || old.Revision != 0 {
 		t.Fatalf("a ticket from an older writer: %+v, %v", old, err)
 	}
-	if old.staleAfter() != 30 || old.isStale(129.9) || !old.isStale(130) {
+	if old.staleAfter() != 30 || staleAt(old, 129.9) || !staleAt(old, 130) {
 		t.Fatalf("an older ticket's stale rule: %v", old.staleAfter())
 	}
 	if _, err := ticketFromText([]byte(`{"port": "8815"}`)); err == nil ||

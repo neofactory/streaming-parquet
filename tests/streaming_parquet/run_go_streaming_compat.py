@@ -262,8 +262,13 @@ def _():
         assert t["stored_row"] is None, t      # Go does not say yet
         # and it is the text the core writes: Python's core writes the same
         assert _core.ticket_text(t) == text, (_core.ticket_text(t), text)
-        assert not _core.ticket_is_stale(t, t["ts"] + 179, 30.0)
-        assert _core.ticket_is_stale(t, t["ts"] + 180, 30.0)
+        try:
+            _core.test_set_clock(t["ts"] + 179, 0.0)
+            assert not _core.ticket_is_stale(t, 30.0)
+            _core.test_set_clock(t["ts"] + 180, 0.0)
+            assert _core.ticket_is_stale(t, 30.0)
+        finally:
+            _core.test_system_clock()
     finally:
         child.wait(timeout=30)
         assert child.returncode == 0, child.stderr.read()

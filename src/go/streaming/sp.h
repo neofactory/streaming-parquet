@@ -2,9 +2,16 @@
  * host language shares, written once.
  *
  * The core holds formats and rules. It does no input and no output: no
- * disk, no network, no clock. A host (Python through cffi, Go through
- * cgo) reads and writes the store, runs the threads, and tells the core
- * the time. A rule that is here is in no host.
+ * disk, no network. A host (Python through cffi, Go through cgo) reads
+ * and writes the store, runs the threads, does the waiting and writes
+ * the log. A rule that is here is in no host.
+ *
+ * How a function reports is in report.h, the same for the three cores:
+ * a function that can fail, or that can have a line for the host's
+ * log, returns a status and takes a Report as its last parameter; what
+ * it makes comes back through an output parameter. The core reads the
+ * clock itself (report.h: TIME); sp_test_set_clock, at the end of this
+ * file, is for tests.
  *
  * This file is the spec of what it declares. First in it: the ticket.
  *
@@ -63,6 +70,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "report.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -96,27 +105,27 @@ typedef enum { SP_TEXT = 0, SP_INTEGER = 1, SP_NUMBER = 2 } SpKind;
 const char *sp_ticket_field_name(int field);
 int sp_ticket_field_kind(int field);
 
-/* An empty ticket: every member unknown, no files. NULL when memory is
- * out. */
-SpTicket *sp_ticket_new(void);
+/* An empty ticket: every member unknown, no files. */
+int sp_ticket_new(SpTicket **out, Report *report);
 void sp_ticket_free(SpTicket *t);
 
-/* Set a member. Each returns 0, or -1 with the reason in err: no such
- * member, the wrong kind for it, text that is not UTF-8, a number that
- * is not finite. sp_ticket_clear makes a member unknown again. */
+/* Set a member. Refused: no such member, the wrong kind for it, text
+ * that is not UTF-8, a number that is not finite. A NULL text makes
+ * the member unknown. sp_ticket_clear makes any member unknown again;
+ * a number that is no member changes nothing. */
 int sp_ticket_set_text(SpTicket *t, int field, const char *text,
-                       char *err, size_t errlen);
+                       Report *report);
 int sp_ticket_set_integer(SpTicket *t, int field, int64_t value,
-                          char *err, size_t errlen);
+                          Report *report);
 int sp_ticket_set_number(SpTicket *t, int field, double value,
-                         char *err, size_t errlen);
-int sp_ticket_clear(SpTicket *t, int field);
+                         Report *report);
+void sp_ticket_clear(SpTicket *t, int field);
 
 /* Add an unfinished file. A NULL number is one the writer does not
- * know. Returns 0, or -1 with the reason in err. */
+ * know. */
 int sp_ticket_add_file(SpTicket *t, const char *checkpoint,
                        const int64_t *first_row, const int64_t *final_rows,
-                       const int64_t *rows, char *err, size_t errlen);
+                       const int64_t *rows, Report *report);
 
 /* Read a member. sp_ticket_text returns NULL for an unknown member; the
  * pointer is the ticket's. The two others return 1 and fill *out, or 0
@@ -135,15 +144,17 @@ int sp_ticket_file(const SpTicket *t, int32_t index, const char **checkpoint,
                    int64_t *final_rows, int *has_final_rows,
                    int64_t *rows, int *has_rows);
 
-/* The ticket as JSON text, for the host to store: sp_free it. *out_len
- * is its length without the final 0. NULL when memory is out. */
-char *sp_ticket_write(const SpTicket *t, size_t *out_len);
+/* The ticket as JSON text in *out, for the host to store: sp_free it.
+ * *out_len is its length without the final 0. */
+int sp_ticket_write(const SpTicket *t, char **out, size_t *out_len,
+                    Report *report);
 
-/* A ticket from the text a host read from the store. NULL with the
- * reason in err when the text is not a JSON object, or a known member
- * is of the wrong kind. The text needs no final 0. */
-SpTicket *sp_ticket_read(const char *text, size_t len,
-                         char *err, size_t errlen);
+/* A ticket in *out from the text a host read from the store. Refused
+ * (REPORT_REFUSED, with the member named) when the text is not a JSON
+ * object, or a known member is of the wrong kind. The text needs no
+ * final 0. */
+int sp_ticket_read(const char *text, size_t len, SpTicket **out,
+                   Report *report);
 
 /* The seconds after its ts at which this ticket means a dead writer:
  * what the ticket says (stale_after). A ticket that does not say gets
@@ -151,10 +162,9 @@ SpTicket *sp_ticket_read(const char *text, size_t len,
  * (pqc_dead_after(0), in the checkpoint core). */
 double sp_ticket_stale_after(const SpTicket *t, double if_absent);
 
-/* 1 when, at the time `now` (the host's clock, in the ticket's own
- * seconds), the ticket's writer is dead: now is stale_after or more
- * past ts. A ticket with no ts is stale. */
-int sp_ticket_is_stale(const SpTicket *t, double now, double if_absent);
+/* 1 when the ticket's writer is dead: the wall clock is stale_after or
+ * more past ts. A ticket with no ts is stale. */
+int sp_ticket_is_stale(const SpTicket *t, double if_absent);
 
 /* THE OWNERSHIP DECISION
  *
@@ -177,50 +187,52 @@ int sp_ticket_is_stale(const SpTicket *t, double now, double if_absent);
  *                   A stale one: that server is gone, take over.
  *
  * A host that could not read the ticket still owns the stream on its
- * lock alone, and logs sp_ownership_unread: an unreachable store at
- * start delays the uploads and never the stream.
+ * lock alone, and logs the line of sp_ownership_unread: an unreachable
+ * store at start delays the uploads and never the stream.
  *
  * `who` in each message is the host's own call, as its user wrote it:
  * create_stream('a/b') in Python, CreateStream("a/b") in Go.
  */
 
-/* The lock record: {"pid", "host", "port", "run"} as JSON text, for the
- * host to write into the lock file it holds: sp_free it. NULL when
- * memory is out. */
-char *sp_lock_record(int64_t pid, const char *host, int64_t port,
-                     const char *run, size_t *out_len);
+/* The lock record: {"pid", "host", "port", "run"} as JSON text in *out,
+ * for the host to write into the lock file it holds: sp_free it. */
+int sp_lock_record(int64_t pid, const char *host, int64_t port,
+                   const char *run, char **out, size_t *out_len,
+                   Report *report);
 
-/* The refusal for a lock another process holds. `holder` is the text of
- * the lock file (its lock record; any text is taken, and what cannot be
- * read from it shows as "?"). */
-void sp_lock_refusal(const char *who, const char *lock_path,
-                     const char *holder, size_t holder_len,
-                     char *msg, size_t msglen);
+/* The refusal for a lock another process holds: it always answers
+ * REPORT_REFUSED, and the report's error names the holder. `holder` is
+ * the text of the lock file (its lock record; any text is taken, and
+ * what cannot be read from it shows as "?"). */
+int sp_lock_refusal(const char *who, const char *lock_path,
+                    const char *holder, size_t holder_len, Report *report);
 
 typedef enum {
-    SP_OWN = 0,        /* this writer owns the stream; msg is empty */
-    SP_TAKE_OVER = 1,  /* it owns it, from a writer that died; msg is the
-                          warning to log */
-    SP_REFUSED = 2     /* another server writes it; msg is the error */
+    SP_OWN = 0,        /* this writer owns the stream */
+    SP_TAKE_OVER = 1,  /* it owns it, from a writer that died: the
+                          report has a warning line that says so */
+    SP_REFUSED = 2     /* another server writes it: the call answers
+                          REPORT_REFUSED and the error names it */
 } SpOwnership;
 
-/* The ticket check. ticket: what the store holds, NULL for none. host:
- * this writer's address. now, if_absent: as sp_ticket_is_stale. */
+/* The ticket check: *decision is the SpOwnership. ticket: what the
+ * store holds, NULL for none. host: this writer's address. if_absent:
+ * as sp_ticket_is_stale. */
 int sp_ownership(const char *who, const char *name, const char *store,
                  const SpTicket *ticket, const char *host,
-                 double now, double if_absent, char *msg, size_t msglen);
+                 double if_absent, int *decision, Report *report);
 
-/* The warning for a ticket the host could not read (`why`: its error). */
-void sp_ownership_unread(const char *name, const char *store,
-                         const char *why, char *msg, size_t msglen);
+/* A ticket the host could not read (`why`: its error): the report gets
+ * the warning line to log. */
+int sp_ownership_unread(const char *name, const char *store,
+                        const char *why, Report *report);
 
 /* THE WRITE PLAN
  *
  * Which committed rows go to the stream's files, and when. One SpWrites
  * per stream holds the plan's state; the host tells it what was
- * committed and what time it is, pins the rows, and does the writes the
- * plan names. The plan does no I/O and has no clock: `now` is the
- * host's monotonic clock, in seconds.
+ * committed, pins the rows, and does the writes the plan names. The
+ * plan does no I/O; its times are the monotonic clock's.
  *
  * Rows have stream row numbers. The plan keeps:
  *
@@ -274,19 +286,18 @@ typedef struct {
     int64_t lost;
 } SpWrite;
 
-/* A plan that is off, at row 0, with row_group_rows 1 and no cadences.
- * NULL when memory is out. */
-SpWrites *sp_writes_new(void);
+/* A plan that is off, at row 0, with row_group_rows 1 and no cadences. */
+int sp_writes_new(SpWrites **out, Report *report);
 void sp_writes_free(SpWrites *w);
 
 /* The cadences, from now on. A NULL seconds is none: no row group by
- * time, no checkpoints. Returns 0, or -1 with the reason in err:
- * row_group_rows under 1, seconds negative or not finite. New options
- * start the checkpoint cadence again. */
+ * time, no checkpoints. REPORT_INVALID: row_group_rows under 1,
+ * seconds negative or not finite. New options start the checkpoint
+ * cadence again. */
 int sp_writes_set_options(SpWrites *w, int64_t row_group_rows,
                           const double *row_group_seconds,
                           const double *checkpoint_seconds,
-                          char *err, size_t errlen);
+                          Report *report);
 
 /* Turn the plan on at the row `committed` (the first row not yet
  * committed): earlier rows are not planned. No change when it is on. */
@@ -296,21 +307,20 @@ void sp_writes_start(SpWrites *w, int64_t committed);
  * forces a row group first. */
 void sp_writes_stop(SpWrites *w);
 
-/* The kind of write due for `committed` at `now`; nothing moves. */
-int sp_writes_due(const SpWrites *w, int64_t committed, double now);
+/* The kind of write due for `committed` now; nothing moves. */
+int sp_writes_due(const SpWrites *w, int64_t committed);
 
 /* sp_writes_due, and the pending rows' clock starts when it was not
  * running: then *begins is 1 (the pending rows begin at this commit),
  * else 0. The answer is from before the clock started. */
-int sp_writes_commit(SpWrites *w, int64_t committed, double now,
-                     int *begins);
+int sp_writes_commit(SpWrites *w, int64_t committed, int *begins);
 
 /* Plan the write for a pin that holds the rows [lo, hi): hi is the
  * committed row count the host pinned to, lo is cursor or, after a
  * loss, later. force_row_group: plan a row group whatever is due.
  * *out is the write; the plan moves with it. */
 void sp_writes_plan(SpWrites *w, int force_row_group, int64_t lo,
-                    int64_t hi, double now, SpWrite *out);
+                    int64_t hi, SpWrite *out);
 
 int sp_writes_on(const SpWrites *w);
 int64_t sp_writes_cursor(const SpWrites *w);
@@ -353,35 +363,38 @@ int64_t sp_writes_lost(const SpWrites *w);
  *   sp_store_listed     a published catalog lists the file: it leaves
  *                       the ticket. The host writes the ticket, and
  *   sp_store_dropped    when that write worked: the file's checkpoints
- *                       are superseded from `now`.
+ *                       are superseded from that moment.
  *   sp_store_due        the files whose checkpoints were superseded
  *                       keep_seconds ago or more: a reader told of them
  *                       has had that long. The host deletes them and
  *   sp_store_discarded  says so.
  *
- * Two clocks, both the host's: `wall` is the time the ticket shows
- * (stored_at), `now` is monotonic seconds.
+ * Two clocks: the time the ticket shows (stored_at) is the wall
+ * clock's; the keep time is counted on the monotonic clock.
  */
 typedef struct SpStore SpStore;
 
-/* keep_seconds: how long a superseded checkpoint stays. NULL when
- * memory is out or keep_seconds is negative or not finite. */
-SpStore *sp_store_new(double keep_seconds);
+/* keep_seconds: how long a superseded checkpoint stays.
+ * REPORT_INVALID when it is negative or not finite. */
+int sp_store_new(double keep_seconds, SpStore **out, Report *report);
 void sp_store_free(SpStore *s);
 
-/* The keep time from now on. Returns 0, or -1 for a value that is
+/* The keep time from now on. REPORT_INVALID for a value that is
  * negative or not finite. */
-int sp_store_set_keep_seconds(SpStore *s, double keep_seconds);
+int sp_store_set_keep_seconds(SpStore *s, double keep_seconds,
+                              Report *report);
 double sp_store_keep_seconds(const SpStore *s);
 
-/* Each returns 0, or -1 when memory is out or the name is NULL. */
-int sp_store_begins(SpStore *s, const char *file, int64_t first_row);
+/* Each fails only when a name is NULL or memory is out. */
+int sp_store_begins(SpStore *s, const char *file, int64_t first_row,
+                    Report *report);
 int sp_store_covers(SpStore *s, const char *file, int64_t version,
-                    const char *checkpoint, int64_t final_rows, int64_t rows);
+                    const char *checkpoint, int64_t final_rows, int64_t rows,
+                    Report *report);
 int sp_store_stored(SpStore *s, const char *file, int64_t version,
-                    const char *checkpoint, int64_t rows, double wall);
-int sp_store_finished(SpStore *s, const char *file);
-int sp_store_awaits(SpStore *s, const char *file);
+                    const char *checkpoint, int64_t rows, Report *report);
+int sp_store_finished(SpStore *s, const char *file, Report *report);
+int sp_store_awaits(SpStore *s, const char *file, Report *report);
 
 /* 1 when the file was awaiting its catalog (it now leaves the ticket,
  * and waits for sp_store_dropped); 0 when it was not. */
@@ -392,19 +405,18 @@ int sp_store_listed(SpStore *s, const char *file);
  * version a pass published, in the same step (under the same lock) as
  * sp_store_listed for the files that version lists. A ticket then never
  * names a catalog version together with a file that version lists: a
- * view would read that file's rows twice. Returns 0, or -1 when memory
- * is out. */
-int sp_store_catalog(SpStore *s, const char *version);
+ * view would read that file's rows twice. */
+int sp_store_catalog(SpStore *s, const char *version, Report *report);
 
 /* The ticket without the listed files is written: their checkpoints are
  * superseded from now. Returns how many files that is. */
-int sp_store_dropped(SpStore *s, double now);
+int sp_store_dropped(SpStore *s);
 
-/* The index-th file (from 0) whose checkpoints are due for deletion at
- * `now`; NULL past the last. The pointer holds until the next call that
+/* The index-th file (from 0) whose checkpoints are due for deletion
+ * now; NULL past the last. The pointer holds until the next call that
  * changes the store. */
-const char *sp_store_due(const SpStore *s, double now, int32_t index);
-int sp_store_discarded(SpStore *s, const char *file);
+const char *sp_store_due(const SpStore *s, int32_t index);
+int sp_store_discarded(SpStore *s, const char *file, Report *report);
 
 /* The newest row of this run the store holds, -1 for none; 1 and *wall
  * filled when one is there, else 0. */
@@ -414,10 +426,9 @@ int sp_store_stored_at(const SpStore *s, double *wall);
 /* Put what the store holds into a ticket: stored_row, stored_at,
  * keep_seconds, and `files` (replaced), in the order of the files'
  * names. `where` is the stream's folder in the store, ending in '/':
- * each checkpoint is written as where + its object name. Returns 0, or
- * -1 with the reason in err. */
+ * each checkpoint is written as where + its object name. */
 int sp_store_fill(const SpStore *s, SpTicket *t, const char *where,
-                  char *err, size_t errlen);
+                  Report *report);
 
 /* How many files the store's state holds (in the ticket, awaiting, or
  * with checkpoints to delete): what a long run must not let grow. */
@@ -429,9 +440,8 @@ int32_t sp_store_files(const SpStore *s);
  * waits, when it starts again. One SpReader per reader holds the state;
  * the host runs the thread, reads the store, makes the connection, and
  * tells the reader what each of those found. The reader answers with
- * the next step. It does no I/O and has no clock: `now` is the host's
- * wall clock (the ticket's ts is on it), `mono` its monotonic clock,
- * both in seconds.
+ * the next step. It does no I/O and no waiting: a step says how long
+ * to wait, and the host waits.
  *
  * Where a reader looks, at every poll, in this order:
  *
@@ -469,8 +479,8 @@ int32_t sp_store_files(const SpStore *s);
  * 0.5 s, then twice as long each time up to 10 s, and poll again. A
  * connection that was made sets the wait back to 0.5 s.
  *
- * What a reader says (sp_reader_message, for the host's log): one line
- * when a wait for a writer starts, one warning when the wait has lasted
+ * What a reader says (the lines of a step's report, for the host's
+ * log): one line when a wait for a writer starts, one warning when the wait has lasted
  * SP_READER_WARN_SECONDS, an error when the store cannot be read and a
  * line when it can again, an error for each failed connection, and an
  * error when the writer started again.
@@ -506,10 +516,6 @@ typedef enum {
     SP_DO_FAIL                /* the connect call fails: sp_reader_reason */
 } SpDo;
 
-typedef enum {
-    SP_LOG_INFO = 1, SP_LOG_WARNING = 2, SP_LOG_ERROR = 3
-} SpLog;
-
 typedef struct {
     int action;               /* SpDo */
     int state;                /* SpReaderState, after this step */
@@ -519,32 +525,35 @@ typedef struct {
 
 /* who: the host's own call, as its user wrote it (connect('a/b')).
  * store: where the reader looks, for the messages; NULL for a reader
- * with a direct ticket. NULL when memory is out or name is NULL. */
-SpReader *sp_reader_new(const char *who, const char *name, const char *store,
-                        int direct);
+ * with a direct ticket. */
+int sp_reader_new(const char *who, const char *name, const char *store,
+                  int direct, SpReader **out, Report *report);
 void sp_reader_free(SpReader *r);
 
 /* The folder above the name: "a/b" for "a/b/c", "" for a name with no
  * folder. */
 const char *sp_reader_folder(const SpReader *r);
 
-/* What a poll found. ticket: for SP_FOUND_TICKET. why: the host's error
- * for SP_FOUND_UNREADABLE. if_absent: as sp_ticket_is_stale. */
-void sp_reader_poll(SpReader *r, int found, const SpTicket *ticket,
-                    const char *why, double now, double mono,
-                    double if_absent, SpStep *step);
+/* What a poll found: *step is the next step, and the report has the
+ * lines the step made. ticket: for SP_FOUND_TICKET. why: the host's
+ * error for SP_FOUND_UNREADABLE. if_absent: as sp_ticket_is_stale. */
+int sp_reader_poll(SpReader *r, int found, const SpTicket *ticket,
+                   const char *why, double if_absent, SpStep *step,
+                   Report *report);
 
 /* The answer to SP_DO_LIST: 1 when the folder exists (in the store or
  * among this process's streams), 0 when not. A host that could not
  * list polls with SP_FOUND_UNREADABLE instead. */
-void sp_reader_folder_is(SpReader *r, int exists, double mono, SpStep *step);
+int sp_reader_folder_is(SpReader *r, int exists, SpStep *step,
+                        Report *report);
 
 /* The connection was made and rows flow. */
 void sp_reader_connected(SpReader *r);
 
 /* The connection was lost or could not be made (why: the host's error),
  * or the local stream closed (why: NULL). The step is a wait. */
-void sp_reader_lost(SpReader *r, const char *why, double mono, SpStep *step);
+int sp_reader_lost(SpReader *r, const char *why, SpStep *step,
+                   Report *report);
 
 void sp_reader_close(SpReader *r);
 
@@ -558,18 +567,14 @@ const char *sp_reader_reason(const SpReader *r);
  * stream). */
 const char *sp_reader_run(const SpReader *r);
 
-/* The next line for the host's log: its level (SpLog) with the text in
- * msg, or 0 when there is none. Call until 0 after each step. */
-int sp_reader_message(SpReader *r, char *msg, size_t msglen);
-
 /* THE VIEW
  *
  * One SQL view over a stream: the store's rows up to one row, the
  * ring's rows after it. One SpView per view holds the rules' state.
  * The host reads the ticket, fetches and attaches the catalog, runs
  * the SQL and the thread; the view decides what the text names, writes
- * the text, and says when to look again. It does no I/O and has no
- * clock: `now` is the host's wall clock, `mono` its monotonic clock.
+ * the text, and says when to look again. It does no I/O and no
+ * waiting.
  *
  * What the text reads, all named by one ticket, so a query never mixes
  * two states:
@@ -662,22 +667,22 @@ int64_t sp_view_seam(const SpTicket *t, const int64_t *window, int *use_ring,
  * messages. memory: the name the ring's relation is registered under,
  * NULL for a view with no ring. empty: the name of a relation with the
  * stream's columns and no rows, NULL when the host does not know the
- * columns. NULL when memory is out or a name is missing. */
-SpView *sp_view_new(const char *view, const char *stream, const char *memory,
-                    const char *empty);
+ * columns. */
+int sp_view_new(const char *view, const char *stream, const char *memory,
+                const char *empty, SpView **out, Report *report);
 void sp_view_free(SpView *v);
 
-/* Plan the text for a ticket (NULL: the store has none). files: for
- * each of the ticket's files, in order, the path of the file its
- * checkpoint belongs to (the checkpoint core's rule); NULL when the
- * ticket has none. ring_run: the run of the ring's rows, NULL for none.
- * window: as sp_view_seam. if_absent: as sp_ticket_is_stale.
- * keep_if_absent: the keep time of a ticket that names none. Returns
- * 0, or -1 when memory is out. */
+/* Plan the text for a ticket (NULL: the store has none); the report has
+ * the lines the look made. files: for each of the ticket's files, in
+ * order, the path of the file its checkpoint belongs to (the checkpoint
+ * core's rule); NULL when the ticket has none. ring_run: the run of the
+ * ring's rows, NULL for none. window: as sp_view_seam. if_absent: as
+ * sp_ticket_is_stale. keep_if_absent: the keep time of a ticket that
+ * names none. */
 int sp_view_plan(SpView *v, const SpTicket *t, const char *const *files,
-                 const char *ring_run, const int64_t *window, double now,
-                 double mono, double if_absent, double keep_if_absent,
-                 SpViewPlan *out);
+                 const char *ring_run, const int64_t *window,
+                 double if_absent, double keep_if_absent, SpViewPlan *out,
+                 Report *report);
 
 /* ROW IDS. A view made with row ids has two more columns, which
  * together name a row of the stream for good:
@@ -694,19 +699,20 @@ int sp_view_plan(SpView *v, const SpTicket *t, const char *const *files,
 #define SP_ROW_ID_ROW "sp_run_row_number"
 void sp_view_set_row_ids(SpView *v, int on);
 
-/* The statement that makes a view named `view` of the ring alone, with
- * row ids, from the ring's relation `memory` (as above): sp_free it.
- * NULL when memory is out or a name is missing. */
-char *sp_view_live_sql(const char *view, const char *memory);
+/* The statement, in *out, that makes a view named `view` of the ring
+ * alone, with row ids, from the ring's relation `memory` (as above):
+ * sp_free it. */
+int sp_view_live_sql(const char *view, const char *memory, char **out,
+                     Report *report);
 
 /* The catalog version the plan names (SP_CATALOG_EXACT), else NULL. */
 const char *sp_view_catalog_etag(const SpView *v);
 
-/* The statement that makes the planned view: sp_free it. catalog: the
- * name the host attached the catalog under, NULL for none. NULL with
- * the reason in err when there is nothing to read the columns from. */
-char *sp_view_sql(const SpView *v, const char *catalog, char *err,
-                  size_t errlen);
+/* The statement, in *out, that makes the planned view: sp_free it.
+ * catalog: the name the host attached the catalog under, NULL for none.
+ * REPORT_REFUSED when there is nothing to read the columns from. */
+int sp_view_sql(const SpView *v, const char *catalog, char **out,
+                Report *report);
 
 /* The host ran the statement. */
 void sp_view_built(SpView *v);
@@ -720,15 +726,17 @@ const char *sp_view_ring_note(const SpView *v);
 /* Seconds until the next look: a live writer's next write of the
  * ticket and a margin, never under SP_VIEW_POLL_MIN_SECONDS; with no
  * live writer, SP_VIEW_POLL_DEFAULT_SECONDS. */
-double sp_view_wait_seconds(const SpView *v, double now);
+double sp_view_wait_seconds(const SpView *v);
 
-/* A look failed (why: the host's error): returns the seconds to wait
- * before the next. sp_view_followed: a look worked. */
-double sp_view_failed(SpView *v, const char *why);
-void sp_view_followed(SpView *v);
+/* A look failed (why: the host's error): *wait_seconds is how long to
+ * wait before the next, and the first failure of a row of them puts an
+ * error line in the report. sp_view_followed: a look worked; after
+ * failures the report gets one line that says so. */
+int sp_view_failed(SpView *v, const char *why, double *wait_seconds,
+                   Report *report);
+int sp_view_followed(SpView *v, Report *report);
 
-/* As sp_reader_message. */
-int sp_view_message(SpView *v, char *msg, size_t msglen);
+
 
 /* THE CATALOG
  *
@@ -769,46 +777,52 @@ int sp_view_message(SpView *v, char *msg, size_t msglen);
  */
 typedef struct SpCatalog SpCatalog;
 
-/* The length of the footer of a parquet file, from the file's last 8
- * bytes or more (`tail`, `len`): the footer is the `length` bytes
- * before those 8. -1 with the reason for bytes that do not end a
- * parquet file. */
-int64_t sp_parquet_footer_length(const uint8_t *tail, size_t len,
-                                 char *err, size_t errlen);
+/* The length, in *out, of the footer of a parquet file, from the file's
+ * last 8 bytes or more (`tail`, `len`): the footer is that many bytes
+ * before those 8. REPORT_REFUSED for bytes that do not end a parquet
+ * file. */
+int sp_parquet_footer_length(const uint8_t *tail, size_t len, int64_t *out,
+                             Report *report);
 
-/* A catalog from the bytes the store holds; len 0: a new one. data_path:
- * the stream's folder in the store, ending in '/'. now: the host's wall
- * clock. NULL with the reason for bytes that are not a stream's catalog. */
-SpCatalog *sp_catalog_open(const uint8_t *bytes, size_t len,
-                           const char *data_path, double now,
-                           char *err, size_t errlen);
+/* A catalog, in *out, from the bytes the store holds; len 0: a new one.
+ * data_path: the stream's folder in the store, ending in '/'.
+ * REPORT_REFUSED for bytes that are not a stream's catalog. */
+int sp_catalog_open(const uint8_t *bytes, size_t len, const char *data_path,
+                    SpCatalog **out, Report *report);
 void sp_catalog_free(SpCatalog *c);
 
 /* 1 when the catalog lists the file of this full path. */
 int sp_catalog_lists(const SpCatalog *c, const char *path);
 
-/* How many files the catalog lists, and the path of the index-th (from
- * 0): sp_free it; NULL past the last. */
+/* How many files the catalog lists, and the path, in *out, of the
+ * index-th (from 0): sp_free it. REPORT_INVALID past the last. */
 int64_t sp_catalog_files(const SpCatalog *c);
-char *sp_catalog_file(const SpCatalog *c, int64_t index);
+int sp_catalog_file(const SpCatalog *c, int64_t index, char **out,
+                    Report *report);
 
 /* List a finished file. footer: the footer's bytes (not the 8 after
- * it). A file already listed is left as it is. Returns 0, or -1 with
- * the reason; a refused file changes nothing. */
+ * it). A file already listed is left as it is. A refused file
+ * (REPORT_REFUSED, REPORT_UNSUPPORTED) changes nothing. */
 int sp_catalog_add(SpCatalog *c, const char *path, int64_t file_size,
                    const uint8_t *footer, size_t footer_len,
-                   char *err, size_t errlen);
+                   Report *report);
 
 /* Files added since the last sp_catalog_bytes. */
 int64_t sp_catalog_staged(const SpCatalog *c);
 
-/* The catalog as bytes, for the host to store: sp_free them. The files
- * added since the last call are in one snapshot, of the time `now`.
- * NULL with the reason on failure. */
-uint8_t *sp_catalog_bytes(SpCatalog *c, double now, size_t *out_len,
-                          char *err, size_t errlen);
+/* The catalog as bytes in *out, for the host to store: sp_free them.
+ * The files added since the last call are in one snapshot, of the time
+ * of this call. */
+int sp_catalog_bytes(SpCatalog *c, uint8_t **out, size_t *out_len,
+                     Report *report);
 
 void sp_free(void *p);
+
+/* FOR TESTS ONLY (report.h: TIME). fixed 1: from now on the core's wall
+ * clock is `wall` and its monotonic clock `mono`, until the next call.
+ * fixed 0: the system's clocks again. It changes the time for every
+ * thread of the process; library code does not call it. */
+void sp_test_set_clock(int fixed, double wall, double mono);
 
 #ifdef __cplusplus
 }
