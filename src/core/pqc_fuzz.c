@@ -12,7 +12,7 @@
  *                         starts from valid artifacts (built in-proc),
  *                         mutates them millions of times.
  */
-#include "pqc.h"
+#include "pqc_test_calls.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -20,7 +20,7 @@
 #ifdef FUZZ_READER
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   char err[512];
-  PqcReader *r = pqc_reader_open(data, size, err, sizeof err);
+  PqcReader *r = t_pqc_reader_open(data, size, err, sizeof err);
   if (r) {
     /* exercise every accessor on a "valid" (fuzz-accepted) object */
     (void)pqc_reader_name(r);
@@ -46,7 +46,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   const int64_t deltas[] = { 0, 1, -1, 4, 1000, (int64_t)1 << 40,
                              -((int64_t)1 << 40) };
   for (size_t i = 0; i < sizeof(deltas)/sizeof(deltas[0]); i++) {
-    uint8_t *out = pqc_shift_footer(data, size, deltas[i], &out_len,
+    uint8_t *out = t_pqc_shift_footer(data, size, deltas[i], &out_len,
                                     err, sizeof err);
     if (out) pqc_free(out);
   }
@@ -109,7 +109,7 @@ static void mutate(uint8_t *b, size_t n) {
 
 static void hit(const uint8_t *buf, size_t n) {
   char err[512];
-  PqcReader *r = pqc_reader_open(buf, n, err, sizeof err);
+  PqcReader *r = t_pqc_reader_open(buf, n, err, sizeof err);
   if (r) {
     (void)pqc_reader_name(r); (void)pqc_reader_watermark(r);
     uint32_t nc = pqc_reader_n_chunks(r);
@@ -121,7 +121,7 @@ static void hit(const uint8_t *buf, size_t n) {
     pqc_reader_free(r);
   }
   size_t ol = 0;
-  uint8_t *o = pqc_shift_footer(buf, n, (int64_t)xr() - 1000, &ol,
+  uint8_t *o = t_pqc_shift_footer(buf, n, (int64_t)xr() - 1000, &ol,
                                 err, sizeof err);
   if (o) pqc_free(o);
 }
@@ -139,7 +139,7 @@ int main(int argc, char **argv) {
   /* every unmutated seed must parse (accepted) */
   for (int i = 0; i < g_n; i++) {
     char err[512];
-    PqcReader *r = pqc_reader_open(g_seed[i], g_slen[i], err, sizeof err);
+    PqcReader *r = t_pqc_reader_open(g_seed[i], g_slen[i], err, sizeof err);
     if (r) { accepted_clean++; pqc_reader_free(r); }
   }
   for (long it = 0; it < iters; it++) {

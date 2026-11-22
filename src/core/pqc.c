@@ -14,11 +14,20 @@
 
 /* ---- errors ----------------------------------------------------------- */
 
-static void set_err(char *err, size_t errlen, const char *msg) {
-    if (err && errlen) {
-        strncpy(err, msg, errlen - 1);
-        err[errlen - 1] = '\0';
-    }
+/* How a call reports is report.h. Inside this file a function that
+ * fails calls set_err with the reason; the first reason of a call
+ * stays. The status is from the reason: no memory, a call the writer's
+ * state does not allow (set_invalid), or bytes that are not what they
+ * must be. */
+static void set_err(Report *report, const char *msg) {
+    if (report->status != REPORT_OK) return;
+    report_fail(report, strcmp(msg, "out of memory") == 0
+                ? REPORT_NO_MEMORY : REPORT_REFUSED, "%s", msg);
+}
+
+static void set_invalid(Report *report, const char *msg) {
+    if (report->status != REPORT_OK) return;
+    report_fail(report, REPORT_INVALID, "%s", msg);
 }
 
 /* ---- CRC-32 (IEEE, zlib-compatible) ----------------------------------- */
@@ -130,15 +139,14 @@ typedef struct {
     int64_t num_rows;
     int have_rows;
     /* error */
-    char *err;
-    size_t errlen;
+    Report *report;
     int failed;
 } T;
 
 static void t_fail(T *t, const char *msg) {
     if (!t->failed) {
         t->failed = 1;
-        set_err(t->err, t->errlen, msg);
+        set_err(t->report, msg);
     }
 }
 
@@ -372,18 +380,18 @@ static void copy_struct(T *t, int ctx) {
  * element slices and num_rows. Returns 0 or -1 (err set). */
 static int shift_fmd(const uint8_t *thrift, size_t len, int64_t delta,
                      Buf *out, Buf *rg_slices, uint32_t *rg_count,
-                     int64_t *num_rows, char *err, size_t errlen) {
+                     int64_t *num_rows, Report *report) {
     T t = { .in = thrift, .n = len, .out = out, .delta = delta,
-            .rg_slices = rg_slices, .err = err, .errlen = errlen };
+            .rg_slices = rg_slices, .report = report };
     copy_struct(&t, CTX_FMD);
     if (t.failed) return -1;
     if (t.i != t.n) {
-        set_err(err, errlen, "thrift: trailing bytes after FileMetaData "
+        set_err(report, "thrift: trailing bytes after FileMetaData "
                 "-- refusing to rebase a footer I don't fully understand");
         return -1;
     }
     if (!t.have_rows) {
-        set_err(err, errlen, "thrift: FileMetaData has no num_rows");
+        set_err(report, "thrift: FileMetaData has no num_rows");
         return -1;
     }
     if (rg_count) *rg_count = t.rg_count;
@@ -398,9 +406,9 @@ static int shift_fmd(const uint8_t *thrift, size_t len, int64_t delta,
 static int build_combined(const uint8_t *tpl, size_t tpl_len,
                           int64_t total_rows, const uint8_t *splice,
                           size_t splice_len, uint32_t splice_count,
-                          Buf *out, char *err, size_t errlen) {
+                          Buf *out, Report *report) {
     T t = { .in = tpl, .n = tpl_len, .out = out,
-            .err = err, .errlen = errlen };
+            .report = report };
     int64_t last_id = 0;
     int saw_rows = 0, saw_rgs = 0;
     for (;;) {
@@ -442,11 +450,11 @@ static int build_combined(const uint8_t *tpl, size_t tpl_len,
         buf_put(out, t.in + vstart, t.i - vstart);
     }
     if (t.i != t.n) {
-        set_err(err, errlen, "thrift: trailing bytes after template");
+        set_err(report, "thrift: trailing bytes after template");
         return -1;
     }
     if (!saw_rows || !saw_rgs) {
-        set_err(err, errlen, "thrift: template lacks num_rows/row_groups");
+        set_err(report, "thrift: template lacks num_rows/row_groups");
         return -1;
     }
     return 0;
@@ -460,15 +468,15 @@ static const uint8_t MAGIC[4] = { 'P', 'A', 'R', '1' };
 static int split_mini(const uint8_t *mini, size_t len,
                       const uint8_t **pages, size_t *pages_len,
                       const uint8_t **thrift, size_t *thrift_len,
-                      char *err, size_t errlen) {
+                      Report *report) {
     if (len < 12 || memcmp(mini, MAGIC, 4) != 0
         || memcmp(mini + len - 4, MAGIC, 4) != 0) {
-        set_err(err, errlen, "mini file: bad or missing PAR1 magic");
+        set_err(report, "mini file: bad or missing PAR1 magic");
         return -1;
     }
     uint32_t flen = rd_u32le(mini + len - 8);
     if ((size_t)flen + 12 > len) {
-        set_err(err, errlen, "mini file: footer length exceeds file");
+        set_err(report, "mini file: footer length exceeds file");
         return -1;
     }
     *pages = mini + 4;
@@ -570,19 +578,19 @@ struct PqcWriter {
     char pending_name[PQC_NAME_MAX];
 };
 
-PqcWriter *pqc_writer_new(const char *final_name, uint64_t chunk_bytes,
-                          char *err, size_t errlen) {
+static PqcWriter *writer_new(const char *final_name, uint64_t chunk_bytes,
+                             Report *report) {
     size_t nlen = strlen(final_name);
     if (nlen < 9 || strcmp(final_name + nlen - 8, ".parquet") != 0) {
-        set_err(err, errlen, "final_name must end in .parquet");
+        set_invalid(report, "final_name must end in .parquet");
         return NULL;
     }
     if (nlen + 16 > PQC_NAME_MAX) {
-        set_err(err, errlen, "final_name too long");
+        set_invalid(report, "final_name too long");
         return NULL;
     }
     PqcWriter *w = calloc(1, sizeof(*w));
-    if (!w) { set_err(err, errlen, "out of memory"); return NULL; }
+    if (!w) { set_err(report, "out of memory"); return NULL; }
     strcpy(w->name, final_name);
     w->chunk_bytes = chunk_bytes;
     w->logical_end = 4;
@@ -629,18 +637,18 @@ uint64_t pqc_logical_end(const PqcWriter *w) { return w->logical_end; }
 
 void pqc_drop_unfinished(PqcWriter *w) { drop_unfinished(w); }
 
-int64_t pqc_add_group(PqcWriter *w, const uint8_t *mini, size_t len,
-                      char *err, size_t errlen) {
+static int64_t add_group(PqcWriter *w, const uint8_t *mini, size_t len,
+                         Report *report) {
     const uint8_t *pages, *thrift;
     size_t pages_len, thrift_len;
     if (split_mini(mini, len, &pages, &pages_len, &thrift, &thrift_len,
-                   err, errlen))
+                   report))
         return -1;
     Buf footer = {0}, slices = {0};
     uint32_t rg_count = 0;
     int64_t rows = 0;
     if (shift_fmd(thrift, thrift_len, (int64_t)w->logical_end - 4,
-                  &footer, &slices, &rg_count, &rows, err, errlen)) {
+                  &footer, &slices, &rg_count, &rows, report)) {
         buf_free(&footer);
         buf_free(&slices);
         return -1;
@@ -648,7 +656,7 @@ int64_t pqc_add_group(PqcWriter *w, const uint8_t *mini, size_t len,
     if (w->n_groups == w->cap_groups) {
         size_t cap = w->cap_groups ? w->cap_groups * 2 : 16;
         Group *g = realloc(w->groups, cap * sizeof(Group));
-        if (!g) { set_err(err, errlen, "out of memory");
+        if (!g) { set_err(report, "out of memory");
                   buf_free(&footer); buf_free(&slices); return -1; }
         w->groups = g;
         w->cap_groups = cap;
@@ -656,7 +664,7 @@ int64_t pqc_add_group(PqcWriter *w, const uint8_t *mini, size_t len,
     Group *g = &w->groups[w->n_groups++];
     memset(g, 0, sizeof(*g));
     g->pages = malloc(pages_len ? pages_len : 1);
-    if (!g->pages) { set_err(err, errlen, "out of memory");
+    if (!g->pages) { set_err(report, "out of memory");
                      w->n_groups--; buf_free(&footer); buf_free(&slices);
                      return -1; }
     memcpy(g->pages, pages, pages_len);
@@ -716,21 +724,21 @@ void pqc_next_span(PqcWriter *w, uint64_t new_rows,
     *rows = w->span_rows;
 }
 
-int64_t pqc_add_unfinished(PqcWriter *w, const uint8_t *mini, size_t len,
-                           char *err, size_t errlen) {
+static int64_t add_unfinished(PqcWriter *w, const uint8_t *mini, size_t len,
+                              Report *report) {
     if (!w->span_set) {
-        set_err(err, errlen, "pqc_add_unfinished without pqc_next_span: "
+        set_invalid(report, "pqc_add_unfinished without pqc_next_span: "
                 "the core says which rows the object holds");
         return -1;
     }
     if (w->has_new) {
-        set_err(err, errlen, "an unfinished object is not stored yet");
+        set_invalid(report, "an unfinished object is not stored yet");
         return -1;
     }
     const uint8_t *pages, *thrift;
     size_t pages_len, thrift_len;
     if (split_mini(mini, len, &pages, &pages_len, &thrift, &thrift_len,
-                   err, errlen))
+                   report))
         return -1;
     uint64_t pos = w->logical_end;
     for (size_t i = 0; i < w->span_from; i++) pos += w->unf[i].pages_len;
@@ -738,13 +746,13 @@ int64_t pqc_add_unfinished(PqcWriter *w, const uint8_t *mini, size_t len,
     uint32_t rg_count = 0;
     int64_t rows = 0;
     if (shift_fmd(thrift, thrift_len, (int64_t)pos - 4, &footer, &slices,
-                  &rg_count, &rows, err, errlen)) {
+                  &rg_count, &rows, report)) {
         buf_free(&footer);
         buf_free(&slices);
         return -1;
     }
     if ((uint64_t)rows != w->span_rows) {
-        set_err(err, errlen, "the unfinished object does not hold the "
+        set_err(report, "the unfinished object does not hold the "
                 "rows pqc_next_span asked for");
         buf_free(&footer);
         buf_free(&slices);
@@ -752,7 +760,7 @@ int64_t pqc_add_unfinished(PqcWriter *w, const uint8_t *mini, size_t len,
     }
     w->new_pages = malloc(pages_len ? pages_len : 1);
     if (!w->new_pages) {
-        set_err(err, errlen, "out of memory");
+        set_err(report, "out of memory");
         buf_free(&footer);
         buf_free(&slices);
         return -1;
@@ -836,17 +844,24 @@ static int cut_pending(PqcWriter *w) {
 }
 
 int pqc_next_object(PqcWriter *w, char name[PQC_NAME_MAX],
-                    const uint8_t **data, uint64_t *len, uint32_t *crc) {
+                    const uint8_t **data, uint64_t *len, uint32_t *crc,
+                    int *have, Report *report) {
+    if (!report_begin(report)) return REPORT_INVALID;
+    if (!w || !name || !data || !len || !crc || !have)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_next_object: a NULL argument");
+    *have = 0;
     if (w->pending_kind == PEND_NONE && cut_pending(w)) {
         w->pending_kind = PEND_NONE;
-        return -1;
+        return report_fail(report, REPORT_NO_MEMORY, "out of memory");
     }
-    if (w->pending_kind == PEND_NONE) return 0;
+    if (w->pending_kind == PEND_NONE) return REPORT_OK;
     memcpy(name, w->pending_name, PQC_NAME_MAX);
     *data = w->pending.p;
     *len = w->pending.len;
     *crc = w->pending_crc;
-    return 1;
+    *have = 1;
+    return REPORT_OK;
 }
 
 void pqc_object_stored(PqcWriter *w) {
@@ -905,7 +920,7 @@ void pqc_object_stored(PqcWriter *w) {
 static uint8_t *encode_ckpt(const char *name, uint64_t watermark,
                             const ManEntry *man, size_t n_man,
                             const uint8_t *data, size_t data_len,
-                            uint64_t *out_len, char *err, size_t errlen) {
+                            uint64_t *out_len, Report *report) {
     Buf body = {0};
     size_t nlen = strlen(name);
     buf_u16le(&body, (uint16_t)nlen);
@@ -926,7 +941,7 @@ static uint8_t *encode_ckpt(const char *name, uint64_t watermark,
         buf_u32le(&body, man[i].crc);
     }
     if (buf_put(&body, data, data_len)) {
-        set_err(err, errlen, "out of memory");
+        set_err(report, "out of memory");
         buf_free(&body);
         return NULL;
     }
@@ -935,7 +950,7 @@ static uint8_t *encode_ckpt(const char *name, uint64_t watermark,
     buf_byte(&out, PQC_VERSION);
     buf_u32le(&out, pqc_crc32(body.p, body.len));
     if (buf_put(&out, body.p, body.len)) {
-        set_err(err, errlen, "out of memory");
+        set_err(report, "out of memory");
         buf_free(&body);
         buf_free(&out);
         return NULL;
@@ -945,33 +960,33 @@ static uint8_t *encode_ckpt(const char *name, uint64_t watermark,
     return out.p;
 }
 
-uint8_t *pqc_build_checkpoint(PqcWriter *w, const uint8_t *empty_mini,
-                              size_t empty_len, uint64_t *out_len,
-                              uint64_t *out_watermark,
-                              char *err, size_t errlen) {
+static uint8_t *build_checkpoint(PqcWriter *w, const uint8_t *empty_mini,
+                                 size_t empty_len, uint64_t *out_len,
+                                 uint64_t *out_watermark,
+                                 Report *report) {
     if (owes_object(w)) {
-        set_err(err, errlen, "an object is not stored -- a checkpoint "
+        set_invalid(report, "an object is not stored -- a checkpoint "
                 "must never claim bytes that are not durable");
         return NULL;
     }
     /* No object at all: the mini file IS the data region. */
     if (w->n_groups == 0 && w->n_man == 0 && w->n_unf == 0) {
         if (!empty_mini) {
-            set_err(err, errlen, "empty writer: pass an (empty) parquet "
+            set_invalid(report, "empty writer: pass an (empty) parquet "
                     "file for a zero-row checkpoint");
             return NULL;
         }
         const uint8_t *tp, *tt;
         size_t tpl_, ttl;
         if (split_mini(empty_mini, empty_len, &tp, &tpl_, &tt, &ttl,
-                       err, errlen))
+                       report))
             return NULL;
         int64_t trows = 0;
-        if (shift_fmd(tt, ttl, 0, NULL, NULL, NULL, &trows, err, errlen))
+        if (shift_fmd(tt, ttl, 0, NULL, NULL, NULL, &trows, report))
             return NULL;
         uint8_t *ck = encode_ckpt(w->name, (uint64_t)trows, w->man, 0,
                                   empty_mini, empty_len, out_len,
-                                  err, errlen);
+                                  report);
         if (ck && out_watermark) *out_watermark = (uint64_t)trows;
         return ck;
     }
@@ -981,7 +996,7 @@ uint8_t *pqc_build_checkpoint(PqcWriter *w, const uint8_t *empty_mini,
     ManEntry *list = malloc((n_list ? n_list : 1) * sizeof(ManEntry));
     Buf splice = {0}, footer = {0}, data = {0};
     uint8_t *ck = NULL;
-    if (!list) { set_err(err, errlen, "out of memory"); return NULL; }
+    if (!list) { set_err(report, "out of memory"); return NULL; }
     size_t at = 0;
     for (size_t i = 0; i < w->n_man; i++) list[at++] = w->man[i];
     for (size_t i = w->first_loose; i < w->n_groups; i++)
@@ -1001,14 +1016,14 @@ uint8_t *pqc_build_checkpoint(PqcWriter *w, const uint8_t *empty_mini,
         total_rows += w->unf[i].rows;
     }
     if (build_combined(w->tpl, w->tpl_len, total_rows, splice.p,
-                       splice.len, total_rg, &footer, err, errlen))
+                       splice.len, total_rg, &footer, report))
         goto done;
     if (buf_put(&data, footer.p, footer.len)
         || buf_u32le(&data, (uint32_t)footer.len)
         || buf_put(&data, MAGIC, 4))
         goto oom;
     ck = encode_ckpt(w->name, (uint64_t)total_rows, list, n_list, data.p,
-                     data.len, out_len, err, errlen);
+                     data.len, out_len, report);
     if (ck) {
         if (out_watermark) *out_watermark = (uint64_t)total_rows;
         /* each unfinished object has cost its footer entry once more */
@@ -1017,7 +1032,7 @@ uint8_t *pqc_build_checkpoint(PqcWriter *w, const uint8_t *empty_mini,
     }
     goto done;
 oom:
-    set_err(err, errlen, "out of memory");
+    set_err(report, "out of memory");
 done:
     free(list);
     buf_free(&splice);
@@ -1036,18 +1051,18 @@ struct PqcReader {
     uint64_t data_offset, data_len;
 };
 
-PqcReader *pqc_reader_open(const uint8_t *ckpt, size_t len,
-                           char *err, size_t errlen) {
+static PqcReader *reader_open(const uint8_t *ckpt, size_t len,
+                              Report *report) {
     if (len < 9 || memcmp(ckpt, "PQC2", 4) != 0) {
-        set_err(err, errlen, "bad checkpoint magic");
+        set_err(report, "bad checkpoint magic");
         return NULL;
     }
     if (ckpt[4] != PQC_VERSION) {
-        set_err(err, errlen, "unsupported checkpoint version");
+        set_err(report, "unsupported checkpoint version");
         return NULL;
     }
     if (pqc_crc32(ckpt + 9, len - 9) != rd_u32le(ckpt + 5)) {
-        set_err(err, errlen, "checkpoint CRC mismatch -- corrupt, refusing");
+        set_err(report, "checkpoint CRC mismatch -- corrupt, refusing");
         return NULL;
     }
     const uint8_t *p = ckpt + 9, *end = ckpt + len;
@@ -1056,7 +1071,7 @@ PqcReader *pqc_reader_open(const uint8_t *ckpt, size_t len,
     p += 2;
     if (nlen >= PQC_NAME_MAX || p + nlen + 8 + 8 + 4 > end) goto trunc;
     PqcReader *r = calloc(1, sizeof(*r));
-    if (!r) { set_err(err, errlen, "out of memory"); return NULL; }
+    if (!r) { set_err(report, "out of memory"); return NULL; }
     memcpy(r->name, p, nlen);
     p += nlen;
     r->watermark = rd_u64le(p); p += 8;
@@ -1064,7 +1079,7 @@ PqcReader *pqc_reader_open(const uint8_t *ckpt, size_t len,
     r->n_man = rd_u32le(p); p += 4;
     if (r->n_man) {
         r->man = calloc(r->n_man, sizeof(ManEntry));
-        if (!r->man) { free(r); set_err(err, errlen, "out of memory");
+        if (!r->man) { free(r); set_err(report, "out of memory");
                        return NULL; }
     }
     for (uint32_t i = 0; i < r->n_man; i++) {
@@ -1078,7 +1093,7 @@ PqcReader *pqc_reader_open(const uint8_t *ckpt, size_t len,
         r->man[i].crc = rd_u32le(p); p += 4;
     }
     if (r->data_offset != (uint64_t)(p - ckpt)) {
-        set_err(err, errlen, "checkpoint data_offset inconsistent");
+        set_err(report, "checkpoint data_offset inconsistent");
         pqc_reader_free(r);
         return NULL;
     }
@@ -1087,7 +1102,7 @@ PqcReader *pqc_reader_open(const uint8_t *ckpt, size_t len,
 trunc_r:
     pqc_reader_free(r);
 trunc:
-    set_err(err, errlen, "checkpoint truncated");
+    set_err(report, "checkpoint truncated");
     return NULL;
 }
 
@@ -1116,19 +1131,86 @@ void pqc_reader_data(const PqcReader *r, uint64_t *offset,
     *length = r->data_len;
 }
 
+/* ---- the public calls that report (report.h) -------------------------- */
+
+/* The status of a call whose work is done: a failure that gave no
+ * reason (memory ran out while a buffer grew) gets one. */
+static int unsaid(Report *report, int worked) {
+    if (!worked && report->status == REPORT_OK)
+        report_fail(report, REPORT_NO_MEMORY, "out of memory");
+    return report->status;
+}
+
+int pqc_writer_new(const char *final_name, uint64_t chunk_bytes,
+                   PqcWriter **out, Report *report) {
+    if (!report_begin(report)) return REPORT_INVALID;
+    if (!final_name || !out)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_writer_new: a NULL argument");
+    *out = writer_new(final_name, chunk_bytes, report);
+    return unsaid(report, *out != NULL);
+}
+
+int pqc_add_group(PqcWriter *w, const uint8_t *mini, size_t len,
+                  int64_t *rows, Report *report) {
+    if (!report_begin(report)) return REPORT_INVALID;
+    if (!w || (!mini && len) || !rows)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_add_group: a NULL argument");
+    int64_t n = add_group(w, mini, len, report);
+    if (n >= 0) *rows = n;
+    return unsaid(report, n >= 0);
+}
+
+int pqc_add_unfinished(PqcWriter *w, const uint8_t *mini, size_t len,
+                       int64_t *rows, Report *report) {
+    if (!report_begin(report)) return REPORT_INVALID;
+    if (!w || (!mini && len) || !rows)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_add_unfinished: a NULL argument");
+    int64_t n = add_unfinished(w, mini, len, report);
+    if (n >= 0) *rows = n;
+    return unsaid(report, n >= 0);
+}
+
+int pqc_build_checkpoint(PqcWriter *w, const uint8_t *empty_mini,
+                         size_t empty_len, uint8_t **out, uint64_t *out_len,
+                         uint64_t *out_watermark, Report *report) {
+    if (!report_begin(report)) return REPORT_INVALID;
+    if (!w || !out || !out_len)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_build_checkpoint: a NULL argument");
+    *out = build_checkpoint(w, empty_mini, empty_len, out_len,
+                            out_watermark, report);
+    return unsaid(report, *out != NULL);
+}
+
+int pqc_reader_open(const uint8_t *ckpt, size_t len, PqcReader **out,
+                    Report *report) {
+    if (!report_begin(report)) return REPORT_INVALID;
+    if ((!ckpt && len) || !out)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_reader_open: a NULL argument");
+    *out = reader_open(ckpt, len, report);
+    return unsaid(report, *out != NULL);
+}
+
 /* ---- test hook -------------------------------------------------------- */
 
-uint8_t *pqc_shift_footer(const uint8_t *thrift, size_t len,
-                          int64_t delta, size_t *out_len,
-                          char *err, size_t errlen) {
-    Buf out = {0};
-    if (shift_fmd(thrift, len, delta, &out, NULL, NULL, NULL,
-                  err, errlen)) {
-        buf_free(&out);
-        return NULL;
+int pqc_shift_footer(const uint8_t *thrift, size_t len, int64_t delta,
+                     uint8_t **out, size_t *out_len, Report *report) {
+    if (!report_begin(report)) return REPORT_INVALID;
+    if ((!thrift && len) || !out || !out_len)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_shift_footer: a NULL argument");
+    Buf buf = {0};
+    if (shift_fmd(thrift, len, delta, &buf, NULL, NULL, NULL, report)) {
+        buf_free(&buf);
+        return unsaid(report, 0);
     }
-    *out_len = out.len;
-    return out.p;
+    *out = buf.p;
+    *out_len = buf.len;
+    return REPORT_OK;
 }
 
 void pqc_free(void *p) { free(p); }

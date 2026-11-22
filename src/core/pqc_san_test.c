@@ -11,7 +11,7 @@
  * hammers the allocation, recursion, and bounds paths.
  */
 
-#include "pqc.h"
+#include "pqc_test_calls.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -146,11 +146,11 @@ int main(void) {
         /* shift is canonicalize+drop on first application; after that,
          * shifting by d then -d must reproduce the delta-0 form */
         size_t o0, o1, o2;
-        uint8_t *s0 = pqc_shift_footer(th, flen, 0, &o0, err, 512);
+        uint8_t *s0 = t_pqc_shift_footer(th, flen, 0, &o0, err, 512);
         assert(s0);
-        uint8_t *s1 = pqc_shift_footer(th, flen, 5000, &o1, err, 512);
+        uint8_t *s1 = t_pqc_shift_footer(th, flen, 5000, &o1, err, 512);
         assert(s1);
-        uint8_t *s2 = pqc_shift_footer(s1, o1, -5000, &o2, err, 512);
+        uint8_t *s2 = t_pqc_shift_footer(s1, o1, -5000, &o2, err, 512);
         assert(s2);
         assert(o2 == o0 && memcmp(s2, s0, o0) == 0);
         pqc_free(s0);
@@ -160,7 +160,7 @@ int main(void) {
 
     /* writer soak: many lifecycles, random sizes, chunk drains */
     for (int iter = 0; iter < 300; iter++) {
-        PqcWriter *w = pqc_writer_new("soak.parquet",
+        PqcWriter *w = t_pqc_writer_new("soak.parquet",
                                       1024 + rnd() % 8192, err, 512);
         assert(w);
         char name[PQC_NAME_MAX];
@@ -174,22 +174,22 @@ int main(void) {
             int nrg = 1 + (int)(rnd() % 3);
             size_t n = mini_file(mini, pages, nrg, 1 + (int)(rnd() % 6),
                                  (int64_t)(rnd() % 500));
-            int64_t rows = pqc_add_group(w, mini, n, err, 512);
+            int64_t rows = t_pqc_add_group(w, mini, n, err, 512);
             assert(rows >= 0);
             /* a checkpoint may not claim what is not stored */
             if (rnd() % 5 == 0) {
                 uint64_t cl0, wm0;
-                assert(pqc_build_checkpoint(w, NULL, 0, &cl0, &wm0,
+                assert(t_pqc_build_checkpoint(w, NULL, 0, &cl0, &wm0,
                                             err, 512) == NULL);
             }
             /* drain */
-            while ((rc = pqc_next_object(w, name, &data, &len, &crc)) == 1) {
+            while ((rc = t_pqc_next_object(w, name, &data, &len, &crc)) == 1) {
                 assert(pqc_crc32(data, len) == crc);
                 if (rnd() % 4 == 0) {          /* failed store: retry   */
                     const uint8_t *d2;
                     uint64_t l2;
                     uint32_t c2;
-                    assert(pqc_next_object(w, name, &d2, &l2, &c2) == 1);
+                    assert(t_pqc_next_object(w, name, &d2, &l2, &c2) == 1);
                     assert(l2 == len && c2 == crc);
                 }
                 assert(n_store < 2048);
@@ -214,17 +214,17 @@ int main(void) {
                 if (rnd() % 7 == 0) {          /* the wrong rows: refused */
                     size_t bad = mini_file(mini, 100, 1, 2,
                                            (int64_t)span + 1);
-                    assert(pqc_add_unfinished(w, mini, bad, err, 512) < 0);
+                    assert(t_pqc_add_unfinished(w, mini, bad, err, 512) < 0);
                     tn = mini_file(mini, 100 + rnd() % 500, 1, 2,
                                    (int64_t)span);
                 }
-                assert(pqc_add_unfinished(w, mini, tn, err, 512)
+                assert(t_pqc_add_unfinished(w, mini, tn, err, 512)
                        == (int64_t)span);
                 uint64_t cl, wm;
-                assert(pqc_build_checkpoint(w, NULL, 0, &cl, &wm, err, 512)
+                assert(t_pqc_build_checkpoint(w, NULL, 0, &cl, &wm, err, 512)
                        == NULL);               /* its object is not stored */
                 int stored = 0;
-                while ((rc = pqc_next_object(w, name, &data, &len, &crc))
+                while ((rc = t_pqc_next_object(w, name, &data, &len, &crc))
                        == 1) {
                     assert(pqc_crc32(data, len) == crc);
                     assert(n_store < 2048);
@@ -235,11 +235,11 @@ int main(void) {
                 }
                 assert(rc == 0 && stored == 1);
                 assert(pqc_rows_unfinished(w) == unfinished);
-                uint8_t *ck = pqc_build_checkpoint(w, NULL, 0, &cl, &wm,
+                uint8_t *ck = t_pqc_build_checkpoint(w, NULL, 0, &cl, &wm,
                                                    err, 512);
                 assert(ck);
                 assert(wm == pqc_rows_final(w) + unfinished);
-                PqcReader *r = pqc_reader_open(ck, cl, err, 512);
+                PqcReader *r = t_pqc_reader_open(ck, cl, err, 512);
                 assert(r);
                 assert(strcmp(pqc_reader_name(r), "soak.parquet") == 0);
                 assert(pqc_reader_n_chunks(r) >= pqc_chunks_cut(w) + 1);
@@ -248,7 +248,7 @@ int main(void) {
                 assert(off + dl == cl);
                 /* corrupt copy must refuse */
                 ck[cl / 2] ^= 0xFF;
-                assert(pqc_reader_open(ck, cl, err, 512) == NULL);
+                assert(t_pqc_reader_open(ck, cl, err, 512) == NULL);
                 pqc_reader_free(r);
                 pqc_free(ck);
             }
@@ -259,7 +259,7 @@ int main(void) {
         }
         pqc_drop_unfinished(w);
         uint64_t cl, wm;
-        uint8_t *ck = pqc_build_checkpoint(w, NULL, 0, &cl, &wm, err, 512);
+        uint8_t *ck = t_pqc_build_checkpoint(w, NULL, 0, &cl, &wm, err, 512);
         assert(ck && wm == pqc_rows_final(w));
         pqc_free(ck);
         pqc_writer_free(w);
@@ -267,11 +267,11 @@ int main(void) {
     }
 
     /* refusals */
-    assert(pqc_writer_new("nope.txt", 1024, err, 512) == NULL);
+    assert(t_pqc_writer_new("nope.txt", 1024, err, 512) == NULL);
     {
-        PqcWriter *w = pqc_writer_new("e.parquet", 1024, err, 512);
+        PqcWriter *w = t_pqc_writer_new("e.parquet", 1024, err, 512);
         uint64_t cl, wm;
-        assert(pqc_build_checkpoint(w, NULL, 0, &cl, &wm, err, 512)
+        assert(t_pqc_build_checkpoint(w, NULL, 0, &cl, &wm, err, 512)
                == NULL);                        /* no rows: needs a mini */
         pqc_writer_free(w);
     }

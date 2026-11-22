@@ -171,11 +171,12 @@ public:
 		handle->checkpoint = ReadCheckpoint(*handle->raw_fs, raw, opener);
 		auto &blob = handle->checkpoint->bytes;
 
-		char err[256] = {0};
-		PqcReader *r = pqc_reader_open(blob.data(), blob.size(), err,
-		                               sizeof(err));
-		if (!r) {
-			throw IOException("checkpoint %s: refused: %s", raw, err);
+		// how the core reports is src/core/report.h: a status, and the
+		// reason in the report this call passed
+		Report report;
+		PqcReader *r = nullptr;
+		if (pqc_reader_open(blob.data(), blob.size(), &r, &report) != REPORT_OK) {
+			throw IOException("checkpoint %s: refused: %s", raw, report.error);
 		}
 		// the checkpoint records its own file name; the object is one
 		// version of that file's checkpoint, <name>.<version>.ckpt

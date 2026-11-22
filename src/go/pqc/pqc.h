@@ -62,8 +62,15 @@
  * Dependencies: libc only. Not thread-safe per writer/reader (one
  * owner each, like a file handle). All returned buffers are malloc'd
  * and freed with pqc_free(). All multi-byte integers in the formats
- * are little-endian. Errors are LOUD: calls return NULL/negative and
- * write a message into the caller's err buffer; nothing is guessed.
+ * are little-endian.
+ *
+ * How a function reports is in report.h, the same for the three cores:
+ * a function that can fail returns a status and takes a Report as its
+ * last parameter; what it makes comes back through an output parameter.
+ * Errors are LOUD: nothing is guessed. REPORT_REFUSED: bytes that are
+ * not what they must be (a mini file, a checkpoint). REPORT_INVALID: a
+ * call the writer's state does not allow, or a NULL argument. This core
+ * reads no clock and has no lines for the log.
  */
 
 #ifndef PQC_H
@@ -71,6 +78,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
+#include "report.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -91,16 +100,16 @@ typedef struct PqcWriter PqcWriter;
 /* final_name must end in ".parquet". chunk_bytes is the cut threshold
  * (>= 5 MiB when the host stores on S3 -- the host enforces its sink's
  * part minimum, the core doesn't know the sink). */
-PqcWriter *pqc_writer_new(const char *final_name, uint64_t chunk_bytes,
-                          char *err, size_t errlen);
+int pqc_writer_new(const char *final_name, uint64_t chunk_bytes,
+                   PqcWriter **out, Report *report);
 void pqc_writer_free(PqcWriter *w);
 
 /* Append one final row group (or several: the mini file may hold more
  * than one). mini = a complete parquet file whose offsets count from
  * 0. It replaces every unfinished object: the final group holds their
- * rows. Returns rows added, or -1 (err filled). */
-int64_t pqc_add_group(PqcWriter *w, const uint8_t *mini, size_t len,
-                      char *err, size_t errlen);
+ * rows. *rows: the rows added. */
+int pqc_add_group(PqcWriter *w, const uint8_t *mini, size_t len,
+                  int64_t *rows, Report *report);
 
 /* A checkpoint is due, and new_rows rows are in no object yet. Fills
  * the rows the host must encode as ONE row group, as rows of the file:
@@ -114,17 +123,17 @@ void pqc_next_span(PqcWriter *w, uint64_t new_rows,
 /* The span of the last pqc_next_span, encoded: a complete parquet
  * file of exactly those rows. The object replaces the unfinished
  * objects from the span's first row on, once the host has stored it.
- * Returns its rows, or -1 (err filled). */
-int64_t pqc_add_unfinished(PqcWriter *w, const uint8_t *mini, size_t len,
-                           char *err, size_t errlen);
+ * *rows: its rows. */
+int pqc_add_unfinished(PqcWriter *w, const uint8_t *mini, size_t len,
+                       int64_t *rows, Report *report);
 
 /* Forget the unfinished objects: the next checkpoint claims the final
  * rows only. */
 void pqc_drop_unfinished(PqcWriter *w);
 
 /* Object drain loop. pqc_next_object presents the next object to
- * store: returns 1 and fills name/data/len/crc, or 0 when none is
- * owed, or -1 on error. The SAME object is presented again until the
+ * store: *have is 1 and name/data/len/crc are filled, or *have is 0
+ * when none is owed. The SAME object is presented again until the
  * host acknowledges the store with pqc_object_stored (retry after a
  * failed PUT = just call pqc_next_object again). data is valid until
  * the acknowledgment. The object is a chunk when the loose final
@@ -133,20 +142,20 @@ void pqc_drop_unfinished(PqcWriter *w);
  * unfinished object pqc_add_unfinished took. Object names are
  * "<final_name>.chunks/NNNNNN", numbered in the order made. */
 int pqc_next_object(PqcWriter *w, char name[PQC_NAME_MAX],
-                    const uint8_t **data, uint64_t *len, uint32_t *crc);
+                    const uint8_t **data, uint64_t *len, uint32_t *crc,
+                    int *have, Report *report);
 void pqc_object_stored(PqcWriter *w);
 
 /* Build THE checkpoint object: the list of the stored objects and the
  * footer of the whole. empty_mini is used only by a writer with no
  * rows at all: a complete (empty) parquet file, taken verbatim as the
- * data region; pass NULL otherwise. Returns malloc'd checkpoint bytes
- * (caller: pqc_free), or NULL (err filled). out_watermark = rows
- * covered. Calling this while pqc_next_object still owes an object is
- * an error: claims never precede durability. */
-uint8_t *pqc_build_checkpoint(PqcWriter *w, const uint8_t *empty_mini,
-                              size_t empty_len, uint64_t *out_len,
-                              uint64_t *out_watermark,
-                              char *err, size_t errlen);
+ * data region; pass NULL otherwise. *out: the malloc'd checkpoint
+ * bytes (caller: pqc_free). out_watermark = rows covered. Calling this
+ * while pqc_next_object still owes an object is an error
+ * (REPORT_INVALID): claims never precede durability. */
+int pqc_build_checkpoint(PqcWriter *w, const uint8_t *empty_mini,
+                         size_t empty_len, uint8_t **out, uint64_t *out_len,
+                         uint64_t *out_watermark, Report *report);
 
 /* Bookkeeping views. */
 uint64_t pqc_rows_final(const PqcWriter *w);      /* rows in final groups     */
@@ -158,9 +167,10 @@ uint64_t pqc_logical_end(const PqcWriter *w);     /* next final group's position
 
 typedef struct PqcReader PqcReader;
 
-/* Parse + validate (magic, version, CRC-32). NULL on refusal. */
-PqcReader *pqc_reader_open(const uint8_t *ckpt, size_t len,
-                           char *err, size_t errlen);
+/* Parse + validate (magic, version, CRC-32). REPORT_REFUSED for bytes
+ * that are not a checkpoint. */
+int pqc_reader_open(const uint8_t *ckpt, size_t len, PqcReader **out,
+                    Report *report);
 void pqc_reader_free(PqcReader *r);
 
 const char *pqc_reader_name(const PqcReader *r);
@@ -195,10 +205,9 @@ double pqc_dead_after(double beat_seconds);
 uint32_t pqc_crc32(const uint8_t *data, size_t len);
 
 /* Rebase a bare parquet footer's offsets by delta (exposed for tests:
- * byte-parity with the Python reference). Returns malloc'd bytes. */
-uint8_t *pqc_shift_footer(const uint8_t *thrift, size_t len,
-                          int64_t delta, size_t *out_len,
-                          char *err, size_t errlen);
+ * byte-parity with the Python reference). *out: malloc'd bytes. */
+int pqc_shift_footer(const uint8_t *thrift, size_t len, int64_t delta,
+                     uint8_t **out, size_t *out_len, Report *report);
 
 void pqc_free(void *p);
 

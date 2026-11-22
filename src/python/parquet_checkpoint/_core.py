@@ -29,28 +29,39 @@ _CORE_DIR = os.path.join(os.path.dirname(os.path.dirname(_PKG_DIR)), 'core')
 _LIB_PATH = os.path.join(_PKG_DIR, 'libpqc.dylib')
 
 NAME_MAX = 256                  # PQC_NAME_MAX
-_ERRLEN = 512
 
 ffi = cffi.FFI()
 _CDEF = """
+typedef struct {
+    int32_t level;
+    double wall;
+    double mono;
+    char text[1024];
+} ReportLine;
+typedef struct {
+    int32_t status;
+    int32_t lines;
+    int32_t dropped;
+    char error[512];
+    ReportLine line[4];
+} Report;
 typedef struct PqcWriter PqcWriter;
-PqcWriter *pqc_writer_new(const char *final_name, uint64_t chunk_bytes,
-                          char *err, size_t errlen);
+int pqc_writer_new(const char *final_name, uint64_t chunk_bytes,
+                   PqcWriter **out, Report *report);
 void pqc_writer_free(PqcWriter *w);
-int64_t pqc_add_group(PqcWriter *w, const uint8_t *mini, size_t len,
-                      char *err, size_t errlen);
+int pqc_add_group(PqcWriter *w, const uint8_t *mini, size_t len,
+                  int64_t *rows, Report *report);
 void pqc_next_span(PqcWriter *w, uint64_t new_rows,
                    uint64_t *first_row, uint64_t *rows);
-int64_t pqc_add_unfinished(PqcWriter *w, const uint8_t *mini, size_t len,
-                           char *err, size_t errlen);
+int pqc_add_unfinished(PqcWriter *w, const uint8_t *mini, size_t len,
+                       int64_t *rows, Report *report);
 void pqc_drop_unfinished(PqcWriter *w);
 int pqc_next_object(PqcWriter *w, char name[256], const uint8_t **data,
-                    uint64_t *len, uint32_t *crc);
+                    uint64_t *len, uint32_t *crc, int *have, Report *report);
 void pqc_object_stored(PqcWriter *w);
-uint8_t *pqc_build_checkpoint(PqcWriter *w, const uint8_t *empty_mini,
-                              size_t empty_len, uint64_t *out_len,
-                              uint64_t *out_watermark,
-                              char *err, size_t errlen);
+int pqc_build_checkpoint(PqcWriter *w, const uint8_t *empty_mini,
+                         size_t empty_len, uint8_t **out, uint64_t *out_len,
+                         uint64_t *out_watermark, Report *report);
 uint64_t pqc_rows_final(const PqcWriter *w);
 uint64_t pqc_rows_unfinished(const PqcWriter *w);
 uint32_t pqc_chunks_cut(const PqcWriter *w);
@@ -65,7 +76,7 @@ def _build_if_stale():
     """In a checkout, build the library from src/core into this package
     when a source is newer than it. An installed package has the
     library and no sources: nothing to do."""
-    sources = [os.path.join(_CORE_DIR, n) for n in ('pqc.c', 'pqc.h')]
+    sources = [os.path.join(_CORE_DIR, n) for n in ('pqc.c', 'pqc.h', 'report.h')]
     if not all(os.path.exists(s) for s in sources):
         if os.path.exists(_LIB_PATH):
             return
@@ -88,8 +99,9 @@ lib = ffi.dlopen(_LIB_PATH)
 # function for the first time waited on the lock its own thread held.
 for _name in sorted(set(re.findall(r"\b(pqc_\w+)\s*\(", _CDEF))):
     getattr(lib, _name)
-for _type in (f'char[{_ERRLEN}]', f'char[{NAME_MAX}]', 'const uint8_t **',
-              'uint64_t *', 'uint32_t *'):
+for _type in ('Report *', 'PqcWriter **', f'char[{NAME_MAX}]',
+              'const uint8_t **', 'uint8_t **', 'uint64_t *', 'int64_t *',
+              'uint32_t *', 'int *'):
     ffi.new(_type)
 
 
@@ -105,25 +117,35 @@ class CoreError(Exception):
 
 class Writer:
     """One PqcWriter. One owner at a time, like a file handle: the core
-    takes no lock."""
+    takes no lock. How a call reports is src/core/report.h: the writer
+    has one Report, and a status that is not 0 becomes a CoreError
+    (MemoryError for no memory) with the report's text."""
+
+    _NO_MEMORY = 4
 
     def __init__(self, final_name, chunk_bytes):
-        self._err = ffi.new(f'char[{_ERRLEN}]')
-        self._w = lib.pqc_writer_new(final_name.encode('utf-8'),
-                                     chunk_bytes, self._err, _ERRLEN)
-        if self._w == ffi.NULL:
-            raise CoreError(self._message())
+        self._report = ffi.new('Report *')
+        self._w = ffi.NULL
+        out = ffi.new('PqcWriter **')
+        self._check(lib.pqc_writer_new(final_name.encode('utf-8'),
+                                       chunk_bytes, out, self._report))
+        self._w = out[0]
 
-    def _message(self):
-        return ffi.string(self._err).decode('utf-8', 'replace')
+    def _check(self, rc):
+        if rc == 0:
+            return
+        text = ffi.string(self._report.error).decode('utf-8', 'replace')
+        if rc == self._NO_MEMORY:
+            raise MemoryError(text)
+        raise CoreError(text)
 
     def add_group(self, mini):
         """Append the final row group(s) of a complete parquet file.
         They replace every unfinished object. Returns the rows added."""
-        rows = lib.pqc_add_group(self._w, mini, len(mini), self._err, _ERRLEN)
-        if rows < 0:
-            raise CoreError(self._message())
-        return rows
+        rows = ffi.new('int64_t *')
+        self._check(lib.pqc_add_group(self._w, mini, len(mini), rows,
+                                      self._report))
+        return rows[0]
 
     def next_span(self, new_rows):
         """A checkpoint is due and new_rows rows are in no object yet:
@@ -137,11 +159,10 @@ class Writer:
     def add_unfinished(self, mini):
         """The span of the last next_span, as a complete parquet file.
         Returns its rows."""
-        rows = lib.pqc_add_unfinished(self._w, mini, len(mini), self._err,
-                                      _ERRLEN)
-        if rows < 0:
-            raise CoreError(self._message())
-        return rows
+        rows = ffi.new('int64_t *')
+        self._check(lib.pqc_add_unfinished(self._w, mini, len(mini), rows,
+                                           self._report))
+        return rows[0]
 
     def drop_unfinished(self):
         """Forget the unfinished objects: the next checkpoint claims
@@ -155,10 +176,10 @@ class Writer:
         data = ffi.new('const uint8_t **')
         length = ffi.new('uint64_t *')
         crc = ffi.new('uint32_t *')
-        rc = lib.pqc_next_object(self._w, name, data, length, crc)
-        if rc < 0:
-            raise CoreError("out of memory preparing an object")
-        if rc == 0:
+        have = ffi.new('int *')
+        self._check(lib.pqc_next_object(self._w, name, data, length, crc,
+                                        have, self._report))
+        if not have[0]:
             return None
         return (ffi.string(name).decode('utf-8'),
                 bytes(ffi.buffer(data[0], length[0])))
@@ -174,18 +195,19 @@ class Writer:
         rows, a complete empty parquet file; None otherwise."""
         n = ffi.new('uint64_t *')
         watermark = ffi.new('uint64_t *')
+        out = ffi.new('uint8_t **')
         if empty_mini is None:
-            p = lib.pqc_build_checkpoint(self._w, ffi.NULL, 0, n, watermark,
-                                         self._err, _ERRLEN)
+            rc = lib.pqc_build_checkpoint(self._w, ffi.NULL, 0, out, n,
+                                          watermark, self._report)
         else:
-            p = lib.pqc_build_checkpoint(self._w, empty_mini, len(empty_mini),
-                                         n, watermark, self._err, _ERRLEN)
-        if p == ffi.NULL:
-            raise CoreError(self._message())
+            rc = lib.pqc_build_checkpoint(self._w, empty_mini,
+                                          len(empty_mini), out, n, watermark,
+                                          self._report)
+        self._check(rc)
         try:
-            return bytes(ffi.buffer(p, n[0])), int(watermark[0])
+            return bytes(ffi.buffer(out[0], n[0])), int(watermark[0])
         finally:
-            lib.pqc_free(p)
+            lib.pqc_free(out[0])
 
     @property
     def rows_final(self):

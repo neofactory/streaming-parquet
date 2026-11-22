@@ -30,7 +30,7 @@ libsp: $(OUT)/libsp.dylib
 $(OUT)/libarrow_ring.dylib: arrow_ring.c arrow_ring.h
 	$(CC) $(CFLAGS) -shared -o $@ arrow_ring.c -lpthread
 
-$(OUT)/libpqc.dylib: pqc.c pqc.h
+$(OUT)/libpqc.dylib: pqc.c pqc.h report.h
 	$(CC) $(CFLAGS) -shared -o $@ pqc.c
 
 # The catalog (sp_catalog.c) is a SQLite database: the system's SQLite
@@ -45,7 +45,7 @@ san-arrow_ring: arrow_ring.c arrow_ring.h arrow_ring_san_test.c
 	$(CC) $(SAN) -o arrow_ring_san_test_bin arrow_ring.c arrow_ring_san_test.c -lpthread
 	./arrow_ring_san_test_bin
 
-san-pqc: pqc.c pqc.h pqc_san_test.c
+san-pqc: pqc.c pqc.h report.h pqc_test_calls.h pqc_san_test.c
 	$(CC) $(SAN) -o pqc_san_test_bin pqc.c pqc_san_test.c
 	./pqc_san_test_bin
 
@@ -65,7 +65,7 @@ fuzz: fuzz-pqc fuzz-sp
 
 # pqc's reader and footer shift take bytes from the store: real
 # checkpoints and footers (pqc_corpus/, made by make_corpus.py), mutated.
-fuzz-pqc: pqc.c pqc.h pqc_fuzz.c
+fuzz-pqc: pqc.c pqc.h report.h pqc_test_calls.h pqc_fuzz.c
 	$(CC) $(SAN) -DFUZZ_STANDALONE -o pqc_fuzz_bin pqc.c pqc_fuzz.c
 	python3 ../../tests/parquet_checkpoint/make_corpus.py
 	./pqc_fuzz_bin $${FUZZ_ITERS:-200000} pqc_corpus

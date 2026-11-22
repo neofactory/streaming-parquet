@@ -82,8 +82,10 @@ func CkptVersions(sink Sink, name string) ([]Version, error) {
 	return out, nil
 }
 
-func cerr(buf *[512]C.char) error {
-	return fmt.Errorf("%s", C.GoString(&buf[0]))
+// cerr is the error of a call into the core that failed: the reason in
+// the call's report (report.h).
+func cerr(r *C.Report) error {
+	return fmt.Errorf("%s", C.GoString(&r.error[0]))
 }
 
 func bytesPtr(b []byte) *C.uint8_t {
@@ -139,12 +141,12 @@ func NewWriter(name string, sink Sink, chunkBytes uint64, checkpointEveryWrite b
 	if len(left) > 0 {
 		return nil, fmt.Errorf("%s exists -- a previous writer crashed or is live; Finalize it first", left[len(left)-1].Object)
 	}
-	var eb [512]C.char
+	var r C.Report
 	cname := C.CString(name)
 	defer C.free(unsafe.Pointer(cname))
-	w := C.pqc_writer_new(cname, C.uint64_t(chunkBytes), &eb[0], 512)
-	if w == nil {
-		return nil, cerr(&eb)
+	var w *C.PqcWriter
+	if C.pqc_writer_new(cname, C.uint64_t(chunkBytes), &w, &r) != 0 {
+		return nil, cerr(&r)
 	}
 	return &Writer{name: name, sink: sink, w: w, auto: checkpointEveryWrite}, nil
 }
@@ -155,10 +157,10 @@ func NewWriter(name string, sink Sink, chunkBytes uint64, checkpointEveryWrite b
 // CheckpointTail stored of those rows. Every object is stored before
 // anything claims it.
 func (w *Writer) AddGroupMini(mini []byte) (int64, error) {
-	var eb [512]C.char
-	rows := C.pqc_add_group(w.w, bytesPtr(mini), C.size_t(len(mini)), &eb[0], 512)
-	if rows < 0 {
-		return 0, cerr(&eb)
+	var r C.Report
+	var rows C.int64_t
+	if C.pqc_add_group(w.w, bytesPtr(mini), C.size_t(len(mini)), &rows, &r) != 0 {
+		return 0, cerr(&r)
 	}
 	if err := w.storeObjects(); err != nil {
 		return 0, err
@@ -179,12 +181,13 @@ func (w *Writer) storeObjects() error {
 	var data *C.uint8_t
 	var length C.uint64_t
 	var crc C.uint32_t
+	var r C.Report
 	for {
-		rc := C.pqc_next_object(w.w, &name[0], &data, &length, &crc)
-		if rc < 0 {
-			return fmt.Errorf("pqc_next_object failed")
+		var have C.int
+		if C.pqc_next_object(w.w, &name[0], &data, &length, &crc, &have, &r) != 0 {
+			return cerr(&r)
 		}
-		if rc == 0 {
+		if have == 0 {
 			return nil
 		}
 		body := C.GoBytes(unsafe.Pointer(data), C.int(length))
@@ -209,10 +212,10 @@ func (w *Writer) NextSpan(newRows uint64) (firstRow, rows uint64) {
 // AddUnfinishedMini takes the span of the last NextSpan as a complete
 // mini parquet file of exactly those rows, and stores its object.
 func (w *Writer) AddUnfinishedMini(mini []byte) (int64, error) {
-	var eb [512]C.char
-	rows := C.pqc_add_unfinished(w.w, bytesPtr(mini), C.size_t(len(mini)), &eb[0], 512)
-	if rows < 0 {
-		return 0, cerr(&eb)
+	var r C.Report
+	var rows C.int64_t
+	if C.pqc_add_unfinished(w.w, bytesPtr(mini), C.size_t(len(mini)), &rows, &r) != 0 {
+		return 0, cerr(&r)
 	}
 	if err := w.storeObjects(); err != nil {
 		return 0, err
@@ -270,11 +273,11 @@ func (w *Writer) checkpoint(emptyMini []byte) (watermark uint64, err error) {
 	if err := w.storeObjects(); err != nil {
 		return 0, err
 	}
-	var eb [512]C.char
+	var rep C.Report
 	var n, wm C.uint64_t
-	p := C.pqc_build_checkpoint(w.w, bytesPtr(emptyMini), C.size_t(len(emptyMini)), &n, &wm, &eb[0], 512)
-	if p == nil {
-		return 0, cerr(&eb)
+	var p *C.uint8_t
+	if C.pqc_build_checkpoint(w.w, bytesPtr(emptyMini), C.size_t(len(emptyMini)), &p, &n, &wm, &rep) != 0 {
+		return 0, cerr(&rep)
 	}
 	ck := C.GoBytes(unsafe.Pointer(p), C.int(n))
 	C.pqc_free(unsafe.Pointer(p))
@@ -331,10 +334,10 @@ func (w *Writer) checkpoint(emptyMini []byte) (watermark uint64, err error) {
 
 // manifestNames is the set of objects a checkpoint object names.
 func manifestNames(ck []byte) (map[string]bool, error) {
-	var eb [512]C.char
-	r := C.pqc_reader_open(bytesPtr(ck), C.size_t(len(ck)), &eb[0], 512)
-	if r == nil {
-		return nil, cerr(&eb)
+	var rep C.Report
+	var r *C.PqcReader
+	if C.pqc_reader_open(bytesPtr(ck), C.size_t(len(ck)), &r, &rep) != 0 {
+		return nil, cerr(&rep)
 	}
 	defer C.pqc_reader_free(r)
 	names := map[string]bool{}
@@ -425,10 +428,10 @@ func OpenReader(ckptName string, sink Sink) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	var eb [512]C.char
-	r := C.pqc_reader_open(bytesPtr(raw), C.size_t(len(raw)), &eb[0], 512)
-	if r == nil {
-		return nil, cerr(&eb)
+	var rep C.Report
+	var r *C.PqcReader
+	if C.pqc_reader_open(bytesPtr(raw), C.size_t(len(raw)), &r, &rep) != 0 {
+		return nil, cerr(&rep)
 	}
 	defer C.pqc_reader_free(r)
 	rd := &Reader{

@@ -50,31 +50,43 @@ if r.returncode != 0:
 
 ffi = cffi.FFI()
 ffi.cdef("""
+typedef struct {
+    int32_t level;
+    double wall;
+    double mono;
+    char text[1024];
+} ReportLine;
+typedef struct {
+    int32_t status;
+    int32_t lines;
+    int32_t dropped;
+    char error[512];
+    ReportLine line[4];
+} Report;
 typedef struct PqcWriter PqcWriter;
 typedef struct PqcReader PqcReader;
-PqcWriter *pqc_writer_new(const char *final_name, uint64_t chunk_bytes,
-                          char *err, size_t errlen);
+int pqc_writer_new(const char *final_name, uint64_t chunk_bytes,
+                   PqcWriter **out, Report *report);
 void pqc_writer_free(PqcWriter *w);
-int64_t pqc_add_group(PqcWriter *w, const uint8_t *mini, size_t len,
-                      char *err, size_t errlen);
+int pqc_add_group(PqcWriter *w, const uint8_t *mini, size_t len,
+                  int64_t *rows, Report *report);
 void pqc_next_span(PqcWriter *w, uint64_t new_rows,
                    uint64_t *first_row, uint64_t *rows);
-int64_t pqc_add_unfinished(PqcWriter *w, const uint8_t *mini, size_t len,
-                           char *err, size_t errlen);
+int pqc_add_unfinished(PqcWriter *w, const uint8_t *mini, size_t len,
+                       int64_t *rows, Report *report);
 void pqc_drop_unfinished(PqcWriter *w);
 int pqc_next_object(PqcWriter *w, char name[256], const uint8_t **data,
-                    uint64_t *len, uint32_t *crc);
+                    uint64_t *len, uint32_t *crc, int *have, Report *report);
 void pqc_object_stored(PqcWriter *w);
-uint8_t *pqc_build_checkpoint(PqcWriter *w, const uint8_t *empty_mini,
-                              size_t empty_len, uint64_t *out_len,
-                              uint64_t *out_watermark,
-                              char *err, size_t errlen);
+int pqc_build_checkpoint(PqcWriter *w, const uint8_t *empty_mini,
+                         size_t empty_len, uint8_t **out, uint64_t *out_len,
+                         uint64_t *out_watermark, Report *report);
 uint64_t pqc_rows_final(const PqcWriter *w);
 uint64_t pqc_rows_unfinished(const PqcWriter *w);
 uint32_t pqc_chunks_cut(const PqcWriter *w);
 uint64_t pqc_logical_end(const PqcWriter *w);
-PqcReader *pqc_reader_open(const uint8_t *ckpt, size_t len,
-                           char *err, size_t errlen);
+int pqc_reader_open(const uint8_t *ckpt, size_t len, PqcReader **out,
+                    Report *report);
 void pqc_reader_free(PqcReader *r);
 const char *pqc_reader_name(const PqcReader *r);
 uint64_t pqc_reader_watermark(const PqcReader *r);
@@ -84,23 +96,36 @@ int pqc_reader_chunk(const PqcReader *r, uint32_t idx, const char **name,
 void pqc_reader_data(const PqcReader *r, uint64_t *offset,
                      uint64_t *length);
 uint32_t pqc_crc32(const uint8_t *data, size_t len);
-uint8_t *pqc_shift_footer(const uint8_t *thrift, size_t len,
-                          int64_t delta, size_t *out_len,
-                          char *err, size_t errlen);
+int pqc_shift_footer(const uint8_t *thrift, size_t len, int64_t delta,
+                     uint8_t **out, size_t *out_len, Report *report);
 void pqc_free(void *p);
 """)
 C = ffi.dlopen(LIB)
 
-ERR = ffi.new('char[512]')
+REPORT = ffi.new('Report *')
+
+
+def check(rc):
+    """Raise for a call that failed, with the report's reason (report.h)."""
+    assert rc == REPORT.status, (rc, REPORT.status)
+    if rc != 0:
+        raise RuntimeError(ffi.string(REPORT.error).decode())
+
+
+def reader_open(data):
+    """The core's reader of a checkpoint's bytes; RuntimeError when the
+    core refuses them."""
+    out = ffi.new('PqcReader **')
+    check(C.pqc_reader_open(data, len(data), out, REPORT))
+    return out[0]
 
 
 def c_shift(thrift, delta):
     n = ffi.new('size_t *')
-    p = C.pqc_shift_footer(thrift, len(thrift), delta, n, ERR, 512)
-    if p == ffi.NULL:
-        raise RuntimeError(ffi.string(ERR).decode())
-    out = bytes(ffi.buffer(p, n[0]))
-    C.pqc_free(p)
+    p = ffi.new('uint8_t **')
+    check(C.pqc_shift_footer(thrift, len(thrift), delta, p, n, REPORT))
+    out = bytes(ffi.buffer(p[0], n[0]))
+    C.pqc_free(p[0])
     return out
 
 
@@ -125,14 +150,14 @@ class CWriter:
         self.name = name
         self.sink = sink
         self._seq = 0
-        self._w = C.pqc_writer_new(name.encode(), chunk_bytes, ERR, 512)
-        if self._w == ffi.NULL:
-            raise RuntimeError(ffi.string(ERR).decode())
+        out = ffi.new('PqcWriter **')
+        check(C.pqc_writer_new(name.encode(), chunk_bytes, out, REPORT))
+        self._w = out[0]
 
     def add_group(self, mini):
-        n = C.pqc_add_group(self._w, mini, len(mini), ERR, 512)
-        if n < 0:
-            raise RuntimeError(ffi.string(ERR).decode())
+        rows = ffi.new('int64_t *')
+        check(C.pqc_add_group(self._w, mini, len(mini), rows, REPORT))
+        n = rows[0]
         self.store_objects()
         return n
 
@@ -142,9 +167,9 @@ class CWriter:
         return first[0], rows[0]
 
     def add_unfinished(self, mini):
-        n = C.pqc_add_unfinished(self._w, mini, len(mini), ERR, 512)
-        if n < 0:
-            raise RuntimeError(ffi.string(ERR).decode())
+        rows = ffi.new('int64_t *')
+        check(C.pqc_add_unfinished(self._w, mini, len(mini), rows, REPORT))
+        n = rows[0]
         self.store_objects()
         return n
 
@@ -157,10 +182,10 @@ class CWriter:
         length = ffi.new('uint64_t *')
         crc = ffi.new('uint32_t *')
         while True:
-            rc = C.pqc_next_object(self._w, name, data, length, crc)
-            if rc < 0:
-                raise RuntimeError("pqc_next_object failed")
-            if rc == 0:
+            have = ffi.new('int *')
+            check(C.pqc_next_object(self._w, name, data, length, crc, have,
+                                    REPORT))
+            if not have[0]:
                 return
             body = bytes(ffi.buffer(data[0], length[0]))
             assert C.pqc_crc32(body, len(body)) == crc[0]
@@ -172,11 +197,10 @@ class CWriter:
         wm = ffi.new('uint64_t *')
         t = empty_mini if empty_mini is not None else ffi.NULL
         tl = len(empty_mini) if empty_mini is not None else 0
-        p = C.pqc_build_checkpoint(self._w, t, tl, n, wm, ERR, 512)
-        if p == ffi.NULL:
-            raise RuntimeError(ffi.string(ERR).decode())
-        ck = bytes(ffi.buffer(p, n[0]))
-        C.pqc_free(p)
+        p = ffi.new('uint8_t **')
+        check(C.pqc_build_checkpoint(self._w, t, tl, p, n, wm, REPORT))
+        ck = bytes(ffi.buffer(p[0], n[0]))
+        C.pqc_free(p[0])
         self._seq += 1                               # the host names versions
         self.sink.put(ckpt_object(self.name, self._seq), ck)
         return ck, wm[0]
@@ -368,8 +392,7 @@ def _():
         assert c_sink.get(name) == p_sink.get(name), f"{name} differs"
     # the package writer's newest checkpoint through the C reader
     ck_p = p_sink.get(ckpt_versions(p_sink, 'par.parquet')[-1][1])
-    rd = C.pqc_reader_open(ck_p, len(ck_p), ERR, 512)
-    assert rd != ffi.NULL, ffi.string(ERR).decode()
+    rd = reader_open(ck_p)
     assert ffi.string(C.pqc_reader_name(rd)).decode() == 'par.parquet'
     assert C.pqc_reader_watermark(rd) == pw.rows_checkpointed == final
     assert C.pqc_reader_n_chunks(rd) == len(CheckpointReader(ck_p).manifest)
@@ -412,9 +435,14 @@ def _():
     cw.free()
     bad = bytearray(ck)
     bad[25] ^= 0xFF
-    assert C.pqc_reader_open(bytes(bad), len(bad), ERR, 512) == ffi.NULL
-    assert b'CRC' in ffi.string(ERR)
-    assert C.pqc_reader_open(b'JUNK' + ck[4:], len(ck), ERR, 512) == ffi.NULL
+    for data, word in ((bytes(bad), 'CRC'), (b'JUNK' + ck[4:], 'magic')):
+        try:
+            reader_open(data)
+        except RuntimeError as e:
+            assert word in str(e), e
+            assert REPORT.status == 2, REPORT.status    # REPORT_REFUSED
+        else:
+            raise AssertionError(f"the core read a checkpoint with a bad {word}")
 
 
 print(f"\n{'=' * 50}")
