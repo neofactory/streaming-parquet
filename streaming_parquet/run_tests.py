@@ -2402,6 +2402,164 @@ def _():
         and "the ring is in use again" in said[0][1], said
 
 
+@test("row_ids=True: sp_run_start_time and sp_run_row_number name every "
+      "row once, across two runs, finished files, the unfinished file and "
+      "memory; the same from the writer and a reader, in all three views; "
+      "off by default")
+def _():
+    from datetime import datetime, timezone
+    flat = pa.schema([("n", pa.int64())])
+
+    def started(run):
+        return datetime.strptime(run, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+            tzinfo=timezone.utc)
+    with tempfile.TemporaryDirectory() as root:
+        # run 1: three finished files; n = the row number
+        s = _catalog_writer_run(root, flat, [[pa.array(range(k * 10, k * 10 + 10))]
+                                             for k in range(3)], name="v2test/rid")
+        run1 = s._run
+        # run 2: two finished files, then rows in the unfinished file
+        # and in memory; n = 1000 + the row number
+        s = sp.create_stream("v2test/rid", flat, store=root,
+                             memory=MemoryOptions(lookback=500),
+                             parquet=ParquetOptions(checkpoint_seconds=0.05))
+        con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+        views = []
+        try:
+            run2 = s._run
+            assert run1 != run2
+            for k in range(2):
+                s.append(pa.record_batch(
+                    [pa.array(range(1000 + k * 10, 1010 + k * 10))], schema=flat))
+                s.cut()
+            wait_for(lambda: s._parquet.catalog.files == 5, what="5 files listed")
+            for k in range(3):
+                s.append(pa.record_batch(
+                    [pa.array(range(1020 + k * 5, 1025 + k * 5))], schema=flat))
+                time.sleep(0.2)
+            a = sp.connect("v2test/rid", store=root,
+                           memory=MemoryOptions(lookback=500))
+            wait_for(lambda: a.state == "streaming" and a.newest_row() is not None
+                     and a.newest_row().n == 1034, what="the reader has every row")
+
+            def check(view, rows, runs):
+                got = con.sql(
+                    f"SELECT sp_run_start_time, count(*), "
+                    f"count(DISTINCT sp_run_row_number), min(sp_run_row_number), "
+                    f"max(sp_run_row_number), min(n - sp_run_row_number), "
+                    f"max(n - sp_run_row_number) FROM {view.name} "
+                    f"GROUP BY 1 ORDER BY 1").fetchall()
+                assert got == [(started(r), c, c, lo, lo + c - 1, off, off)
+                               for r, c, lo, off in runs], (view.name, got)
+                types = dict((r[0], r[1]) for r in con.sql(
+                    f"DESCRIBE SELECT * FROM {view.name}").fetchall())
+                assert types["sp_run_start_time"] == "TIMESTAMP WITH TIME ZONE", types
+                assert types["sp_run_row_number"] == "BIGINT", types
+                assert list(types)[0] == "n" and len(types) == 3, types
+                assert con.sql(f"SELECT count(*) FROM {view.name}").fetchall() \
+                    == [(rows,)]
+
+            for who, tag in ((s, "w"), (a, "r")):
+                both = [(run1, 30, 0, 0), (run2, 35, 0, 1000)]
+                v = who.duckdb_all(con, name=f"all_{tag}", row_ids=True)
+                views.append(v)
+                wait_for(lambda: con.sql(f"SELECT count(*) FROM all_{tag}"
+                                         ).fetchall() == [(65,)],
+                         what="every row in the view")
+                check(v, 65, both)
+                v = who.duckdb_archive(con, name=f"arch_{tag}", row_ids=True)
+                views.append(v)
+                wait_for(lambda: con.sql(f"SELECT count(*) FROM arch_{tag}"
+                                         ).fetchall() == [(65,)],
+                         what="every row in the store")
+                check(v, 65, both)
+                v = who.duckdb_live(con, name=f"live_{tag}", row_ids=True)
+                views.append(v)
+                check(v, 35, [(run2, 35, 0, 1000)])
+            # one row, by its id
+            assert con.sql(
+                "SELECT n FROM all_r WHERE sp_run_row_number = 7 ORDER BY "
+                "sp_run_start_time").fetchall() == [(7,), (1007,)]
+            # off by default: the stream's columns alone
+            for make in (a.duckdb_all, a.duckdb_archive, a.duckdb_live):
+                v = make(con, name="plain")
+                try:
+                    assert [r[0] for r in con.sql(
+                        "DESCRIBE SELECT * FROM plain").fetchall()] == ["n"]
+                finally:
+                    v.close()
+        finally:
+            for v in views:
+                v.close()
+            try:
+                a.close()
+            except NameError:
+                pass
+            con.close()
+            s.close()
+
+
+@test("a view never reads a finished file's rows twice: the ticket "
+      "names a catalog version only together with dropping the files "
+      "that version lists")
+def _():
+    import json as _json
+    flat = pa.schema([("n", pa.int64())])
+    with tempfile.TemporaryDirectory() as root:
+        s = sp.create_stream("v2test/twice", flat, store=root,
+                             memory=MemoryOptions(lookback=500),
+                             parquet=ParquetOptions(checkpoint_seconds=0.05))
+        con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+        a = w = r = None
+        try:
+            s.append(pa.record_batch([pa.array(range(10))], schema=flat))
+            s.cut()
+            cat = s._parquet.catalog
+            wait_for(lambda: cat.files == 1, what="the first file listed")
+            a = sp.connect("v2test/twice", store=root,
+                           memory=MemoryOptions(lookback=500))
+            w = s.duckdb_all(con, name="tw_w")
+            r = a.duckdb_archive(con, name="tw_r")
+            # hold the moment after the catalog is published and before
+            # the writer hears of it
+            real, held = cat.on_listed, []
+
+            def slow(names):
+                held.append(cat.etag)
+                time.sleep(1.0)
+                return real(names)
+            cat.on_listed = slow
+            s.append(pa.record_batch([pa.array(range(10, 30))], schema=flat))
+            s.cut()
+            tpath = os.path.join(root, "tickets", "v2test", "twice.json")
+            wait_for(lambda: held, what="the second catalog published")
+            t = _json.load(open(tpath))
+            assert t["files"] and t["catalog_etag"] != held[0], \
+                "the ticket names the new catalog and still lists its file"
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < 1.5:
+                for name in ("tw_w", "tw_r"):
+                    n, distinct = con.sql(f"SELECT count(*), count(DISTINCT n) "
+                                          f"FROM {name}").fetchall()[0]
+                    assert n == distinct, f"{name}: {n} rows, {distinct} distinct"
+                time.sleep(0.02)
+            wait_for(lambda: not _json.load(open(tpath))["files"]
+                     and _json.load(open(tpath))["catalog_etag"] == cat.etag,
+                     what="the ticket names the new catalog without the file")
+            for name in ("tw_w", "tw_r"):
+                wait_for(lambda: con.sql(f"SELECT count(*), count(DISTINCT n) FROM "
+                                         f"{name}").fetchall() == [(30, 30)],
+                         what=f"{name} has every row once")
+        finally:
+            for v in (w, r):
+                if v is not None:
+                    v.close()
+            if a is not None:
+                a.close()
+            con.close()
+            s.close()
+
+
 @test("view.close() returns at once and ends the view's thread, also "
       "when the stream has no live writer and the view's next look is "
       "15 seconds away")

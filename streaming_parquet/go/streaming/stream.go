@@ -466,13 +466,11 @@ func (s *Stream) heartbeat(stop chan struct{}) {
 			Archive:     s.location.Load().(string)}
 		s.mu.Lock()
 		where := ""
-		var cat *catalog
 		if s.arch != nil {
 			where = strings.TrimSuffix(s.arch.location, "/") + "/"
 			if s.arch.recording() {
 				t.CheckpointSeconds = s.arch.ckptSeconds
 			}
-			cat = s.arch.cat
 		}
 		s.mu.Unlock()
 		if where != "" {
@@ -480,11 +478,6 @@ func (s *Stream) heartbeat(stop chan struct{}) {
 			if err := s.store.fill(&t, where); err != nil {
 				fmt.Fprintf(os.Stderr, "[%s] ticket: %v\n", s.Name, err)
 			}
-		}
-		if cat != nil {
-			// read after the files, as the Python host does: a file the
-			// ticket leaves out is in this catalog version
-			t.CatalogEtag = cat.version()
 		}
 		if err := s.tel.tickets.put(s.Name, t); err != nil {
 			fmt.Fprintf(os.Stderr, "[%s] ticket publish error: %v\n",

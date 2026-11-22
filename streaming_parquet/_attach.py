@@ -147,10 +147,13 @@ class Attached:
     """Read face over a _StreamData. See module docstring."""
 
     def __init__(self, data=None, feeder=None, on_close=None,
-                 archive_dir=None, unarchived=None, source=None):
+                 archive_dir=None, unarchived=None, source=None, run=None):
         self._data = data          # _StreamData (local) or None until the
         self._feeder = feeder      #   remote feeder discovers the schema
         self._source = source      # _views.TicketSource, or None (no store)
+        # callable -> the run the memory's rows belong to
+        self._run_fn = run or ((lambda: feeder._run) if feeder is not None
+                               else (lambda: None))
         self._on_close = on_close
         self._closed = False
         self._archive_dir_fn = archive_dir   # callable -> the archive's location
@@ -269,14 +272,25 @@ class Attached:
 
     # ---- DuckDB views ------------------------------------------------------
 
-    def duckdb_live(self, con, name=None):
+    def duckdb_live(self, con, name=None, row_ids=False):
         """Memory as a DuckDB view that stays current: register once,
         every query sees the current rows. A scan reads memory a chunk
         at a time and pins only the chunk in hand, so a query holds
-        nothing of the ring between chunks, however long it runs."""
+        nothing of the ring between chunks, however long it runs.
+        row_ids: also the columns sp_run_start_time and
+        sp_run_row_number (core/sp.h: ROW IDS)."""
         from arrow_ring import DynamicRelation
         d = self._require()
         vname = name or f"sp_live_{_safe(d.name)}"
+        if row_ids:
+            from . import _core
+            from ._views import _MemoryProxy
+            mem = f"__sp_live_{_safe(vname)}"
+            con.register(mem, _MemoryProxy(
+                lambda lo: self._require().iter_chunks(lo), d.schema,
+                run=self._run_fn))
+            con.execute(_core.view_live_sql(vname, mem))
+            return View(con, vname, unregister=lambda: con.unregister(mem))
         con.register(vname, DynamicRelation(d))
         return View(con, vname, unregister=lambda: con.unregister(vname))
 
@@ -310,31 +324,31 @@ class Attached:
             run=(lambda: feeder._run) if feeder is not None else None,
             memory=memory_chunks, window=lambda: self._require().window())
 
-    def duckdb_archive(self, con, name=None, store=None):
+    def duckdb_archive(self, con, name=None, store=None, row_ids=False):
         """The stream's files as one DuckDB view: the finished files of
         the catalog the ticket names and the unfinished files it lists,
         kept current from the ticket (_views). The connection must be
         opened with allow_unsigned_extensions. Needs no live connection:
-        the files know the columns."""
+        the files know the columns. row_ids: as duckdb_live."""
         from ._views import StoreView
         src = self._view_source(store)
         return StoreView(con, src, name or f"sp_archive_{_safe(self.name)}",
                          self._resolve().schema if self._resolve() else None,
-                         with_memory=False)
+                         with_memory=False, row_ids=row_ids)
 
-    def duckdb_all(self, con, name=None, store=None):
+    def duckdb_all(self, con, name=None, store=None, row_ids=False):
         """Memory plus the files, one DuckDB view, exact at the seam:
         the files the ticket names up to the seam, memory after it. To
         the extent that rows are in memory the view uses them: the seam
         is the oldest row boundary the store has above the ring's
         oldest quarter (_views). Without the live connection the memory
         piece is left out and `standing()` says why; the files still
-        answer."""
+        answer. row_ids: as duckdb_live."""
         from ._views import StoreView
         src = self._view_source(store)
         return StoreView(con, src, name or f"sp_{_safe(self.name)}",
                          self._resolve().schema if self._resolve() else None,
-                         with_memory=True)
+                         with_memory=True, row_ids=row_ids)
 
     @property
     def archive_location(self):

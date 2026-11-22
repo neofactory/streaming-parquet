@@ -139,6 +139,7 @@ class ParquetWriter:
         # it is finished until they are deleted
         self._ckpt_sink = {}
         self.catalog = None             # _catalog.Catalog, set by create_stream
+        self._ticket_catalog = None     # the catalog version the ticket names
         self.on_ticket = None           # the stream's "write the ticket now"
         self._remote_swept = False      # the remote half of the boot sweep
                                         # runs on the first mirror pass
@@ -389,12 +390,22 @@ class ParquetWriter:
         ticket is written, and only then are its checkpoints deleted.
         Called on the catalog thread."""
         with self._store_lock:
+            # one step: the files leave the ticket and the ticket names
+            # the catalog version that lists them. A ticket with that
+            # version and one of the files would give a view the file's
+            # rows twice.
             done = [n for n in self._ckpt_sink
                     if n in names and self._store.listed(n)]
-        if not done:
+            etag = self.catalog.etag if self.catalog is not None else None
+            newer = etag != self._ticket_catalog
+            self._store.catalog(etag)
+            self._ticket_catalog = etag
+        if not done and not newer:
             return
         if self.on_ticket is not None and not self.on_ticket():
             return                      # ticket not written: delete nothing yet
+        if not done:
+            return
         with self._store_lock:
             self._store.dropped(time.monotonic())
         self.discard_due()
@@ -447,6 +458,14 @@ class ParquetWriter:
         and the files belong together."""
         with self._store_lock:
             return self._store.state()[:3]
+
+    def store_ticket(self):
+        """(stored_row, stored_at, files, catalog_etag): store_files()
+        and the catalog version the ticket names, in one reading: the
+        files and the version belong together."""
+        with self._store_lock:
+            st = self._store.state()
+            return st[0], st[1], st[2], st[4]
 
     def store_location(self):
         """The stream's folder in the store, ending in '/': the bucket's

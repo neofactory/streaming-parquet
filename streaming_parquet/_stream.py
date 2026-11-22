@@ -165,7 +165,8 @@ class Stream:
         from ._attach import Attached
         self._face = Attached(data=self._data, feeder=None, on_close=None,
                               archive_dir=self._archive_location,
-                              unarchived=self._rows_unarchived)
+                              unarchived=self._rows_unarchived,
+                              run=lambda: self._run)
 
         # The heartbeat thread: the ticket beat, and the time-due work on
         # a stream committing nothing (the tail checkpoint, the mirror
@@ -360,11 +361,10 @@ class Stream:
         """The ticket without its write time: what a change is judged by."""
         p = self._parquet
         if p is not None:
-            stored_row, stored_at, files = p.store_files()
+            stored_row, stored_at, files, catalog_etag = p.store_ticket()
             where = p.store_location()
             files = [dict(f, checkpoint=f"{where}{f['checkpoint']}")
                      for f in files]
-            catalog_etag = p.catalog.etag if p.catalog is not None else None
             keep_seconds = p.superseded_keep_s
         else:
             stored_row, stored_at, files = -1, None, []
@@ -770,14 +770,16 @@ class Stream:
     def arrow_table(self, columns=None, rows=None, since=None):
         return self._face.arrow_table(columns=columns, rows=rows, since=since)
 
-    def duckdb_live(self, con, name=None):
-        return self._face.duckdb_live(con, name=name)
+    def duckdb_live(self, con, name=None, row_ids=False):
+        return self._face.duckdb_live(con, name=name, row_ids=row_ids)
 
-    def duckdb_archive(self, con, name=None, store=None):
-        return self._face.duckdb_archive(con, name=name, store=store)
+    def duckdb_archive(self, con, name=None, store=None, row_ids=False):
+        return self._face.duckdb_archive(con, name=name, store=store,
+                                         row_ids=row_ids)
 
-    def duckdb_all(self, con, name=None, store=None):
-        return self._face.duckdb_all(con, name=name, store=store)
+    def duckdb_all(self, con, name=None, store=None, row_ids=False):
+        return self._face.duckdb_all(con, name=name, store=store,
+                                     row_ids=row_ids)
 
     # --- Lifecycle -----------------------------------------------------------
 

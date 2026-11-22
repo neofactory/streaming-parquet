@@ -226,6 +226,28 @@ extension, so the connection is opened with
 seam, same run only. `duckdb_archive(con)` is the files alone;
 `duckdb_live(con)` is memory alone.
 
+**Row ids.** `row_ids=True` on any of the three calls adds two
+columns that together name a row of the stream for good:
+
+| Column | Type | What it is |
+|---|---|---|
+| `sp_run_start_time` | `TIMESTAMPTZ` | when the writer that wrote the row started (the ticket's `run`) |
+| `sp_run_row_number` | `BIGINT` | the row's number in that run, from 0 |
+
+    view = a.duckdb_all(con, row_ids=True)
+    con.sql(f"select * from {view.name} "
+            f"where sp_run_start_time = ? and sp_run_row_number = ?", params=[t, n])
+
+Row numbers start again at 0 with each run, so one number alone does
+not name a row. A finished file's rows get the two values from the
+catalog (its table `sp_file`: each file's run and first row), an
+unfinished file's rows from the file itself, memory's rows from the
+ring. Rows of a file that does not record its run (written by a library
+from before files did) read as null in both. The default is off, and a
+view without row ids has the stream's columns alone. A filter on
+`sp_run_row_number` opens every finished file; a filter on a column of
+the stream opens only the files that can hold it, as without row ids.
+
 **How long a view lives.** Until `view.close()`, or the end of the
 process. Closing the stream or the reader it was made from does not
 close it: the view goes on answering from what is there (the store's
@@ -503,6 +525,7 @@ reading (a stream we write and one we connect to, alike):
                       for row in cursor ; cursor.arrow_table() ; cursor.lost
                   arrow_table(columns=None, rows=None, since=None) -> pyarrow.Table
                   duckdb_live(con) duckdb_archive(con, store=) duckdb_all(con, store=) -> View
+                  (each takes row_ids=True: sp_run_start_time, sp_run_row_number)
                       the archive views follow the ticket; con opened with
                       allow_unsigned_extensions (the parquet_checkpoint extension)
                   memory_state() -> MemoryState

@@ -68,16 +68,17 @@ type catalog struct {
 	// not. Nil: the stream has no ticket.
 	writeTicket func() bool
 
-	mu       sync.Mutex
-	wanted   bool          // a pass is owed
-	running  bool          // a pass goroutine is alive
-	stopped  bool          // Close: no pass starts, a running one stops
-	done     chan struct{} // closed when the running pass ends
-	etag     string        // the published catalog's version; "" = none
-	files    int           // files the published catalog lists
-	errText  string        // the last pass's failure; "" when fine
-	awaiting map[string]bool
-	dropOwed bool // files left the record; the ticket is not yet written without them
+	mu         sync.Mutex
+	wanted     bool          // a pass is owed
+	running    bool          // a pass goroutine is alive
+	stopped    bool          // Close: no pass starts, a running one stops
+	done       chan struct{} // closed when the running pass ends
+	etag       string        // the published catalog's version; "" = none
+	ticketEtag string        // the version the ticket was last given
+	files      int           // files the published catalog lists
+	errText    string        // the last pass's failure; "" when fine
+	awaiting   map[string]bool
+	dropOwed   bool // files left the record; the ticket is not yet written without them
 
 	cat *C.SpCatalog // the pass goroutine's alone
 }
@@ -89,13 +90,6 @@ func newCatalog(name, folder string, sink pqc.Sink, store *storeState, writeTick
 	}
 	return &catalog{name: name, folder: folder, sink: sink, vs: vs, store: store,
 		writeTicket: writeTicket, awaiting: map[string]bool{}, wanted: true}
-}
-
-// version is the published catalog's version, for the ticket.
-func (c *catalog) version() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.etag
 }
 
 func (c *catalog) state() (files int, errText string) {
@@ -339,17 +333,25 @@ func (c *catalog) add(name string) error {
 // checkpoints count as superseded.
 func (c *catalog) listed(names map[string]bool) {
 	c.mu.Lock()
+	var files []string
 	for n := range c.awaiting {
-		if names[n] && c.store.listed(n) {
-			c.dropOwed = true
+		if names[n] {
+			files = append(files, n)
 		}
+	}
+	newer := c.etag != c.ticketEtag
+	c.ticketEtag = c.etag
+	if c.store.listed(files, c.etag) {
+		c.dropOwed = true
 	}
 	owed := c.dropOwed
 	c.mu.Unlock()
-	if owed {
+	if owed || newer {
 		if c.writeTicket != nil && !c.writeTicket() {
 			return // ticket not written: delete nothing yet
 		}
+	}
+	if owed {
 		c.mu.Lock()
 		c.dropOwed = false
 		c.mu.Unlock()

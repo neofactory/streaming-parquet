@@ -418,10 +418,18 @@ int main(void) {
         CHECK(sp_store_awaits(st, "b.parquet") == 0);
         CHECK(sp_store_fill(st, k, "w/", err, sizeof err) == 0);
         CHECK(sp_ticket_file_count(k) == 1);
+        /* the ticket names no catalog version until the host gives one */
+        CHECK(sp_ticket_text(k, SP_T_CATALOG_ETAG) == NULL);
         CHECK(sp_store_listed(st, "zzz.parquet") == 0);
         CHECK(sp_store_listed(st, "b.parquet") == 1);
+        CHECK(sp_store_catalog(st, "\"v2\"") == 0);
         CHECK(sp_store_fill(st, k, "w/", err, sizeof err) == 0);
         CHECK(sp_ticket_file_count(k) == 0);
+        CHECK(strcmp(sp_ticket_text(k, SP_T_CATALOG_ETAG), "\"v2\"") == 0);
+        CHECK(sp_store_catalog(st, NULL) == 0);
+        CHECK(sp_store_fill(st, k, "w/", err, sizeof err) == 0);
+        CHECK(sp_ticket_text(k, SP_T_CATALOG_ETAG) == NULL);
+        CHECK(sp_store_catalog(st, "\"v2\"") == 0);
         /* the ticket write failed: nothing is superseded; a second
          * catalog pass finds it again */
         CHECK(sp_store_due(st, 1e9, 0) == NULL);
@@ -728,6 +736,35 @@ int main(void) {
                                  "row 750; it begins at row ' || _first || '. This query read the rows "
                                  "up to 749 from the store.") == sql);
         sp_free(sql);
+        /* the same view with row ids: each piece gives the two columns */
+        sp_view_set_row_ids(v, 1);
+        sql = sp_view_sql(v, "cat1", err, sizeof err);
+        CHECK(sql && strstr(sql, "(SELECT d.* EXCLUDE (filename, file_row_number), "
+                                 "CAST(f.run AS TIMESTAMPTZ) AS sp_run_start_time, "
+                                 "f.first_row + d.file_row_number AS sp_run_row_number FROM "
+                                 "(SELECT *, filename, file_row_number FROM \"cat1\".data) d "
+                                 "LEFT JOIN (SELECT df.path, sf.run, sf.first_row FROM "
+                                 "\"__ducklake_metadata_cat1\".sp_file sf JOIN "
+                                 "\"__ducklake_metadata_cat1\".ducklake_data_file df "
+                                 "USING (data_file_id)) f ON d.filename = f.path)"));
+        CHECK(sql && strstr(sql, "(SELECT * EXCLUDE (file_row_number), CAST((SELECT decode(value) "
+                                 "FROM parquet_kv_metadata('pqc:///d/a.parquet.000003.ckpt') WHERE "
+                                 "decode(key) = 'sp_run' LIMIT 1) AS TIMESTAMPTZ) AS "
+                                 "sp_run_start_time, CAST((SELECT decode(value) FROM "
+                                 "parquet_kv_metadata('pqc:///d/a.parquet.000003.ckpt') WHERE "
+                                 "decode(key) = 'sp_base_seq' LIMIT 1) AS BIGINT) + file_row_number "
+                                 "AS sp_run_row_number FROM read_parquet("
+                                 "'pqc:///d/a.parquet.000003.ckpt', file_row_number=true) "
+                                 "WHERE file_row_number <= 249)"));
+        CHECK(sql && strstr(sql, "(SELECT * EXCLUDE (_seq, _first), _seq AS sp_run_row_number "
+                                 "FROM \"__mem\" WHERE _seq > 749 AND "));
+        sp_free(sql);
+        sp_view_set_row_ids(v, 0);
+        sql = sp_view_live_sql("live_x", "__m");
+        CHECK(sql && strcmp(sql, "CREATE OR REPLACE VIEW \"live_x\" AS SELECT * EXCLUDE "
+                                 "(_seq, _first), _seq AS sp_run_row_number FROM \"__m\"") == 0);
+        sp_free(sql);
+        CHECK(sp_view_live_sql(NULL, "m") == NULL);
         sp_view_built(v);
         CHECK(sp_view_seam_row(v) == 749);
         /* the next write is due at ts + beat + margin */

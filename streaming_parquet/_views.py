@@ -74,6 +74,8 @@ import pyarrow.compute as pc
 
 import parquet_checkpoint
 
+from datetime import datetime, timezone
+
 from . import _core, _tickets
 from ._catalog import CATALOG
 from ._diag import _diag
@@ -137,8 +139,14 @@ class _MemoryProxy:
     the writer; a copy patched it; the chunk read retires the copy.)
     A reader with no connection yet scans an empty memory."""
 
-    def __init__(self, chunks, schema):
+    def __init__(self, chunks, schema, run=None):
+        """run: a callable that answers the run the ring's rows belong
+        to; given, every row also has that run's start time in the
+        column sp_run_start_time (row ids, core/sp.h: ROW IDS)."""
         self._chunks = chunks
+        self._run = run
+        if run is not None:
+            schema = schema.append(pa.field(_core.ROW_ID_RUN, _RUN_TYPE))
         self._schema = (schema.append(pa.field('_seq', pa.int64()))
                         .append(pa.field('_first', pa.int64())))
 
@@ -147,8 +155,27 @@ class _MemoryProxy:
             it = self._chunks(0)        # from the ring's oldest row
         except Exception:
             it = ()
+        started = None
+        if self._run is not None:
+            started = pa.scalar(_run_time(self._run()), _RUN_TYPE)
         return pa.RecordBatchReader.from_batches(
-            self._schema, _Numbered(it)).__arrow_c_stream__(requested_schema)
+            self._schema, _Numbered(it, started)
+        ).__arrow_c_stream__(requested_schema)
+
+
+_RUN_TYPE = pa.timestamp("us", "UTC")
+
+
+def _run_time(run):
+    """A run (the writer's start, '2026-11-21T23:58:06.066487Z') as a
+    datetime; None for no run or text that is not one."""
+    if not run:
+        return None
+    try:
+        return datetime.strptime(run, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+            tzinfo=timezone.utc)
+    except ValueError:
+        return None
 
 
 class _Numbered:
@@ -156,9 +183,10 @@ class _Numbered:
     with __next__, not a generator: a generator's loop variable would
     hold each batch, and its chunk's pin, until the next pull."""
 
-    def __init__(self, pairs):
+    def __init__(self, pairs, started=None):
         self._pairs = iter(pairs)
         self._first = None
+        self._started = started         # a scalar: the row id column's value
 
     def __iter__(self):
         return self
@@ -168,6 +196,9 @@ class _Numbered:
         if self._first is None:
             self._first = first
         n = batch.num_rows
+        if self._started is not None:
+            batch = batch.append_column(_core.ROW_ID_RUN,
+                                        pa.repeat(self._started, n))
         return (batch.append_column('_seq', _row_numbers(first, n))
                 .append_column('_first', pa.repeat(
                     pa.scalar(self._first, pa.int64()), n)))
@@ -209,7 +240,7 @@ class StoreView:
     """One DuckDB view over a stream's store (duckdb_archive) or its
     store and memory (duckdb_all). See the module docstring."""
 
-    def __init__(self, con, source, name, schema, with_memory):
+    def __init__(self, con, source, name, schema, with_memory, row_ids=False):
         from . import _extension
         _extension.load(con, f"{name}: the archive view of {source.name!r}")
         self.name = name
@@ -227,8 +258,9 @@ class StoreView:
             for c in (con, self._cur):
                 c.register(self._empty_name, empty)
                 if self._with_memory:
-                    c.register(self._mem_name,
-                               _MemoryProxy(source.memory, schema))
+                    c.register(self._mem_name, _MemoryProxy(
+                        source.memory, schema,
+                        run=source.run if row_ids else None))
         self._tmp = tempfile.mkdtemp(prefix="sp-view-")
         self._lock = threading.Lock()
         self._k = 0
@@ -237,7 +269,8 @@ class StoreView:
         self._rules = _core.View(
             name, source.name,
             self._mem_name if self._with_memory else None,
-            self._empty_name if schema is not None else None)
+            self._empty_name if schema is not None else None,
+            row_ids=row_ids)
         self._seen_revision = None
         self.seam = None                # the row the text changes at
         self.rebuilds = 0               # times the view's text was replaced

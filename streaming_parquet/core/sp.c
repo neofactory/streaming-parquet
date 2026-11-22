@@ -1007,6 +1007,7 @@ struct SpStore {
     int64_t stored_row;
     int has_stored_at;
     double stored_at;
+    char *catalog;            /* the catalog version the ticket names */
 };
 
 SpStore *sp_store_new(double keep_seconds) {
@@ -1039,7 +1040,17 @@ void sp_store_free(SpStore *s) {
     if (!s) return;
     for (int32_t i = 0; i < s->n_files; i++) store_file_clear(&s->files[i]);
     free(s->files);
+    free(s->catalog);
     free(s);
+}
+
+int sp_store_catalog(SpStore *s, const char *version) {
+    if (!s) return -1;
+    char *mine = version ? copy_text(version, strlen(version)) : NULL;
+    if (version && !mine) return -1;
+    free(s->catalog);
+    s->catalog = mine;
+    return 0;
 }
 
 static StoreFile *store_find(const SpStore *s, const char *name) {
@@ -1233,6 +1244,12 @@ int sp_store_fill(const SpStore *s, SpTicket *t, const char *where,
             return -1;
     } else {
         sp_ticket_clear(t, SP_T_STORED_AT);
+    }
+    if (s->catalog) {
+        if (sp_ticket_set_text(t, SP_T_CATALOG_ETAG, s->catalog, err, errlen))
+            return -1;
+    } else {
+        sp_ticket_clear(t, SP_T_CATALOG_ETAG);
     }
     for (int32_t i = 0; i < t->n_files; i++) free(t->files[i].checkpoint);
     t->n_files = 0;
@@ -1607,6 +1624,7 @@ typedef struct {
 
 struct SpView {
     char *name, *stream, *memory, *empty;
+    int row_ids;              /* the text adds the two row id columns */
     ViewNamed *named;
     int32_t n_named;
     int64_t named_seam;
@@ -1920,6 +1938,10 @@ int sp_view_plan(SpView *v, const SpTicket *t, const char *const *files,
     return 0;
 }
 
+void sp_view_set_row_ids(SpView *v, int on) {
+    if (v) v->row_ids = on != 0;
+}
+
 const char *sp_view_catalog_etag(const SpView *v) {
     return v ? v->plan.etag : NULL;
 }
@@ -1930,6 +1952,15 @@ static void text_sql_quoted(Text *b, const char *s) {
         if (*s == '\'') text_put(b, "''", 2);
         else text_put(b, s, 1);
     }
+}
+
+/* One of a file's footer keys, read by DuckDB from the file itself. */
+static void text_footer_key(Text *b, const char *path, const char *key) {
+    text_str(b, "(SELECT decode(value) FROM parquet_kv_metadata('pqc://");
+    text_sql_quoted(b, path);
+    text_str(b, "') WHERE decode(key) = '");
+    text_str(b, key);
+    text_str(b, "' LIMIT 1)");
 }
 
 char *sp_view_sql(const SpView *v, const char *catalog, char *err,
@@ -1943,7 +1974,25 @@ char *sp_view_sql(const SpView *v, const char *catalog, char *err,
     text_str(&b, "CREATE OR REPLACE VIEW \"");
     text_str(&b, v->name);
     text_str(&b, "\" AS ");
-    if (catalog) {
+    if (catalog && v->row_ids) {
+        /* Each finished file's run and first row are in the catalog's
+         * table sp_file; DuckLake gives each row its file and its row
+         * number in the file. A file the table does not know (written
+         * before files recorded their run) reads as null in both. */
+        PIECE();
+        text_str(&b, "SELECT d.* EXCLUDE (filename, file_row_number), "
+                     "CAST(f.run AS TIMESTAMPTZ) AS " SP_ROW_ID_RUN ", "
+                     "f.first_row + d.file_row_number AS " SP_ROW_ID_ROW
+                     " FROM (SELECT *, filename, file_row_number FROM \"");
+        text_str(&b, catalog);
+        text_str(&b, "\".data) d LEFT JOIN (SELECT df.path, sf.run, "
+                     "sf.first_row FROM \"__ducklake_metadata_");
+        text_str(&b, catalog);
+        text_str(&b, "\".sp_file sf JOIN \"__ducklake_metadata_");
+        text_str(&b, catalog);
+        text_str(&b, "\".ducklake_data_file df USING (data_file_id)) f "
+                     "ON d.filename = f.path)");
+    } else if (catalog) {
         PIECE();
         text_str(&b, "SELECT * FROM \"");
         text_str(&b, catalog);
@@ -1951,7 +2000,23 @@ char *sp_view_sql(const SpView *v, const char *catalog, char *err,
     }
     for (int32_t i = 0; i < f->n_pieces; i++) {
         PIECE();
-        if (!f->pieces[i].has_last_row) {
+        if (v->row_ids) {
+            /* an unfinished file says its own run and first row (the
+             * footer keys sp_run and sp_base_seq) */
+            text_str(&b, "SELECT * EXCLUDE (file_row_number), CAST(");
+            text_footer_key(&b, f->pieces[i].path, "sp_run");
+            text_str(&b, " AS TIMESTAMPTZ) AS " SP_ROW_ID_RUN ", CAST(");
+            text_footer_key(&b, f->pieces[i].path, "sp_base_seq");
+            text_str(&b, " AS BIGINT) + file_row_number AS " SP_ROW_ID_ROW
+                         " FROM read_parquet('pqc://");
+            text_sql_quoted(&b, f->pieces[i].path);
+            text_str(&b, "', file_row_number=true)");
+            if (f->pieces[i].has_last_row) {
+                text_str(&b, " WHERE file_row_number <= ");
+                text_integer(&b, f->pieces[i].last_row);
+            }
+            text_str(&b, ")");
+        } else if (!f->pieces[i].has_last_row) {
             text_str(&b, "SELECT * FROM read_parquet('pqc://");
             text_sql_quoted(&b, f->pieces[i].path);
             text_str(&b, "'))");
@@ -1972,7 +2037,12 @@ char *sp_view_sql(const SpView *v, const char *catalog, char *err,
          * it. If the ring begins past the row after the seam, rows are
          * in neither: the query fails, it does not answer short. */
         PIECE();
-        text_str(&b, "SELECT * EXCLUDE (_seq, _first) FROM \"");
+        /* with row ids the ring's relation has the run's start time in
+         * a column of that name already */
+        text_str(&b, v->row_ids
+                 ? "SELECT * EXCLUDE (_seq, _first), _seq AS " SP_ROW_ID_ROW
+                   " FROM \""
+                 : "SELECT * EXCLUDE (_seq, _first) FROM \"");
         text_str(&b, v->memory);
         text_str(&b, "\" WHERE _seq > ");
         text_integer(&b, f->seam);
@@ -2001,7 +2071,10 @@ char *sp_view_sql(const SpView *v, const char *catalog, char *err,
             return NULL;
         }
         PIECE();
-        text_str(&b, "SELECT * FROM \"");
+        text_str(&b, v->row_ids
+                 ? "SELECT *, CAST(NULL AS TIMESTAMPTZ) AS " SP_ROW_ID_RUN
+                   ", CAST(NULL AS BIGINT) AS " SP_ROW_ID_ROW " FROM \""
+                 : "SELECT * FROM \"");
         text_str(&b, v->empty);
         text_str(&b, "\")");
     }
@@ -2011,6 +2084,19 @@ char *sp_view_sql(const SpView *v, const char *catalog, char *err,
         fail(err, errlen, "%s: memory is out", v->name);
         return NULL;
     }
+    return b.p;
+}
+
+char *sp_view_live_sql(const char *view, const char *memory) {
+    if (!view || !memory) return NULL;
+    Text b = {0};
+    text_str(&b, "CREATE OR REPLACE VIEW \"");
+    text_str(&b, view);
+    text_str(&b, "\" AS SELECT * EXCLUDE (_seq, _first), _seq AS "
+                 SP_ROW_ID_ROW " FROM \"");
+    text_str(&b, memory);
+    text_str(&b, "\"");
+    if (b.oom) { free(b.p); return NULL; }
     return b.p;
 }
 

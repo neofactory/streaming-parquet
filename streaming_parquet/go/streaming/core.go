@@ -409,14 +409,30 @@ func (st *storeState) awaits(file string) {
 	C.sp_store_awaits(st.p, cf)
 }
 
-// listed: a published catalog lists the file. True when the file was
-// awaiting that: it now leaves the ticket.
-func (st *storeState) listed(file string) bool {
-	cf := C.CString(file)
-	defer C.free(unsafe.Pointer(cf))
+// listed: a catalog of the version `version` is published and lists
+// `files`. In one step the awaiting files among them leave the ticket
+// and the ticket names that version: a ticket with the version and one
+// of the files would give a view the file's rows twice. True when a
+// file left the ticket.
+func (st *storeState) listed(files []string, version string) bool {
+	cv := C.CString(version)
+	defer C.free(unsafe.Pointer(cv))
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	return C.sp_store_listed(st.p, cf) == 1
+	left := false
+	for _, f := range files {
+		cf := C.CString(f)
+		if C.sp_store_listed(st.p, cf) == 1 {
+			left = true
+		}
+		C.free(unsafe.Pointer(cf))
+	}
+	if version == "" {
+		C.sp_store_catalog(st.p, nil)
+	} else {
+		C.sp_store_catalog(st.p, cv)
+	}
+	return left
 }
 
 // dropped: the ticket without the listed files is written.
@@ -479,6 +495,7 @@ func (st *storeState) fill(t *Ticket, where string) error {
 	}
 	t.StoredRow, t.StoredAt = got.StoredRow, got.StoredAt
 	t.KeepSeconds, t.Files = got.KeepSeconds, got.Files
+	t.CatalogEtag = got.CatalogEtag
 	return nil
 }
 

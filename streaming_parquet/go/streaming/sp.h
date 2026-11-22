@@ -387,6 +387,15 @@ int sp_store_awaits(SpStore *s, const char *file);
  * and waits for sp_store_dropped); 0 when it was not. */
 int sp_store_listed(SpStore *s, const char *file);
 
+/* The catalog version the ticket names from now on (NULL: none);
+ * sp_store_fill puts it in the ticket. The host calls it with the
+ * version a pass published, in the same step (under the same lock) as
+ * sp_store_listed for the files that version lists. A ticket then never
+ * names a catalog version together with a file that version lists: a
+ * view would read that file's rows twice. Returns 0, or -1 when memory
+ * is out. */
+int sp_store_catalog(SpStore *s, const char *version);
+
 /* The ticket without the listed files is written: their checkpoints are
  * superseded from now. Returns how many files that is. */
 int sp_store_dropped(SpStore *s, double now);
@@ -669,6 +678,26 @@ int sp_view_plan(SpView *v, const SpTicket *t, const char *const *files,
                  const char *ring_run, const int64_t *window, double now,
                  double mono, double if_absent, double keep_if_absent,
                  SpViewPlan *out);
+
+/* ROW IDS. A view made with row ids has two more columns, which
+ * together name a row of the stream for good:
+ *   sp_run_start_time   TIMESTAMPTZ  when the writer that wrote the row
+ *                                    started (the ticket's run)
+ *   sp_run_row_number   BIGINT       the row's number in that run, from 0
+ * A finished file's rows get them from the catalog's table sp_file and
+ * the row's place in its file; an unfinished file's rows from the
+ * file's own footer keys; the ring's rows from the ring. With row ids
+ * the ring's relation has, besides _seq and _first, a column
+ * sp_run_start_time. Rows of a file that does not record its run read
+ * as null in both. Call before the first sp_view_plan. */
+#define SP_ROW_ID_RUN "sp_run_start_time"
+#define SP_ROW_ID_ROW "sp_run_row_number"
+void sp_view_set_row_ids(SpView *v, int on);
+
+/* The statement that makes a view named `view` of the ring alone, with
+ * row ids, from the ring's relation `memory` (as above): sp_free it.
+ * NULL when memory is out or a name is missing. */
+char *sp_view_live_sql(const char *view, const char *memory);
 
 /* The catalog version the plan names (SP_CATALOG_EXACT), else NULL. */
 const char *sp_view_catalog_etag(const SpView *v);

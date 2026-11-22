@@ -142,6 +142,7 @@ int main(int argc, char **argv) {
             SpView *v = sp_view_new("v", "n", rnd() % 2 ? "m" : NULL,
                                     rnd() % 2 ? "e" : NULL);
             SpViewPlan plan;
+            sp_view_set_row_ids(v, (int)(rnd() % 2));
             for (int k = 0; k < 2; k++) {
                 sp_view_plan(v, t, NULL, "2026-11-12T20:31:12.123456Z",
                              rnd() % 4 ? window : NULL, 1762979480.0 + k * 40,

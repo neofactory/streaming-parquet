@@ -92,6 +92,7 @@ int sp_store_stored(SpStore *s, const char *file, int64_t version,
 int sp_store_finished(SpStore *s, const char *file);
 int sp_store_awaits(SpStore *s, const char *file);
 int sp_store_listed(SpStore *s, const char *file);
+int sp_store_catalog(SpStore *s, const char *version);
 int sp_store_dropped(SpStore *s, double now);
 const char *sp_store_due(const SpStore *s, double now, int32_t index);
 int sp_store_discarded(SpStore *s, const char *file);
@@ -136,6 +137,8 @@ int sp_view_plan(SpView *v, const SpTicket *t, const char *const *files,
                  const char *ring_run, const int64_t *window, double now,
                  double mono, double if_absent, double keep_if_absent,
                  SpViewPlan *out);
+void sp_view_set_row_ids(SpView *v, int on);
+char *sp_view_live_sql(const char *view, const char *memory);
 const char *sp_view_catalog_etag(const SpView *v);
 char *sp_view_sql(const SpView *v, const char *catalog, char *err,
                   size_t errlen);
@@ -470,6 +473,12 @@ class Store:
         ticket."""
         return bool(lib.sp_store_listed(self._s, file.encode()))
 
+    def catalog(self, version):
+        """The catalog version the ticket names from now on; in the same
+        step as listed() for the files that version lists."""
+        self._ok(lib.sp_store_catalog(
+            self._s, version.encode() if version is not None else ffi.NULL))
+
     def dropped(self, now):
         return lib.sp_store_dropped(self._s, now)
 
@@ -487,14 +496,16 @@ class Store:
         self._ok(lib.sp_store_discarded(self._s, file.encode()))
 
     def state(self, where=""):
-        """(stored_row, stored_at, files, keep_seconds) as the ticket
-        holds them; each file's checkpoint is where + its object name."""
+        """(stored_row, stored_at, files, keep_seconds, catalog_etag) as
+        the ticket holds them; each file's checkpoint is where + its
+        object name."""
         t = ffi.gc(lib.sp_ticket_new(), lib.sp_ticket_free)
         err = _err()
         if lib.sp_store_fill(self._s, t, where.encode(), err, _ERRLEN) != 0:
             _raise(err)
         d = _to_dict(t)
-        return d["stored_row"], d["stored_at"], d["files"], d["keep_seconds"]
+        return (d["stored_row"], d["stored_at"], d["files"],
+                d["keep_seconds"], d["catalog_etag"])
 
     @property
     def files(self):
@@ -614,6 +625,22 @@ def view_seam(ticket, window):
     return seam, bool(use[0]), SEAM_WHY[why[0]]
 
 
+#: The two row id columns (core/sp.h: ROW IDS).
+ROW_ID_RUN = "sp_run_start_time"
+ROW_ID_ROW = "sp_run_row_number"
+
+
+def view_live_sql(view, memory):
+    """The statement that makes a view of the ring alone with row ids."""
+    p = lib.sp_view_live_sql(view.encode(), memory.encode())
+    if p == ffi.NULL:
+        raise MemoryError("view")
+    try:
+        return ffi.string(p).decode()
+    finally:
+        lib.sp_free(p)
+
+
 class ViewPlan:
     """What a look decided: build (the text must change), catalog
     (CATALOG_*), etag (for CATALOG_EXACT), seam, use_ring."""
@@ -624,7 +651,7 @@ class View:
     """A view's rules: what its text names, the text, when to look
     again. The calls are made under the host's lock for the view."""
 
-    def __init__(self, view, stream, memory, empty):
+    def __init__(self, view, stream, memory, empty, row_ids=False):
         def text(s):
             return s.encode() if s is not None else ffi.NULL
         self._v = ffi.gc(lib.sp_view_new(view.encode(), stream.encode(),
@@ -632,6 +659,8 @@ class View:
                          lib.sp_view_free)
         if self._v == ffi.NULL:
             raise MemoryError("view")
+        if row_ids:
+            lib.sp_view_set_row_ids(self._v, 1)
         self._plan = ffi.new("SpViewPlan *")
 
     def plan(self, ticket, files, ring_run, window, now, mono, if_absent,

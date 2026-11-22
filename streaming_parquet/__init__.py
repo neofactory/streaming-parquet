@@ -349,7 +349,8 @@ def connect(name=None, store=None, memory=None, columns=None, ticket=None):
                          on_close=_forget_attached,
                          archive_dir=local._archive_location,
                          unarchived=local._rows_unarchived,
-                         source=local._view_source())
+                         source=local._view_source(),
+                         run=lambda: local._run)
             with _lock:
                 _attached[id(a)] = a
             return a
