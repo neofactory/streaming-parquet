@@ -20,3 +20,10 @@ pqc_fuzz_shift
 build/
 dist/
 .venv/
+
+# programs that `go build ./cmd/<name>` leaves in src/go
+/src/go/leak-bisect
+/src/go/pqc-compat
+/src/go/ring-compat
+/src/go/stream-compat
+/src/go/torture-worker
