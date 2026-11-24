@@ -22,7 +22,7 @@ func testSchema() *arrow.Schema {
 
 func writeRows(t *testing.T, s *Stream, start, count int) {
 	t.Helper()
-	r := s.Ring()
+	r := s.ring
 	n, _ := r.Leaf("n")
 	x, _ := r.Leaf("x")
 	sl, _ := r.Leaf("s")
@@ -54,7 +54,7 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 // One process, no discovery: create a stream, attach by direct ticket, the
 // attached ring fills over real Flight on loopback.
 func TestLoopbackConnect(t *testing.T) {
-	tel, err := Init(Config{})
+	tel, err := newProcess(processConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,14 +72,14 @@ func TestLoopbackConnect(t *testing.T) {
 	}
 	defer a.Close()
 	// the ring appears at connect (schema learned via GetFlightInfo)
-	if _, err := a.WaitRing(5 * time.Second); err != nil {
+	if _, err := a.waitRing(5 * time.Second); err != nil {
 		t.Fatal(err)
 	}
 	for k := 0; k < 5; k++ {
 		writeRows(t, s, k*100, 100)
 		time.Sleep(20 * time.Millisecond)
 	}
-	r, err := a.WaitRing(5 * time.Second)
+	r, err := a.waitRing(5 * time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestLoopbackConnect(t *testing.T) {
 // The symmetry Paul asked for: an ATTACHED process archives to
 // parquet, exactly as a creating process would.
 func TestAttachedArchivesParquet(t *testing.T) {
-	tel, err := Init(Config{})
+	tel, err := newProcess(processConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestAttachedArchivesParquet(t *testing.T) {
 		writeRows(t, s, k*150, 150)
 		time.Sleep(30 * time.Millisecond)
 	}
-	r, err := a.WaitRing(5 * time.Second)
+	r, err := a.waitRing(5 * time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

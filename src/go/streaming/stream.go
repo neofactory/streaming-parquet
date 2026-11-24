@@ -12,18 +12,21 @@ import (
 	"github.com/neofactory/streaming-parquet/src/go/ring"
 )
 
-// Stream is a stream this process writes: a ring, and behind it a
-// goroutine that writes the parquet files. Write rows through Ring()
-// and call Commit(): readers see the rows at once, and the goroutine
-// does everything slow. One writer goroutine, like the ring itself.
+// Stream is a stream this process writes: the rows in memory, and
+// behind them a goroutine that writes the parquet files. Begin a row
+// with MutableRow, set its columns, and call Commit(): readers see the
+// rows at once, and the goroutine does everything slow. ONE goroutine
+// writes a stream.
 //
-// A published stream (the default) has a ticket under the root, so
+// A published stream (the default) has a ticket in the store, so
 // other processes find it, and the Flight face serves it, so they read
 // it. An internal one has neither.
 type Stream struct {
 	Name string
 
-	tel      *Telemetry
+	proc     *process
+	root     string      // the stream's store, "" for none
+	tickets  ticketStore // where its ticket goes; nil with no store
 	ring     *ring.Ring
 	ringRows int64
 	run      string // the writer's start time; the ticket's run, every file's sp_run
@@ -82,7 +85,7 @@ func (s *Stream) own() error {
 	if s.owner != nil {
 		return nil
 	}
-	o, err := s.tel.claim(s.Name, s.run)
+	o, err := s.proc.claim(s.Name, s.run, s.root, s.tickets)
 	if err != nil {
 		return err
 	}
@@ -104,6 +107,11 @@ func (m *MemoryOptions) rows() int64 {
 
 // StreamOptions are given once, at CreateStream.
 //
+// Store is the stream's store: a directory, or a file:// or s3:// URI.
+// Its ticket is at <store>/tickets/<name>.json. With no store the
+// stream writes no ticket: this process reads it, and a reader that
+// has its Ticket.
+//
 // Memory says how many rows the stream keeps in memory.
 //
 // Parquet says how the stream's rows are written to parquet, and with
@@ -113,13 +121,18 @@ func (m *MemoryOptions) rows() int64 {
 // Internal makes a stream that other processes cannot find or read: no
 // ticket, not served. Publish and Unpublish change it later.
 type StreamOptions struct {
+	Store    string         // the store; "" = $STREAMING_PARQUET_STORE, and with that not set none
 	Memory   *MemoryOptions // nil = the default: two row groups
 	Parquet  *ParquetOptions
 	Internal bool
 }
 
-func (t *Telemetry) CreateStream(name string, schema *arrow.Schema,
+func (t *process) CreateStream(name string, schema *arrow.Schema,
 	o StreamOptions) (*Stream, error) {
+	root, tickets, err := t.resolve(o.Store)
+	if err != nil {
+		return nil, err
+	}
 	var givenGroupRows int64
 	if o.Parquet != nil {
 		givenGroupRows = o.Parquet.RowGroupRows
@@ -141,7 +154,7 @@ func (t *Telemetry) CreateStream(name string, schema *arrow.Schema,
 	if err != nil {
 		return nil, err
 	}
-	s := &Stream{Name: name, tel: t, ring: r, ringRows: ringRows,
+	s := &Stream{Name: name, proc: t, root: root, tickets: tickets, ring: r, ringRows: ringRows,
 		run: runStart(), wake: make(chan struct{}, 1),
 		store: newStoreState(pqc.SupersededKeep), ticketNow: make(chan struct{}, 1),
 		stopWork: make(chan struct{})}
@@ -187,19 +200,20 @@ func (e *DupStreamError) Error() string {
 	return "stream '" + e.Name + "' already exists"
 }
 
-// Ring exposes the stream's ring: RowBegin and the setters to write a
-// row, getters and record sets to read. ONE writer goroutine. Commit
-// through the stream (Commit below), not through the ring.
-func (s *Stream) Ring() *ring.Ring { return s.ring }
-
 // Commit freezes the rows written since the last Commit and returns how
 // many. Readers see them at once. If a row group or a checkpoint is due,
 // Commit pins its rows and hands them to the stream's goroutine, which
-// writes them: nothing slow runs here. Call it also after a bulk append
-// on the ring, which commits by itself.
+// writes them: nothing slow runs here.
 func (s *Stream) Commit() (int64, error) {
 	n, err := s.ring.Commit()
-	s.tel.flight.notify(s.Name)
+	s.committed()
+	return n, err
+}
+
+// committed is what follows every commit: the waiting Flight readers
+// are told, and a write that is due is handed to the stream's goroutine.
+func (s *Stream) committed() {
+	s.proc.flight.notify(s.Name)
 	s.plan()
 	if s.ring.LinesHeld() { // the stream's goroutine logs them
 		select {
@@ -207,7 +221,6 @@ func (s *Stream) Commit() (int64, error) {
 		default:
 		}
 	}
-	return n, err
 }
 
 // plan hands the goroutine the rows of a write that is due, pinned.
@@ -242,7 +255,7 @@ func (s *Stream) work() {
 			return
 		case <-s.wake:
 		case <-timer.C:
-			s.tel.flight.notify(s.Name) // rows committed on the ring directly
+			s.proc.flight.notify(s.Name)
 			s.plan()
 		}
 		s.ring.LogLines() // what the ring's core said on the writer's goroutine
@@ -324,7 +337,7 @@ func (s *Stream) wrote(err error) {
 		return
 	}
 	if s.failing {
-		s.tel.log.Info(fmt.Sprintf("[%s] archive recovered", s.Name))
+		s.proc.log.Info(fmt.Sprintf("[%s] archive recovered", s.Name))
 		s.failing, s.errText = false, ""
 	}
 }
@@ -332,7 +345,7 @@ func (s *Stream) wrote(err error) {
 // fault records a failure on the parquet path. Caller holds mu.
 func (s *Stream) fault(err error) {
 	if !s.failing {
-		s.tel.log.Error(fmt.Sprintf("[%s] archive failing: %v", s.Name, err))
+		s.proc.log.Error(fmt.Sprintf("[%s] archive failing: %v", s.Name, err))
 	}
 	s.failing, s.errText = true, err.Error()
 }
@@ -391,14 +404,14 @@ func (s *Stream) Publish() error {
 		return err
 	}
 	s.published = true
-	s.tel.flight.register(s.Name, s.ring.Schema(), s)
-	if s.tel.tickets != nil {
+	s.proc.flight.register(s.Name, s.ring.Schema(), s)
+	if s.tickets != nil {
 		s.stopHB = make(chan struct{})
 		s.hbDone.Add(1)
 		go s.heartbeat(s.stopHB)
 	} else {
-		s.tel.log.Info(fmt.Sprintf("[%s] no store configured "+
-			"(Config.Store / $STREAMING_PARQUET_STORE) — no ticket; "+
+		s.proc.log.Info(fmt.Sprintf("[%s] no store configured "+
+			"(StreamOptions.Store / $STREAMING_PARQUET_STORE) — no ticket; "+
 			"the stream is local + direct-ticket only", s.Name))
 	}
 	return nil
@@ -419,15 +432,15 @@ func (s *Stream) unpublish() {
 		return
 	}
 	s.published = false
-	if s.tel.tickets != nil {
+	if s.tickets != nil {
 		close(s.stopHB)
 		s.hbDone.Wait()
-		if err := s.tel.tickets.delete(s.Name); err != nil {
-			s.tel.log.Warn(fmt.Sprintf("[%s] ticket delete failed: %v",
+		if err := s.tickets.delete(s.Name); err != nil {
+			s.proc.log.Warn(fmt.Sprintf("[%s] ticket delete failed: %v",
 				s.Name, err))
 		}
 	}
-	s.tel.flight.unregister(s.Name)
+	s.proc.flight.unregister(s.Name)
 }
 
 // catalogFor answers the catalog of the files in folder, made the first
@@ -436,7 +449,7 @@ func (s *Stream) catalogFor(sink pqc.Sink, folder string) *catalog {
 	if c := s.catalogs[folder]; c != nil {
 		return c
 	}
-	c := newCatalog(s.Name, folder, sink, s.store, s.ticketWritten, s.tel.log)
+	c := newCatalog(s.Name, folder, sink, s.store, s.ticketWritten, s.proc.log)
 	if c != nil {
 		if s.catalogs == nil {
 			s.catalogs = map[string]*catalog{}
@@ -454,7 +467,7 @@ func (s *Stream) ticketWritten() bool {
 	s.pubMu.Lock()
 	published := s.published
 	s.pubMu.Unlock()
-	if !published || s.tel.tickets == nil {
+	if !published || s.tickets == nil {
 		return true
 	}
 	begun := s.ticketBegun.Load()
@@ -480,7 +493,7 @@ func (s *Stream) heartbeat(stop chan struct{}) {
 		revision := s.ticketRevision.Load() + 1
 		s.ticketBegun.Store(revision)
 		t := Ticket{
-			Name: s.Name, Host: localIP(), Port: s.tel.flight.port,
+			Name: s.Name, Host: localIP(), Port: s.proc.flight.port,
 			Ts:          float64(time.Now().UnixNano()) / 1e9,
 			Run:         s.run,
 			BeatSeconds: heartbeatInterval.Seconds(),
@@ -499,11 +512,11 @@ func (s *Stream) heartbeat(stop chan struct{}) {
 		if where != "" {
 			// what a reader can take from the store: the core's record
 			if err := s.store.fill(&t, where); err != nil {
-				s.tel.log.Error(fmt.Sprintf("[%s] ticket: %v", s.Name, err))
+				s.proc.log.Error(fmt.Sprintf("[%s] ticket: %v", s.Name, err))
 			}
 		}
-		if err := s.tel.tickets.put(s.Name, t); err != nil {
-			s.tel.log.Error(fmt.Sprintf("[%s] ticket publish error: %v",
+		if err := s.tickets.put(s.Name, t); err != nil {
+			s.proc.log.Error(fmt.Sprintf("[%s] ticket publish error: %v",
 				s.Name, err))
 		} else {
 			s.ticketStored.Store(revision)
@@ -571,7 +584,7 @@ func (s *Stream) StartParquet(label string, o *ParquetOptions) error {
 		}
 		lost = s.arch.lost()
 	}
-	arch, err := newArchiver(s.ring, s.Name, s.run, opts, s.store, s.catalogFor, s.tel.log)
+	arch, err := newArchiver(s.ring, s.Name, s.run, opts, s.store, s.catalogFor, s.proc.log)
 	if err != nil {
 		return err
 	}
@@ -607,7 +620,7 @@ func (s *Stream) Cut() { s.cut(false, "") }
 func (s *Stream) CutLabel(label string) { s.cut(true, label) }
 
 func (s *Stream) cut(setLabel bool, label string) {
-	s.tel.flight.notify(s.Name)
+	s.proc.flight.notify(s.Name)
 	s.mu.Lock()
 	owed := false
 	if s.arch != nil {
@@ -671,7 +684,7 @@ func (s *Stream) Close() error {
 	close(s.stopWork)
 	s.workDone.Wait()
 	s.ring.LogLines() // the goroutine that logs them has stopped
-	s.tel.flight.notify(s.Name)
+	s.proc.flight.notify(s.Name)
 
 	s.io.Lock()
 	s.mu.Lock()
@@ -698,9 +711,9 @@ func (s *Stream) Close() error {
 	s.unpublish()
 	s.pubMu.Unlock()
 
-	s.tel.mu.Lock()
-	delete(s.tel.streams, s.Name)
-	s.tel.mu.Unlock()
+	s.proc.mu.Lock()
+	delete(s.proc.streams, s.Name)
+	s.proc.mu.Unlock()
 	s.ring.Close()
 	s.ownMu.Lock()
 	s.owner.release() // the next writer may start now

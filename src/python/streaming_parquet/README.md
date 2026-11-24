@@ -637,14 +637,14 @@ itself.
 | | Where the lines go | With nothing set up |
 |---|---|---|
 | Python | the loggers `streaming_parquet`, `parquet_checkpoint` and `arrow_ring` of `logging` | warnings and errors on standard error; no file |
-| Go | the `*slog.Logger` given in `Config.Logger` | warnings and errors on standard error, as text |
+| Go | the `*slog.Logger` given to `streaming.SetLogger` | warnings and errors on standard error, as text |
 | C cores | the host. A core writes nowhere: each line comes back, with its level and the time it was made, in the `Report` of the call that made it (`src/core/report.h`), and the host logs it | — |
 
     import logging
     logging.basicConfig(level=logging.INFO)        # the program's own setup
     sp.log_to_file("telemetry-diag.log")           # or: the library's lines in a file
 
-    tel, err := streaming.Init(streaming.Config{Logger: slog.Default()})
+    err := streaming.SetLogger(slog.Default())      // before the first stream or reader
 
 The levels mean the same in each language. An error is a fault that
 loses or delays data. A warning is a condition someone should look at.
@@ -667,28 +667,30 @@ the ownership check, the write plan, the store state, a reader's rules
 and the catalog are the same code. What it does not have yet is in the
 repository README ("Not yet the same").
 
-It is wire-compatible with this module
-(the same tickets in the store, the same Flight contract) and symmetric by design:
-there is no server role, only the two verbs, and ANY ring can archive
-— an attached process may StartParquet exactly like a creating one,
-because the parquet path consumes a ring and does not care whose.
+It works with this module: the same tickets in the store, the same
+Flight requests, the same files. There is no server role, only the two
+calls, as here.
 
 ```go
-tel, _ := streaming.Init(streaming.Config{Store: "/data/streams"})
-s, _ := tel.CreateStream("press/fieldbus", schema,
+s, _ := streaming.CreateStream("press/fieldbus", schema,
         streaming.StreamOptions{
+            Store: "/data/streams",
             Parquet: &streaming.ParquetOptions{BaseDir: dir,
                 CheckpointSeconds: 2}})   // nil = no files until a StartParquet
-// The ring holds two row groups: MemoryOptions.Rows and ParquetOptions.RowGroupRows
-// default to 245,760 and DuckDB's 122,880; give one and the other
-// follows; a ring under two row groups is refused.
-// Archive on S3 instead: ParquetOptions{Sink: pqc.NewS3Sink(s3client,
-// bucket, prefix), CheckpointSeconds: 2} — chunks are the 5 MiB part
-// minimum, the checkpoint is the durable tail between them.
-// write via s.Ring() (RowBegin/Set*/Commit, wire maps);
-// s.Commit() after your rows: readers see them at once, and the
-// stream's goroutine writes the files. A write fault shows in
-// s.ArchiveState(); s.Durable() is the first row not yet in a file.
+// Memory holds two row groups: MemoryOptions.Rows and
+// ParquetOptions.RowGroupRows default to 245,760 and DuckDB's 122,880;
+// give one and the other follows; memory under two row groups is refused.
+// Files on S3 instead: ParquetOptions{Sink: pqc.NewS3Sink(s3client,
+// bucket, prefix), CheckpointSeconds: 2}.
+
+x, _ := s.Column("x")
+row, _ := s.MutableRow(0)       // ONE goroutine writes a stream
+row.SetF64(x, 1.0)
+s.Commit()                      // readers see the rows at once; the
+                                // stream's goroutine writes the files
+// s.Append(record) writes the rows of an Arrow record batch and commits.
+// A write fault shows in s.ArchiveState(); s.Durable() is the first row
+// not yet in a file; s.MemoryState() is what memory holds.
 // s.StartParquet("job-19", nil) is a mark: a new file from this row on.
 // Give options there to replace the stream's, or to start files on a
 // stream created with none.
@@ -697,11 +699,20 @@ s, _ := tel.CreateStream("press/fieldbus", schema,
 // StreamOptions{Internal: true} makes a stream no other process finds
 // or reads; s.Publish() and s.Unpublish() change it later.
 
-a, _ := tel.Connect("probe/voltages", streaming.ConnectOptions{
+a, _ := streaming.Connect("probe/voltages", streaming.ConnectOptions{
+        Store: "/data/streams",
         Parquet: &streaming.ParquetOptions{BaseDir: dir}})
-r, _ := a.WaitRing(5 * time.Second)   // local ring fed by Flight
-a.StartParquet("cal-run")             // symmetric archival
+a.WaitConnected(5 * time.Second)      // the columns are known from here
+newest, ok := a.NewestRow()           // newest.F64(column)
+cursor := a.Cursor()                  // cursor.Next(): the rows not yet seen
+table, _ := a.ArrowTable()            // every row in memory, no copy; Release it
+a.StartParquet("cal-run")             // a reader with parquet options writes files too
+
+streaming.Close()                     // every stream and reader of the process
 ```
+
+`streaming.SetLogger(logger)` and `streaming.SetFlightAddress(":8815")`
+are set before the first stream or reader.
 
 `ParquetOptions.Sink` is the root the archive lives under (a bucket,
 or nil for a directory at BaseDir); the stream places its files at
@@ -709,9 +720,8 @@ or nil for a directory at BaseDir); the stream places its files at
 field is that location (`Sink.URI`). A caller that used to pass the
 stream's own prefix as the sink now passes the root.
 
-Composes the other two Go hosts: arrow-ring/go (the ring) and
-parquet-checkpoint/go (chunks + checkpoint via the shared C core;
-pqarrow encodes). Roots: file:// and s3://bucket[/prefix], the same
+It is built on the other two Go packages, `ring` and `pqc` (pqarrow
+encodes). Stores: a directory, file:// and s3://bucket[/prefix], the same
 ticket objects the Python module writes (tickets_s3.go, on the
 standard AWS credential chain). Cross-language gate:
 `run_go_streaming_compat.py` (hermetic file root) — Go publisher ->

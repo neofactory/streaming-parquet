@@ -12,7 +12,7 @@ import (
 // stored row stays.
 func TestTicketSaysWhatTheStoreHolds(t *testing.T) {
 	root := t.TempDir()
-	tel, err := Init(Config{Store: root})
+	tel, err := newProcess(processConfig{Store: root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -23,7 +23,7 @@ func TestTicketSaysWhatTheStoreHolds(t *testing.T) {
 		t.Fatal(err)
 	}
 	ticket := func() *Ticket {
-		tk, err := tel.tickets.get("t/store")
+		tk, err := ticketsOf(tel).get("t/store")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -79,4 +79,10 @@ func TestTicketSaysWhatTheStoreHolds(t *testing.T) {
 		*tk.Files[0].FinalRows != 0 {
 		t.Fatalf("the second file in the ticket: %+v", tk.Files)
 	}
+}
+
+// ticketsOf is where the tickets of a test process's store are.
+func ticketsOf(t *process) ticketStore {
+	_, tickets, _ := t.resolve("")
+	return tickets
 }

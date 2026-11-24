@@ -19,7 +19,7 @@ import (
 // against it; the checkpoint cadence moves it, with no call from the
 // producer.
 func TestDurableFollowsTheCheckpoint(t *testing.T) {
-	tel, err := Init(Config{FlightAddr: "127.0.0.1:0"})
+	tel, err := newProcess(processConfig{FlightAddr: "127.0.0.1:0"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestRingHoldsTwoRowGroups(t *testing.T) {
 				c.ring, c.group, ring, group, err, c.wantRing, c.wantGroup)
 		}
 	}
-	tel, err := Init(Config{})
+	tel, err := newProcess(processConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestRingHoldsTwoRowGroups(t *testing.T) {
 // A checkpoint publishes new rows only: with nothing committed since the
 // last one, the next interval writes no checkpoint.
 func TestCheckpointSkipsWhenNothingNew(t *testing.T) {
-	tel, err := Init(Config{})
+	tel, err := newProcess(processConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestFileIsCutByBytes(t *testing.T) {
 	was := FileCutBytes
 	FileCutBytes = 4000
 	defer func() { FileCutBytes = was }()
-	tel, err := Init(Config{})
+	tel, err := newProcess(processConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +199,7 @@ func parquetRows(path string) (int, error) {
 // not say gets the rule for a writer with no beat.
 func TestTicketSaysWhenItIsStale(t *testing.T) {
 	root := t.TempDir()
-	tel, err := Init(Config{Store: root})
+	tel, err := newProcess(processConfig{Store: root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +211,7 @@ func TestTicketSaysWhenItIsStale(t *testing.T) {
 	defer s.Close()
 	var tk *Ticket
 	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
-		if tk, err = tel.tickets.get("t/stale"); err != nil {
+		if tk, err = ticketsOf(tel).get("t/stale"); err != nil {
 			t.Fatal(err)
 		}
 		if tk != nil {
@@ -272,7 +272,7 @@ func fileRows(t *testing.T, dir string) map[string][]int64 {
 // there with every earlier row in it, and the new file holds the rows
 // committed after.
 func TestStartParquetIsAMark(t *testing.T) {
-	tel, err := Init(Config{})
+	tel, err := newProcess(processConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +309,7 @@ func TestStartParquetIsAMark(t *testing.T) {
 // A stream created with no parquet options writes no file until a
 // StartParquet gives them, and then only the rows committed after.
 func TestStartParquetOnAStreamCreatedWithNone(t *testing.T) {
-	tel, err := Init(Config{})
+	tel, err := newProcess(processConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +356,7 @@ func TestStartParquetOnAStreamCreatedWithNone(t *testing.T) {
 // A write fault shows in ArchiveState, not as the result of a call, and
 // clears when a write works again.
 func TestArchiveStateShowsAWriteFault(t *testing.T) {
-	tel, err := Init(Config{})
+	tel, err := newProcess(processConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +391,7 @@ func TestArchiveStateShowsAWriteFault(t *testing.T) {
 // Unpublish change a running stream.
 func TestPublishedOrInternal(t *testing.T) {
 	root := t.TempDir()
-	tel, err := Init(Config{Store: root})
+	tel, err := newProcess(processConfig{Store: root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,7 +402,7 @@ func TestPublishedOrInternal(t *testing.T) {
 		t.Fatal(err)
 	}
 	listed := func() bool {
-		names, _ := tel.ListStreams()
+		names, _ := tel.ListStreams("")
 		for _, n := range names {
 			if n == "t/int" {
 				return true
@@ -437,7 +437,7 @@ func TestPublishedOrInternal(t *testing.T) {
 			s.Published(), listed(), served())
 	}
 	writeRows(t, s, 10, 5) // the stream itself goes on
-	if got := s.Ring().NewestSeq(); got != 14 {
+	if got := s.ring.NewestSeq(); got != 14 {
 		t.Fatalf("newest seq %d, want 14", got)
 	}
 }
@@ -446,7 +446,7 @@ func TestPublishedOrInternal(t *testing.T) {
 // whole ring around to rows not yet written waits at that pin, and no
 // row is lost; when the store works again every row is written.
 func TestWriterWaitsForRowsNotYetWritten(t *testing.T) {
-	tel, err := Init(Config{})
+	tel, err := newProcess(processConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -465,7 +465,7 @@ func TestWriterWaitsForRowsNotYetWritten(t *testing.T) {
 	writeRows(t, s, 0, 200)   // one row group due: pinned, its write fails
 	writeRows(t, s, 200, 200) // a second: the ring is full of unwritten rows
 	waitUntil(t, "the fault", func() bool { return s.ArchiveState().Failing })
-	_, err = s.Ring().RowBegin(50 * time.Millisecond)
+	_, err = s.ring.RowBegin(50 * time.Millisecond)
 	if !ring.IsPinStalled(err) {
 		t.Fatalf("a row into a ring of unwritten rows: %v, want the writer to wait at the pin", err)
 	}

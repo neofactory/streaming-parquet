@@ -11,7 +11,7 @@ import (
 // begins a new one: every row is in one file, once. CutLabel names the
 // next file.
 func TestCut(t *testing.T) {
-	tel, err := Init(Config{})
+	tel, err := newProcess(processConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestCut(t *testing.T) {
 
 // Cut on a stream that writes no files does nothing.
 func TestCutWhenNotRecording(t *testing.T) {
-	tel, err := Init(Config{})
+	tel, err := newProcess(processConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}

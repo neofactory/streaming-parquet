@@ -36,9 +36,9 @@ func (o *ownership) release() {
 }
 
 // lockDir is the local directory lock files live under.
-func (t *Telemetry) lockDir() string {
-	root := strings.TrimPrefix(t.root, "file://")
-	if t.root != "" && !strings.Contains(root, "://") {
+func lockDir(store string) string {
+	root := strings.TrimPrefix(store, "file://")
+	if store != "" && !strings.Contains(root, "://") {
 		return root
 	}
 	name := "unknown"
@@ -49,9 +49,11 @@ func (t *Telemetry) lockDir() string {
 }
 
 // claim owns the stream name, or returns an error that names who does.
-func (t *Telemetry) claim(name, run string) (*ownership, error) {
+// store and tickets are the stream's: "" and nil for a stream with no
+// store.
+func (t *process) claim(name, run, store string, tickets ticketStore) (*ownership, error) {
 	who := fmt.Sprintf("CreateStream(%q)", name)
-	path := filepath.Join(t.lockDir(), "streams", filepath.FromSlash(name), "writer.lock")
+	path := filepath.Join(lockDir(store), "streams", filepath.FromSlash(name), "writer.lock")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("%s: the lock file's directory: %w", who, err)
 	}
@@ -72,17 +74,17 @@ func (t *Telemetry) claim(name, run string) (*ownership, error) {
 	f.Truncate(0)
 	f.WriteAt(lockRecord(os.Getpid(), host, t.flight.port, run), 0)
 	owned := &ownership{path: path, f: f}
-	if t.tickets == nil {
+	if tickets == nil {
 		return owned, nil
 	}
-	ticket, err := t.tickets.get(name)
+	ticket, err := tickets.get(name)
 	if err != nil {
 		// an unreachable store at start never delays the stream: this
 		// server's lock still holds
-		t.log.Warn(ownershipUnread(name, t.root, err))
+		t.log.Warn(ownershipUnread(name, store, err))
 		return owned, nil
 	}
-	decision, message := ownershipDecision(who, name, t.root, ticket, host)
+	decision, message := ownershipDecision(who, name, store, ticket, host)
 	switch decision {
 	case ownRefused:
 		owned.release()

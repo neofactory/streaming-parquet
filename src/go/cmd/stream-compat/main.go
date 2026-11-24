@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/neofactory/streaming-parquet/src/go/streaming"
 )
 
@@ -73,6 +74,51 @@ func schemaNX() *arrow.Schema {
 	}, nil)
 }
 
+// waitRows waits until the reader has the row numbered minRows-1, and
+// answers every row it holds in memory as one table.
+func waitRows(a *streaming.Attached, minRows int) arrow.Table {
+	if err := a.WaitConnected(15 * time.Second); err != nil {
+		die(err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		newest, ok := a.NewestRow()
+		if ok && newest.RowNumber()+1 >= int64(minRows) {
+			break
+		}
+		if time.Now().After(deadline) {
+			die(fmt.Errorf("timeout: the newest row is %d, want >= %d "+
+				"(state %s)", newest.RowNumber(), minRows-1, a.State()))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	table, err := a.ArrowTable()
+	if err != nil {
+		die(err)
+	}
+	return table
+}
+
+// rowsOf calls each for every row of the table, the oldest first.
+func rowsOf(t arrow.Table, each func(rec arrow.RecordBatch, i int)) {
+	rdr := array.NewTableReader(t, 0)
+	defer rdr.Release()
+	for rdr.Next() {
+		rec := rdr.RecordBatch()
+		for i := 0; i < int(rec.NumRows()); i++ {
+			each(rec, i)
+		}
+	}
+}
+
+func column(rec arrow.RecordBatch, name string) arrow.Array {
+	idx := rec.Schema().FieldIndices(name)
+	if len(idx) == 0 {
+		die(fmt.Errorf("the table has no column %q", name))
+	}
+	return rec.Column(idx[0])
+}
+
 func die(err error) {
 	fmt.Fprintln(os.Stderr, "stream-compat:", err)
 	os.Exit(1)
@@ -87,45 +133,45 @@ func main() {
 	// standard error
 	logger := slog.New(slog.NewTextHandler(os.Stderr,
 		&slog.HandlerOptions{Level: slog.LevelInfo}))
-	tel, err := streaming.Init(streaming.Config{Store: os.Args[2], Logger: logger})
-	if err != nil {
+	if err := streaming.SetLogger(logger); err != nil {
 		die(err)
 	}
-	defer tel.Close()
+	defer streaming.Close()
+	store := os.Args[2]
 	name := os.Args[3]
 	switch os.Args[1] {
 	case "serve-rich":
 		rows, _ := strconv.Atoi(os.Args[4])
 		hold, _ := strconv.ParseFloat(os.Args[5], 64)
-		s, err := tel.CreateStream(name, schemaRich(),
-			streaming.StreamOptions{Memory: &streaming.MemoryOptions{Rows: int64(rows) * 2}})
+		s, err := streaming.CreateStream(name, schemaRich(),
+			streaming.StreamOptions{Store: store, Memory: &streaming.MemoryOptions{Rows: int64(rows) * 2}})
 		if err != nil {
 			die(err)
 		}
-		r := s.Ring()
-		nl, _ := r.Leaf("n")
-		fl, _ := r.Leaf("f")
-		sl, _ := r.Leaf("s")
-		tl, _ := r.Leaf("t")
-		gl, _ := r.Leaf("tags")
+		nl, _ := s.Column("n")
+		fl, _ := s.Column("f")
+		sl, _ := s.Column("s")
+		tl, _ := s.Column("t")
+		gl, _ := s.Column("tags")
 		time.Sleep(1500 * time.Millisecond)
 		for i := int64(0); i < int64(rows); {
 			for k := 0; k < 50 && i < int64(rows); k++ {
-				if _, err := r.RowBegin(time.Second); err != nil {
+				row, err := s.MutableRow(time.Second)
+				if err != nil {
 					die(err)
 				}
-				r.SetI64(nl, i)
+				row.SetI64(nl, i)
 				if v, isNull := richF(i); isNull {
-					r.SetNull(fl)
+					row.SetNull(fl)
 				} else {
-					r.SetF64(fl, v)
+					row.SetF64(fl, v)
 				}
 				if v, isNull := richS(i); isNull {
-					r.SetNull(sl)
+					row.SetNull(sl)
 				} else {
-					r.SetString(sl, v)
+					row.SetString(sl, v)
 				}
-				r.SetI64(tl, i*1_000_000)
+				row.SetI64(tl, i*1_000_000)
 				elems := make([]byte, 0, 24)
 				for j := int64(0); j < i%3; j++ {
 					var b [8]byte
@@ -134,7 +180,7 @@ func main() {
 					}
 					elems = append(elems, b[:]...)
 				}
-				r.SetList(gl, elems, i%3)
+				row.SetList(gl, elems, i%3)
 				i++
 			}
 			if _, err := s.Commit(); err != nil {
@@ -146,42 +192,30 @@ func main() {
 		fmt.Println("served", rows)
 	case "attach-rich":
 		minRows, _ := strconv.Atoi(os.Args[4])
-		a, err := tel.Connect(name, streaming.ConnectOptions{Memory: &streaming.MemoryOptions{Rows: 20000}})
+		a, err := streaming.Connect(name, streaming.ConnectOptions{Store: store, Memory: &streaming.MemoryOptions{Rows: 20000}})
 		if err != nil {
 			die(err)
 		}
 		defer a.Close()
-		r, err := a.WaitRing(15 * time.Second)
-		if err != nil {
-			die(err)
-		}
-		deadline := time.Now().Add(30 * time.Second)
-		for r.NewestSeq()+1 < int64(minRows) {
-			if time.Now().After(deadline) {
-				die(fmt.Errorf("timeout at %d rows", r.NewestSeq()+1))
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
-		nl, _ := r.Leaf("n")
-		fl, _ := r.Leaf("f")
-		sl, _ := r.Leaf("s")
-		tl, _ := r.Leaf("t")
+		table := waitRows(a, minRows)
+		defer table.Release()
 		nulls, nans := 0, 0
-		lo, hi := r.OldestSeq(), r.NewestSeq()
-		for seq := lo; seq <= hi; seq++ {
-			n, _, err := r.GetI64(seq, nl)
-			if err != nil || n != seq {
-				die(fmt.Errorf("n@%d=%d (%v)", seq, n, err))
+		lo, hi := int64(-1), int64(-1)
+		rowsOf(table, func(rec arrow.RecordBatch, i int) {
+			n := column(rec, "n").(*array.Int64).Value(i)
+			if lo < 0 {
+				lo = n
+			} else if n != hi+1 {
+				die(fmt.Errorf("gap: n %d -> %d", hi, n))
 			}
-			f, isNull, err := r.GetF64(seq, fl)
-			if err != nil {
-				die(err)
-			}
+			hi = n
+			fcol := column(rec, "f").(*array.Float64)
 			ef, en := richF(n)
-			if isNull != en {
+			if fcol.IsNull(i) != en {
 				die(fmt.Errorf("f null mismatch at n=%d", n))
 			}
 			if !en {
+				f := fcol.Value(i)
 				if math.IsNaN(ef) != math.IsNaN(f) ||
 					(!math.IsNaN(ef) && f != ef) {
 					die(fmt.Errorf("f@%d = %v want %v", n, f, ef))
@@ -192,40 +226,41 @@ func main() {
 			} else {
 				nulls++
 			}
-			b, sNull, err := r.GetBytes(seq, sl)
-			if err != nil {
-				die(err)
-			}
+			scol := column(rec, "s")
 			es, esn := richS(n)
-			if sNull != esn || (!esn && string(b) != es) {
+			if scol.IsNull(i) != esn || (!esn && scol.(array.StringLike).Value(i) != es) {
 				die(fmt.Errorf("s@%d = %q null=%v want %q null=%v",
-					n, b, sNull, es, esn))
+					n, scol.ValueStr(i), scol.IsNull(i), es, esn))
 			}
-			tv, _, err := r.GetI64(seq, tl)
-			if err != nil || tv != n*1_000_000 {
-				die(fmt.Errorf("t@%d = %d (%v)", n, tv, err))
+			tv := int64(column(rec, "t").(*array.Timestamp).Value(i))
+			if tv != n*1_000_000 {
+				die(fmt.Errorf("t@%d = %d", n, tv))
 			}
+		})
+		// a row's number in the stream is its n: the writer counted from 0
+		if newest, ok := a.NewestRow(); !ok || newest.RowNumber() < hi {
+			die(fmt.Errorf("the newest row is before the table's last, n=%d", hi))
 		}
 		fmt.Printf("%d %d %d %d\n", lo, hi, nulls, nans)
 	case "serve-nx":
 		rows, _ := strconv.Atoi(os.Args[4])
 		hold, _ := strconv.ParseFloat(os.Args[5], 64)
-		s, err := tel.CreateStream(name, schemaNX(),
-			streaming.StreamOptions{Memory: &streaming.MemoryOptions{Rows: int64(rows) * 2}})
+		s, err := streaming.CreateStream(name, schemaNX(),
+			streaming.StreamOptions{Store: store, Memory: &streaming.MemoryOptions{Rows: int64(rows) * 2}})
 		if err != nil {
 			die(err)
 		}
-		r := s.Ring()
-		nl, _ := r.Leaf("n")
-		xl, _ := r.Leaf("x")
+		nl, _ := s.Column("n")
+		xl, _ := s.Column("x")
 		time.Sleep(1500 * time.Millisecond)
 		for i := 0; i < rows; {
 			for k := 0; k < 100 && i < rows; k++ {
-				if _, err := r.RowBegin(time.Second); err != nil {
+				row, err := s.MutableRow(time.Second)
+				if err != nil {
 					die(err)
 				}
-				r.SetI64(nl, int64(i))
-				r.SetF64(xl, float64(i)*0.5)
+				row.SetI64(nl, int64(i))
+				row.SetF64(xl, float64(i)*0.5)
 				i++
 			}
 			if _, err := s.Commit(); err != nil {
@@ -237,70 +272,53 @@ func main() {
 		fmt.Println("served", rows)
 	case "attach-nx":
 		minRows, _ := strconv.Atoi(os.Args[4])
-		a, err := tel.Connect(name, streaming.ConnectOptions{})
+		a, err := streaming.Connect(name, streaming.ConnectOptions{Store: store})
 		if err != nil {
 			die(err)
 		}
 		defer a.Close()
-		r, err := a.WaitRing(15 * time.Second)
-		if err != nil {
-			die(err)
-		}
-		deadline := time.Now().Add(30 * time.Second)
-		for r.NewestSeq()+1 < int64(minRows) {
-			if time.Now().After(deadline) {
-				die(fmt.Errorf("timeout: ring has %d rows, want >= %d "+
-					"(state %s)", r.NewestSeq()+1, minRows, a.State()))
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
-		nl, _ := r.Leaf("n")
-		xl, _ := r.Leaf("x")
-		lo, hi := r.OldestSeq(), r.NewestSeq()
-		var firstN, lastN int64
-		for seq := lo; seq <= hi; seq++ {
-			v, _, err := r.GetI64(seq, nl)
-			if err != nil {
-				die(fmt.Errorf("n@%d: %w", seq, err))
-			}
-			if seq == lo {
+		table := waitRows(a, minRows)
+		defer table.Release()
+		firstN, lastN := int64(-1), int64(-1)
+		rowsOf(table, func(rec arrow.RecordBatch, i int) {
+			v := column(rec, "n").(*array.Int64).Value(i)
+			if firstN < 0 {
 				firstN = v
 			} else if v != lastN+1 {
-				die(fmt.Errorf("gap at seq %d: n %d -> %d", seq, lastN, v))
+				die(fmt.Errorf("gap: n %d -> %d", lastN, v))
 			}
 			lastN = v
-			x, _, err := r.GetF64(seq, xl)
-			if err != nil || x != float64(v)*0.5 {
-				die(fmt.Errorf("x@%d = %v (n=%d, %v)", seq, x, v, err))
+			if x := column(rec, "x").(*array.Float64).Value(i); x != float64(v)*0.5 {
+				die(fmt.Errorf("x@n=%d is %v", v, x))
 			}
-		}
+		})
 		fmt.Printf("%d %d\n", firstN, lastN)
 	case "serve":
 		rows, _ := strconv.Atoi(os.Args[4])
 		hold, _ := strconv.ParseFloat(os.Args[5], 64)
-		o := streaming.StreamOptions{Memory: &streaming.MemoryOptions{Rows: int64(rows) * 2}}
+		o := streaming.StreamOptions{Store: store, Memory: &streaming.MemoryOptions{Rows: int64(rows) * 2}}
 		if len(os.Args) > 6 && os.Args[6] == "pq" {
 			// files under the root, where a reader of the root finds them
 			o.Parquet = &streaming.ParquetOptions{BaseDir: os.Args[2],
 				RowGroupRows: 500, CheckpointSeconds: 0.1}
 		}
-		s, err := tel.CreateStream(name, schema(), o)
+		s, err := streaming.CreateStream(name, schema(), o)
 		if err != nil {
 			die(err)
 		}
-		r := s.Ring()
-		nl, _ := r.Leaf("n")
-		xl, _ := r.Leaf("x")
-		sl, _ := r.Leaf("s")
+		nl, _ := s.Column("n")
+		xl, _ := s.Column("x")
+		sl, _ := s.Column("s")
 		time.Sleep(1500 * time.Millisecond) // let subscribers find us
 		for i := 0; i < rows; {
 			for k := 0; k < 100 && i < rows; k++ {
-				if _, err := r.RowBegin(time.Second); err != nil {
+				row, err := s.MutableRow(time.Second)
+				if err != nil {
 					die(err)
 				}
-				r.SetI64(nl, int64(i))
-				r.SetF64(xl, float64(i)*0.5)
-				r.SetString(sl, fmt.Sprintf("row-%d", i))
+				row.SetI64(nl, int64(i))
+				row.SetF64(xl, float64(i)*0.5)
+				row.SetString(sl, fmt.Sprintf("row-%d", i))
 				i++
 			}
 			if _, err := s.Commit(); err != nil {
@@ -321,7 +339,7 @@ func main() {
 			parquet = &streaming.ParquetOptions{BaseDir: pqdir,
 				RowGroupRows: 500, CheckpointSeconds: 0.1}
 		}
-		a, err := tel.Connect(name, streaming.ConnectOptions{Parquet: parquet})
+		a, err := streaming.Connect(name, streaming.ConnectOptions{Store: store, Parquet: parquet})
 		if err != nil {
 			die(err)
 		}
@@ -331,39 +349,22 @@ func main() {
 				die(err)
 			}
 		}
-		r, err := a.WaitRing(15 * time.Second)
-		if err != nil {
-			die(err)
-		}
-		deadline := time.Now().Add(30 * time.Second)
-		for r.NewestSeq()+1 < int64(minRows) {
-			if time.Now().After(deadline) {
-				die(fmt.Errorf("timeout: ring has %d rows, want >= %d "+
-					"(state %s)", r.NewestSeq()+1, minRows, a.State()))
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
-		nl, _ := r.Leaf("n")
-		sl, _ := r.Leaf("s")
-		lo, hi := r.OldestSeq(), r.NewestSeq()
-		var firstN, lastN int64
-		for seq := lo; seq <= hi; seq++ {
-			v, _, err := r.GetI64(seq, nl)
-			if err != nil {
-				die(fmt.Errorf("n@%d: %w", seq, err))
-			}
-			if seq == lo {
+		table := waitRows(a, minRows)
+		defer table.Release()
+		firstN, lastN := int64(-1), int64(-1)
+		last := ""
+		rowsOf(table, func(rec arrow.RecordBatch, i int) {
+			v := column(rec, "n").(*array.Int64).Value(i)
+			if firstN < 0 {
 				firstN = v
 			} else if v != lastN+1 {
-				die(fmt.Errorf("gap at seq %d: n %d -> %d", seq, lastN, v))
+				die(fmt.Errorf("gap: n %d -> %d", lastN, v))
 			}
 			lastN = v
-			if seq == hi {
-				b, _, err := r.GetBytes(seq, sl)
-				if err != nil || string(b) != fmt.Sprintf("row-%d", v) {
-					die(fmt.Errorf("s@%d = %q (%v)", seq, b, err))
-				}
-			}
+			last = column(rec, "s").(array.StringLike).Value(i)
+		})
+		if last != fmt.Sprintf("row-%d", lastN) {
+			die(fmt.Errorf("s of the last row (n=%d) is %q", lastN, last))
 		}
 		out := fmt.Sprintf("%d %d", firstN, lastN)
 		if pqdir != "" {

@@ -103,28 +103,24 @@ func main() {
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
 	deadline := time.Now().Add(time.Duration(seconds * float64(time.Second)))
 
-	tel, err := streaming.Init(streaming.Config{Store: root})
-	if err != nil {
-		die(err)
-	}
-	defer tel.Close()
+	defer streaming.Close()
 
 	switch role {
 	case "pub":
-		runPub(tel, name, kind, rate, rng, archdir, deadline, stop)
+		runPub(root, name, kind, rate, rng, archdir, deadline, stop)
 	case "sub":
-		runSub(tel, name, kind, rate, rng, archdir, deadline, stop)
+		runSub(root, name, kind, rate, rng, archdir, deadline, stop)
 	default:
 		os.Exit(2)
 	}
 	writeStatus()
 }
 
-func runPub(tel *streaming.Telemetry, name, kind string, rate int,
+func runPub(store, name, kind string, rate int,
 	rng *rand.Rand, archdir string, deadline time.Time,
 	stop chan os.Signal) {
-	s, err := tel.CreateStream(name, schemaFor(kind),
-		streaming.StreamOptions{Memory: &streaming.MemoryOptions{Rows: int64(rate) * 6}})
+	s, err := streaming.CreateStream(name, schemaFor(kind),
+		streaming.StreamOptions{Store: store, Memory: &streaming.MemoryOptions{Rows: int64(rate) * 6}})
 	if err != nil {
 		die(err)
 	}
@@ -138,12 +134,11 @@ func runPub(tel *streaming.Telemetry, name, kind string, rate int,
 		}
 	}
 	nextChurn := time.Now().Add(time.Duration(45+rng.Intn(135)) * time.Second)
-	r := s.Ring()
-	nl, _ := r.Leaf("n")
-	xl, _ := r.Leaf("x")
-	sl := int32(-1)
+	nl, _ := s.Column("n")
+	xl, _ := s.Column("x")
+	sl := streaming.Column(-1)
 	if kind == "str" {
-		sl, _ = r.Leaf("s")
+		sl, _ = s.Column("s")
 	}
 	var n int64
 	burst := rate / 50 // 20ms cadence
@@ -159,17 +154,18 @@ func runPub(tel *streaming.Telemetry, name, kind string, rate int,
 		default:
 		}
 		for k := 0; k < burst; k++ {
-			if _, err := r.RowBegin(2 * time.Second); err != nil {
+			row, err := s.MutableRow(2 * time.Second)
+			if err != nil {
 				// pin stall is loud and survivable; count and retry
 				st.Stalls++
 				time.Sleep(100 * time.Millisecond)
 				k--
 				continue
 			}
-			r.SetI64(nl, n)
-			r.SetF64(xl, float64(n)*0.5)
+			row.SetI64(nl, n)
+			row.SetF64(xl, float64(n)*0.5)
 			if sl >= 0 {
-				r.SetString(sl, strFor(n))
+				row.SetString(sl, strFor(n))
 			}
 			n++
 		}
@@ -213,7 +209,7 @@ done:
 	s.Close()
 }
 
-func runSub(tel *streaming.Telemetry, name, kind string, rate int,
+func runSub(store, name, kind string, rate int,
 	rng *rand.Rand, archdir string, deadline time.Time,
 	stop chan os.Signal) {
 	var parquet *streaming.ParquetOptions
@@ -222,8 +218,8 @@ func runSub(tel *streaming.Telemetry, name, kind string, rate int,
 			RowGroupSeconds: 3, CheckpointSeconds: 0.7,
 			RowGroupRows: int64(rate) * 3}
 	}
-	a, err := tel.Connect(name, streaming.ConnectOptions{
-		Memory: &streaming.MemoryOptions{Rows: int64(rate) * 6}, Parquet: parquet})
+	a, err := streaming.Connect(name, streaming.ConnectOptions{
+		Store: store, Memory: &streaming.MemoryOptions{Rows: int64(rate) * 6}, Parquet: parquet})
 	if err != nil {
 		die(err)
 	}
@@ -235,7 +231,12 @@ func runSub(tel *streaming.Telemetry, name, kind string, rate int,
 		}
 	}
 	nextChurn := time.Now().Add(time.Duration(45+rng.Intn(135)) * time.Second)
-	var lastSeq, lastN int64 = -1, -1
+	// made before the first connection: it starts at the oldest row the
+	// reader receives
+	cursor := a.Cursor()
+	var nl streaming.Column
+	haveColumn := false
+	var lastN int64 = -1
 	lastStatus := time.Now()
 	for time.Now().Before(deadline) {
 		select {
@@ -243,27 +244,24 @@ func runSub(tel *streaming.Telemetry, name, kind string, rate int,
 			goto done
 		case <-time.After(100 * time.Millisecond):
 		}
-		r := a.Ring()
-		if r == nil {
-			continue
+		if !haveColumn {
+			c, err := a.Column("n")
+			if err != nil {
+				continue // not connected yet
+			}
+			nl, haveColumn = c, true
 		}
-		nl, err := r.Leaf("n")
-		if err != nil {
-			continue
-		}
-		newest := r.NewestSeq()
-		if newest < 0 {
-			continue
-		}
-		oldest := r.OldestSeq()
-		start := lastSeq + 1
-		if start < oldest { // fell behind (SIGSTOP chaos etc.)
-			st.Resyncs++
-			start = oldest
-			lastN = -2 // unknown; next row starts a fresh check run
-		}
-		for seq := start; seq <= newest; seq++ {
-			v, _, err := r.GetI64(seq, nl)
+		for lost := cursor.Lost(); ; {
+			row, ok := cursor.Next()
+			if !ok {
+				break
+			}
+			if cursor.Lost() != lost { // fell behind (SIGSTOP chaos etc.)
+				lost = cursor.Lost()
+				st.Resyncs++
+				lastN = -2 // unknown; this row starts a fresh check run
+			}
+			v, _, err := row.I64(nl)
 			if err != nil {
 				st.Resyncs++
 				lastN = -2
@@ -280,7 +278,6 @@ func runSub(tel *streaming.Telemetry, name, kind string, rate int,
 				st.Gaps++ // a real hole: unexplained loss
 			}
 			lastN = v
-			lastSeq = seq
 			st.Rows++
 		}
 		if archdir != "-" && time.Now().After(nextChurn) {

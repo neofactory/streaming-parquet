@@ -13,12 +13,12 @@ import (
 // refusal names the holder; the stream is free once the holder closes.
 func TestSecondWriterOnThisServerIsRefused(t *testing.T) {
 	root := t.TempDir()
-	first, err := Init(Config{Store: root})
+	first, err := newProcess(processConfig{Store: root})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer first.Close()
-	second, err := Init(Config{Store: root})
+	second, err := newProcess(processConfig{Store: root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,9 +50,9 @@ func TestSecondWriterOnThisServerIsRefused(t *testing.T) {
 // can each have one of the same name. Publish takes the lock.
 func TestInternalStreamTakesNoLock(t *testing.T) {
 	root := t.TempDir()
-	a, _ := Init(Config{Store: root})
+	a, _ := newProcess(processConfig{Store: root})
 	defer a.Close()
-	b, _ := Init(Config{Store: root})
+	b, _ := newProcess(processConfig{Store: root})
 	defer b.Close()
 	sa, err := a.CreateStream("t/in", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400}, Internal: true})
 	if err != nil {
@@ -78,7 +78,7 @@ func TestInternalStreamTakesNoLock(t *testing.T) {
 // taken over.
 func TestTicketOfAnotherServer(t *testing.T) {
 	root := t.TempDir()
-	tel, err := Init(Config{Store: root})
+	tel, err := newProcess(processConfig{Store: root})
 	if err != nil {
 		t.Fatal(err)
 	}

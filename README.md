@@ -146,26 +146,27 @@ The rule: the two languages have the same concepts, the same words and the same 
 
 | Concept | Python (`import streaming_parquet as sp`) | Go (`.../src/go/streaming`) |
 |---|---|---|
-| The process's context | the module `sp` | `tel, err := streaming.Init(streaming.Config{...})` |
-| The store | `store=` on each call, else `$STREAMING_PARQUET_STORE` | `Config.Store`, else `$STREAMING_PARQUET_STORE` |
-| Create a stream | `sp.create_stream(name, schema, ...)` | `tel.CreateStream(name, schema, StreamOptions{...})` |
+| The store | `store=` on each call, else `$STREAMING_PARQUET_STORE` | `Store:` in the options of each call, else `$STREAMING_PARQUET_STORE` |
+| Create a stream | `sp.create_stream(name, schema, ...)` | `streaming.CreateStream(name, schema, StreamOptions{...})` |
 | Rows kept in memory | `memory=sp.MemoryOptions(rows=n)` | `Memory: &MemoryOptions{Rows: n}` |
 | Parquet options | `parquet=sp.ParquetOptions(...)`; `None` = no files | `StreamOptions.Parquet *ParquetOptions`; `nil` = no files |
 | Where the files go | the store, through the spool for S3 | `ParquetOptions.BaseDir` or `ParquetOptions.Sink` |
 | Published or internal | `publish=True`; `s.publish()`, `s.unpublish()` | `StreamOptions.Internal`; `s.Publish()`, `s.Unpublish()`, `s.Published()` |
-| Write a row | `row = s.get_mutable_row()`; `row.x = 1.0`; `s.commit()` | `s.Ring().RowBegin(block)`; `s.Ring().SetF64(leaf, 1.0)`; `s.Commit()` |
-| Write many rows | `s.append(table)` | `s.Ring().AppendRecord(rec)`; `s.Commit()` |
-| Packed binary frames | `s.wire_map(entries)`; `s.from_wire(m, frame)` | `s.Ring().NewWireMap(entries)`; `s.Ring().FromWire(m, frame)` |
+| Write a row | `row = s.get_mutable_row()`; `row.x = 1.0`; `s.commit()` | `row, err := s.MutableRow(block)`; `row.SetF64(x, 1.0)`; `s.Commit()` |
+| A column, for the Go setters and getters | the attribute `row.x` | `x, err := s.Column("x")` |
+| Write many rows | `s.append(table)` | `s.Append(record)` |
+| Packed binary frames | `s.wire_map(entries)`; `s.from_wire(m, frame)` | `s.WireMap(entries)`; `row.FromWire(m, frame)` |
 | End the file, begin the next | `s.cut(label)` | `s.Cut()`; `s.CutLabel(label)` |
 | Parquet on and off | `s.start_parquet(label, options)`; `s.stop_parquet()` | `s.StartParquet(label, options)`; `s.StopParquet()` |
-| The standing of the files | `s.archive_state()`; `s.mirror_state()` | `s.ArchiveState()`; `s.Durable()` |
-| Read a stream | `a = sp.connect(name, store=...)` | `a, err := tel.Connect(name, ConnectOptions{...})` |
-| A reader's rows | `a.newest_row()`; `a.cursor()`; `a.arrow_table()` | `a.Ring()`: getters, `Pin(lo, hi)` record sets |
+| The state of the files and of memory | `s.archive_state()`; `s.mirror_state()`; `s.memory_state()` | `s.ArchiveState()`; `s.Durable()`; `s.MemoryState()` |
+| Read a stream | `a = sp.connect(name, store=...)` | `a, err := streaming.Connect(name, ConnectOptions{...})` |
+| Read rows (a stream and a reader alike) | `a.newest_row()`; `a.cursor()`; `a.arrow_table()` | `a.NewestRow()`; `a.Cursor()`; `a.ArrowTable()`, `a.ArrowTableNewest(rows)` |
+| One value of a row | `row.x` | `v, null, err := row.F64(x)` |
 | A reader's state, and why it is not streaming | `a.state`; `a.reason` | `a.State()`; `a.Reason()` |
 | DuckDB views | `duckdb_live`, `duckdb_archive`, `duckdb_all` | none: a Go program queries the store with DuckDB directly |
-| List the streams | `sp.list_streams(store)` | `tel.ListStreams()` |
-| Log lines | logger `streaming_parquet`; `sp.log_to_file(path)` | `Config.Logger *slog.Logger` |
-| Close | `s.close()`; `sp.close()` | `s.Close()`; `tel.Close()` |
+| List the streams | `sp.list_streams(store)` | `streaming.ListStreams(store)` |
+| Log lines | logger `streaming_parquet`; `sp.log_to_file(path)` | `streaming.SetLogger(logger)`, a `*slog.Logger` |
+| Close | `s.close()`; `sp.close()` | `s.Close()`; `streaming.Close()` |
 
 The same in both, because one C core decides it:
 
@@ -181,13 +182,14 @@ The same in both, because one C core decides it:
 Not yet the same (each of these is a difference in words or in reach, not in the stored data):
 
 - **Published**: Go's option is `Internal` (the reverse sense of `publish`).
-- **The ring**: a Go program writes and reads through `Ring()`; Python hides the ring.
 - **Where files go**: Go names a `BaseDir` or a `Sink` in the Parquet options and has no spool, no `ship_seconds` and no mirror state.
 - **Views**: Go has none.
 - **A reader that writes files**: Go's reader can (`ConnectOptions.Parquet`); Python's cannot.
-- **State of memory**: Go has no `memory_state`.
 - **The stored row number**: Go has `Durable()`; Python has no call for it.
-- **The process's context**: the Go type is still named `Telemetry`.
+- **A row's number**: Go's rows have `RowNumber()`; Python's rows do not show it.
+- **Rows from a value on**: Python's `cursor` and `arrow_table` take `since=(column, value)`; Go's do not.
+- **One flat row from a dict**: Python's `append` takes one; Go has no such form.
+- **The Flight address**: Go has `streaming.SetFlightAddress`; Python always takes a free port.
 
 ## The C cores
 
@@ -206,7 +208,7 @@ A core does no input and no output, calls no function of its host, and never wai
 The library logs the way each language does, and never prints by itself.
 
 - **Python**: the standard `logging` module, loggers `streaming_parquet`, `parquet_checkpoint` and `arrow_ring`. No handler and no file by default. `sp.log_to_file(path)` writes INFO and above to a file; `$STREAMING_PARQUET_DIAG_LOG` does the same at import.
-- **Go**: `Config.Logger`, a `*slog.Logger`. With none, warnings and errors go to standard error.
+- **Go**: `streaming.SetLogger(logger)`, a `*slog.Logger`, before the first stream or reader. With none, warnings and errors go to standard error.
 - **The C cores**: no output. Their lines reach the host's log through the `Report`, each with the time the core made it. A line made on a writer's thread is logged by another thread.
 
 ## Install

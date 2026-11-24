@@ -18,11 +18,12 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// Attached is the read face of a remote stream: a local ring fed by
-// Flight, discovered by polling the root's ticket (or dialed directly
-// with a Ticket). The same ring calls work as on a created stream — and so
-// does archival: an attached process may StartParquet, because the
-// parquet path consumes a ring and any ring can archive.
+// Attached is a reader of a stream: the answer of Connect. A stream of
+// this process is read in place. A stream of another process is found
+// by its ticket in the store (or by a Ticket the caller gives) and its
+// rows are pulled over Flight into memory of this reader's own. The
+// reading calls are the same as a Stream's. A reader with parquet
+// options can also write the rows it receives to files.
 type Attached struct {
 	Name string
 	log  *slog.Logger
@@ -51,9 +52,14 @@ type Attached struct {
 	first  readerStep   // the step of the poll Connect made
 	closed chan struct{}
 	done   sync.WaitGroup
+
+	proc    *process
+	root    string      // the store this reader looks in, "" for none
+	tickets ticketStore // nil with no store
 }
 
 type ConnectOptions struct {
+	Store   string          // the store the stream is in; "" = $STREAMING_PARQUET_STORE
 	Memory  *MemoryOptions  // rows this reader keeps in memory; nil = the default
 	Columns []string        // subset subscription; nil = all
 	Ticket  *Ticket         // dial directly, with no look in the store
@@ -63,7 +69,11 @@ type ConnectOptions struct {
 // Connect opens a reader of a stream. Remote: a feeder goroutine waits for a
 // live ticket, connects, and appends every received batch into the
 // local ring (reconnecting with backoff). State() reports where it is.
-func (t *Telemetry) Connect(name string, o ConnectOptions) (*Attached, error) {
+func (t *process) Connect(name string, o ConnectOptions) (*Attached, error) {
+	root, tickets, err := t.resolve(o.Store)
+	if err != nil {
+		return nil, err
+	}
 	var archOpt *ParquetOptions
 	var givenGroupRows int64
 	if o.Parquet != nil {
@@ -79,8 +89,9 @@ func (t *Telemetry) Connect(name string, o ConnectOptions) (*Attached, error) {
 		archOpt = &opts
 	}
 	a := &Attached{Name: name, capacity: ringRows, columns: o.Columns,
-		archOpt: archOpt, closed: make(chan struct{}), log: t.log}
-	rules, err := newReaderRules(fmt.Sprintf("Connect(%q)", name), name, t.root,
+		archOpt: archOpt, closed: make(chan struct{}), log: t.log,
+		proc: t, root: root, tickets: tickets}
+	rules, err := newReaderRules(fmt.Sprintf("Connect(%q)", name), name, root,
 		o.Ticket != nil)
 	if err != nil {
 		return nil, err
@@ -94,6 +105,9 @@ func (t *Telemetry) Connect(name string, o ConnectOptions) (*Attached, error) {
 	if a.first.action == doFail {
 		return nil, fmt.Errorf("%s", rules.reason())
 	}
+	t.mu.Lock()
+	t.readers[a] = struct{}{}
+	t.mu.Unlock()
 	a.done.Add(1)
 	go a.lifecycle(t)
 	return a, nil
@@ -127,7 +141,7 @@ func (a *Attached) took(st readerStep) readerStep {
 // for a reader that needs its own ring: one with a column subset or
 // one that writes files), and whether this process has a stream in the
 // name's folder.
-func (a *Attached) lookLocal(t *Telemetry) (*Stream, bool) {
+func (a *Attached) lookLocal(t *process) (*Stream, bool) {
 	if a.direct != nil {
 		return nil, false
 	}
@@ -150,7 +164,7 @@ func (a *Attached) lookLocal(t *Telemetry) (*Stream, bool) {
 
 // poll looks for the stream, in this process and then in the store,
 // and takes the core's step for what was found.
-func (a *Attached) poll(t *Telemetry) readerStep {
+func (a *Attached) poll(t *process) readerStep {
 	local, localFolder := a.lookLocal(t)
 	if local != nil {
 		a.local = local
@@ -162,11 +176,11 @@ func (a *Attached) poll(t *Telemetry) readerStep {
 	case a.direct != nil:
 		a.lastTicket.Store(a.direct)
 		st = a.rules.poll(foundTicket, a.direct, nil)
-	case t.tickets == nil:
+	case a.tickets == nil:
 		a.lastTicket.Store(nil)
 		st = a.rules.poll(foundNone, nil, nil) // no store: this process alone
 	default:
-		tk, err := t.tickets.get(a.Name)
+		tk, err := a.tickets.get(a.Name)
 		switch {
 		case err != nil:
 			st = a.rules.poll(foundUnreadable, nil, err)
@@ -181,8 +195,8 @@ func (a *Attached) poll(t *Telemetry) readerStep {
 	if st.action == doList {
 		exists := localFolder
 		var err error
-		if !exists && t.tickets != nil {
-			exists, err = t.tickets.hasFolder(a.rules.folder())
+		if !exists && a.tickets != nil {
+			exists, err = a.tickets.hasFolder(a.rules.folder())
 		}
 		if err != nil {
 			st = a.rules.poll(foundUnreadable, nil, err)
@@ -193,28 +207,25 @@ func (a *Attached) poll(t *Telemetry) readerStep {
 	return a.took(st)
 }
 
-// Ring returns the local ring once the schema is known (nil before
-// the first connection).
-func (a *Attached) Ring() *ring.Ring {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.ring
-}
-
-// WaitRing blocks until the ring exists (schema learned) or timeout.
-func (a *Attached) WaitRing(timeout time.Duration) (*ring.Ring, error) {
+// waitRing waits until the reader has its memory (the schema is known,
+// at the first connection) or timeout.
+func (a *Attached) waitRing(timeout time.Duration) (*ring.Ring, error) {
 	deadline := time.Now().Add(timeout)
 	for {
-		if r := a.Ring(); r != nil {
+		if r := a.current(); r != nil {
 			return r, nil
 		}
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("attach %s: no connection within %s "+
-				"(state %s)", a.Name, timeout, a.State())
+			reason := a.Reason()
+			if reason != "" {
+				reason = ": " + reason
+			}
+			return nil, fmt.Errorf("reader of %s: no connection within %s "+
+				"(state %s)%s", a.Name, timeout, a.State(), reason)
 		}
 		select {
 		case <-a.closed:
-			return nil, fmt.Errorf("attach %s: closed", a.Name)
+			return nil, fmt.Errorf("reader of %s: it is closed", a.Name)
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
@@ -270,7 +281,7 @@ func (a *Attached) dropRing(own bool) {
 	a.ring, a.arch, a.ownRing = nil, nil, false
 }
 
-func (a *Attached) lifecycle(t *Telemetry) {
+func (a *Attached) lifecycle(t *process) {
 	defer a.done.Done()
 	defer a.rules.close()
 	wait := func(d time.Duration) bool { // false = closed
@@ -492,6 +503,9 @@ func (a *Attached) Close() error {
 		close(a.closed)
 	}
 	a.done.Wait()
+	a.proc.mu.Lock()
+	delete(a.proc.readers, a)
+	a.proc.mu.Unlock()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	var err error

@@ -48,7 +48,7 @@ func checkpointsOf(t *testing.T, folder string) int {
 // beside their checkpoints and its catalog pass has nothing to add.
 func TestCatalog(t *testing.T) {
 	dir := t.TempDir()
-	tel, err := Init(Config{Store: dir})
+	tel, err := newProcess(processConfig{Store: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestCatalog(t *testing.T) {
 	// the ticket: the catalog's version, and no finished file
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		tk, err := tel.tickets.get("t/cat")
+		tk, err := ticketsOf(tel).get("t/cat")
 		if err == nil && tk != nil && len(tk.Files) == 0 && tk.CatalogEtag != "" {
 			st, _ = os.Stat(published)
 			want := versionText(st)
@@ -96,7 +96,7 @@ func TestCatalog(t *testing.T) {
 	tel.Close()
 	before, _ := os.Stat(published)
 
-	tel, err = Init(Config{Store: dir})
+	tel, err = newProcess(processConfig{Store: dir})
 	if err != nil {
 		t.Fatal(err)
 	}

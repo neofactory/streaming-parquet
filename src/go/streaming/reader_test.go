@@ -23,7 +23,7 @@ func waitState(t *testing.T, a *Attached, want string) {
 // a name in a folder that exists, and a name with no folder, wait.
 func TestConnectFolderRule(t *testing.T) {
 	root := t.TempDir()
-	tel, err := Init(Config{Store: root})
+	tel, err := newProcess(processConfig{Store: root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestConnectFolderRule(t *testing.T) {
 // its ring in place (an internal stream: no ticket, no Flight). When
 // the stream closes the reader waits again, and finds the next one.
 func TestAttachFindsLocalStream(t *testing.T) {
-	tel, err := Init(Config{Store: t.TempDir()})
+	tel, err := newProcess(processConfig{Store: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestAttachFindsLocalStream(t *testing.T) {
 		if a.Reason() != "" {
 			t.Fatalf("reason %q while streaming", a.Reason())
 		}
-		r := a.Ring()
+		r := a.current()
 		if r == nil || r.NewestSeq() != int64(9+round) {
 			t.Fatalf("round %d: the reader's ring is not the stream's", round)
 		}
@@ -107,7 +107,7 @@ func TestAttachFindsLocalStream(t *testing.T) {
 			t.Fatal(err)
 		}
 		waitState(t, a, "no-ticket")
-		if a.Ring() != nil {
+		if a.current() != nil {
 			t.Fatal("the reader kept the ring of a closed stream")
 		}
 	}

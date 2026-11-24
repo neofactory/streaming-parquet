@@ -50,7 +50,7 @@ func TestCatalogRealS3(t *testing.T) {
 	}()
 
 	run := func(first, files, want int) {
-		tel, err := Init(Config{})
+		tel, err := newProcess(processConfig{})
 		if err != nil {
 			t.Fatal(err)
 		}

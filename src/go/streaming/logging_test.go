@@ -30,7 +30,7 @@ func (l *lockedBuffer) String() string {
 func TestLoggerOfTheConfig(t *testing.T) {
 	var out lockedBuffer
 	logger := slog.New(slog.NewTextHandler(&out, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	tel, err := Init(Config{Logger: logger})
+	tel, err := newProcess(processConfig{Logger: logger})
 	if err != nil {
 		t.Fatal(err)
 	}
