@@ -409,6 +409,14 @@ else:
         print(f"  S3 cleanup: {len(left)} object(s) left under "
               f"s3://{bucket}/{prefix}")
 
+# Close the connection here, not at exit. DuckDB keeps its HTTP
+# connection to RangeServer open, so a handler thread of that server is
+# still alive at exit, and Python then ends without freeing `con`:
+# DuckDB's package prints "nanobind: leaked ... instances". Plain DuckDB
+# does the same with any HTTP/1.1 server in its own process; the
+# extension has no part in it (2026-11-24).
+con.close()
+
 import shutil
 shutil.rmtree(tmp, ignore_errors=True)
 print(f"\nResults: {passed} passed, {failed} failed")
