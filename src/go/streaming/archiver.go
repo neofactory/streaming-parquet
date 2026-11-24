@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"log/slog"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -65,10 +64,9 @@ func (a *archiver) recording() bool { return a.wp.on() }
 // lost is the count of rows the ring reused before they were written.
 func (a *archiver) lost() int64 { return a.lostBefore + a.wp.lost() }
 
-// ParquetOptions says how a stream's rows are written to parquet.
+// ParquetOptions says how a stream's rows are written to parquet. Where
+// is the stream's store: the files are at <store>/streams/<name>/.
 type ParquetOptions struct {
-	BaseDir           string   // parquet lands in <BaseDir>/parquet
-	Sink              pqc.Sink // where chunks, the checkpoint and finished files live; nil = a directory sink under BaseDir
 	RowGroupRows      int64    // rows per row group; see ringSizes for the default
 	RowGroupSeconds   float64  // also flush a partial group after this
 	CheckpointSeconds float64  // tail-checkpoint cadence between flushes
@@ -112,25 +110,17 @@ func ringSizes(name string, ringRows, rowGroupRows int64) (int64, int64, error) 
 // catFor answers the catalog of the files in a folder; nil (a reader
 // that writes files) keeps none: a finished file's checkpoints are
 // deleted at once, and no ticket names the file after it.
-func newArchiver(r *ring.Ring, name, run string, o ParquetOptions, store *storeState,
+// files is the store the files go to: the stream's folder in it is
+// streams/<name>/.
+func newArchiver(r *ring.Ring, name, run string, o ParquetOptions, files pqc.Sink, store *storeState,
 	catFor func(sink pqc.Sink, folder string) *catalog, log *slog.Logger) (*archiver, error) {
 	if store == nil {
 		store = newStoreState(pqc.SupersededKeep)
 	}
 	// The layout, the same under a directory and under a bucket:
 	// <root>/streams/<name>/<files>, the ticket at <root>/tickets/<name>.json.
-	var sink pqc.Sink
-	var location string
-	if o.Sink == nil {
-		ds, err := pqc.NewDirSink(filepath.Join(o.BaseDir, "streams", filepath.FromSlash(name)))
-		if err != nil {
-			return nil, err
-		}
-		sink, location = ds, ds.URI()
-	} else {
-		sink = o.Sink.Sub("streams/" + name)
-		location = sink.URI()
-	}
+	sink := files.Sub("streams/" + name)
+	location := sink.URI()
 	comp := compress.Codecs.Zstd
 	switch o.Compression {
 	case "", "zstd":

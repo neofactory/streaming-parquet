@@ -18,7 +18,7 @@ func TestTicketSaysWhatTheStoreHolds(t *testing.T) {
 	}
 	defer tel.Close()
 	s, err := tel.CreateStream("t/store", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400},
-		Parquet: &ParquetOptions{BaseDir: root, RowGroupRows: 100, CheckpointSeconds: 0.05}})
+		Store: root, Parquet: &ParquetOptions{RowGroupRows: 100, CheckpointSeconds: 0.05}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,4 +85,46 @@ func TestTicketSaysWhatTheStoreHolds(t *testing.T) {
 func ticketsOf(t *process) ticketStore {
 	_, tickets, _ := t.resolve("")
 	return tickets
+}
+
+// Where the files go is the store, and nowhere else: a stream with no
+// store is refused parquet, a store that is a prefix inside a bucket is
+// refused, and a reader that writes files needs a store of its own.
+func TestFilesGoToTheStore(t *testing.T) {
+	tel, err := newProcess(processConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tel.Close()
+	refused := func(what string, err error, part string) {
+		t.Helper()
+		if err == nil || !strings.Contains(err.Error(), part) {
+			t.Fatalf("%s: %v, want it refused with %q", what, err, part)
+		}
+	}
+	_, err = tel.CreateStream("t/nostore", testSchema(), StreamOptions{Parquet: &ParquetOptions{}})
+	refused("parquet with no store", err, "the stream has no store")
+	_, err = tel.CreateStream("t/prefix", testSchema(), StreamOptions{Store: "s3://bucket/some/prefix"})
+	refused("a prefix inside a bucket", err, "a store is a whole bucket")
+
+	store := t.TempDir()
+	s, err := tel.CreateStream("t/where", testSchema(), StreamOptions{Store: store,
+		Memory: &MemoryOptions{Rows: 400}, Parquet: &ParquetOptions{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRows(t, s, 0, 10)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	files, _ := filepath.Glob(filepath.Join(store, "streams", "t", "where", "*.parquet"))
+	if len(files) != 1 {
+		t.Fatalf("the files under the store's streams/t/where/: %v", files)
+	}
+
+	_, err = tel.Connect("t/where", ConnectOptions{Store: store, Parquet: &ParquetOptions{}})
+	refused("a reader with parquet and no store for it", err, "needs ConnectOptions.ParquetStore")
+	_, err = tel.Connect("t/where", ConnectOptions{Store: store, Parquet: &ParquetOptions{},
+		ParquetStore: "file://" + store + "/"})
+	refused("a reader whose files would go to the writer's folder", err, "a store of its own")
 }

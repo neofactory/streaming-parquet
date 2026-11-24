@@ -440,8 +440,8 @@ prefix) or a whole directory, whose contents are the layout. A bucket
 store is written through the spool, the local write-behind copy at
 `/var/tmp/streaming-parquet/<user>/` unless `spool=` says where, or
 `spool=None` for the bucket as the only copy; a directory store is
-written straight into. The Go host's `ParquetOptions.Sink` is the same
-first-copy idea. Severity follows the shape: the first copy failing
+written straight into. The Go host writes straight into its store, a
+directory or a bucket: it has no spool yet. Severity follows the shape: the first copy failing
 means rows are durable nowhere but the ring, and `archive_state()`
 says so (`failing`, the last error, `lost_rows` for rows recycled
 before their flush, the location, the open `file`); the mirror failing
@@ -675,13 +675,14 @@ calls, as here.
 s, _ := streaming.CreateStream("press/fieldbus", schema,
         streaming.StreamOptions{
             Store: "/data/streams",
-            Parquet: &streaming.ParquetOptions{BaseDir: dir,
+            Parquet: &streaming.ParquetOptions{
                 CheckpointSeconds: 2}})   // nil = no files until a StartParquet
+// The files go to the store, at <store>/streams/<name>/. A store is a
+// directory or a whole bucket ("s3://my-bucket", on the standard AWS
+// credential chain); a stream with no store is refused parquet.
 // Memory holds two row groups: MemoryOptions.Rows and
 // ParquetOptions.RowGroupRows default to 245,760 and DuckDB's 122,880;
 // give one and the other follows; memory under two row groups is refused.
-// Files on S3 instead: ParquetOptions{Sink: pqc.NewS3Sink(s3client,
-// bucket, prefix), CheckpointSeconds: 2}.
 
 x, _ := s.Column("x")
 row, _ := s.MutableRow(0)       // ONE goroutine writes a stream
@@ -702,7 +703,8 @@ s.Commit()                      // readers see the rows at once; the
 
 a, _ := streaming.Connect("probe/voltages", streaming.ConnectOptions{
         Store: "/data/streams",
-        Parquet: &streaming.ParquetOptions{BaseDir: dir}})
+        Parquet: &streaming.ParquetOptions{},
+        ParquetStore: "/data/copies"})   // a reader's files: a store of its own
 a.WaitConnected(5 * time.Second)      // the columns are known from here
 newest, ok := a.NewestRow()           // newest.F64(column)
 cursor := a.Cursor()                  // cursor.Next(): the rows not yet seen
@@ -714,12 +716,6 @@ streaming.Close()                     // every stream and reader of the process
 
 `streaming.SetLogger(logger)` and `streaming.SetFlightAddress(":8815")`
 are set before the first stream or reader.
-
-`ParquetOptions.Sink` is the root the archive lives under (a bucket,
-or nil for a directory at BaseDir); the stream places its files at
-`streams/<name>/` inside it (`Sink.Sub`), and the ticket's archive
-field is that location (`Sink.URI`). A caller that used to pass the
-stream's own prefix as the sink now passes the root.
 
 It is built on the other two Go packages, `ring` and `pqc` (pqarrow
 encodes). Stores: a directory, file:// and s3://bucket[/prefix], the same

@@ -53,7 +53,7 @@ func TestCatalog(t *testing.T) {
 		t.Fatal(err)
 	}
 	s, err := tel.CreateStream("t/cat", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400},
-		Parquet: &ParquetOptions{BaseDir: dir}})
+		Store: dir, Parquet: &ParquetOptions{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestCatalog(t *testing.T) {
 	}
 	defer tel.Close()
 	s, err = tel.CreateStream("t/cat", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400},
-		Parquet: &ParquetOptions{BaseDir: dir}})
+		Store: dir, Parquet: &ParquetOptions{}})
 	if err != nil {
 		t.Fatal(err)
 	}

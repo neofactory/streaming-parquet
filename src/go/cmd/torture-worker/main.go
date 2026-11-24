@@ -125,9 +125,11 @@ func runPub(store, name, kind string, rate int,
 		die(err)
 	}
 	session := 0
+	// a writer's files go to its store, at <store>/streams/<name>/: for
+	// a writer, archdir says only whether it writes files ("-" = none)
 	if archdir != "-" {
 		if err := s.StartParquet(fmt.Sprintf("s%03d", session),
-			&streaming.ParquetOptions{BaseDir: archdir,
+			&streaming.ParquetOptions{
 				RowGroupSeconds: 3, CheckpointSeconds: 0.7,
 				RowGroupRows: int64(rate) * 3}); err != nil {
 			die(err)
@@ -212,14 +214,18 @@ done:
 func runSub(store, name, kind string, rate int,
 	rng *rand.Rand, archdir string, deadline time.Time,
 	stop chan os.Signal) {
+	// a reader's files go to a store of its own: archdir
 	var parquet *streaming.ParquetOptions
+	parquetStore := ""
 	if archdir != "-" {
-		parquet = &streaming.ParquetOptions{BaseDir: archdir,
+		parquetStore = archdir
+		parquet = &streaming.ParquetOptions{
 			RowGroupSeconds: 3, CheckpointSeconds: 0.7,
 			RowGroupRows: int64(rate) * 3}
 	}
 	a, err := streaming.Connect(name, streaming.ConnectOptions{
-		Store: store, Memory: &streaming.MemoryOptions{Rows: int64(rate) * 6}, Parquet: parquet})
+		Store: store, Memory: &streaming.MemoryOptions{Rows: int64(rate) * 6},
+		Parquet: parquet, ParquetStore: parquetStore})
 	if err != nil {
 		die(err)
 	}

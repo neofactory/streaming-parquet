@@ -18,7 +18,7 @@ func TestCut(t *testing.T) {
 	defer tel.Close()
 	dir := t.TempDir()
 	s, err := tel.CreateStream("t/cut", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400},
-		Parquet: &ParquetOptions{BaseDir: dir}})
+		Store: dir, Parquet: &ParquetOptions{}})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -36,7 +36,7 @@ func TestLoggerOfTheConfig(t *testing.T) {
 	}
 	defer tel.Close()
 	s, err := tel.CreateStream("t/log", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400},
-		Parquet: &ParquetOptions{BaseDir: t.TempDir()}})
+		Store: t.TempDir(), Parquet: &ParquetOptions{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,10 +46,16 @@ func TestLoggerOfTheConfig(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// a stream with no store says that it has no ticket
+	local, err := tel.CreateStream("t/log-local", testSchema(), StreamOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	local.Close()
 	got := out.String()
 	for _, want := range []string{
 		"level=INFO", "[t/log] catalog: listed 1 file(s), 1 in all",
-		"[t/log] no store configured",
+		"[t/log-local] no store configured",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("the logger did not get %q:\n%s", want, got)

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +14,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/neofactory/streaming-parquet/src/go/pqc"
 	"github.com/neofactory/streaming-parquet/src/go/ring"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -36,6 +38,7 @@ type Attached struct {
 	ownRing bool // this reader made the ring (it is not a local stream's)
 	arch    *archiver
 	archOpt *ParquetOptions // nil: this reader writes no files
+	files   pqc.Sink        // the store its files go to
 	armed   atomic.Bool     // StartParquet requested (possibly pre-schema)
 	label   string
 
@@ -64,6 +67,11 @@ type ConnectOptions struct {
 	Columns []string        // subset subscription; nil = all
 	Ticket  *Ticket         // dial directly, with no look in the store
 	Parquet *ParquetOptions // for a reader that writes the rows it receives to parquet; nil = it writes none
+	// ParquetStore is the store this reader's files go to, at
+	// <ParquetStore>/streams/<name>/. A reader with Parquet needs it,
+	// and it is not the store the stream is in: that folder is the
+	// writer's.
+	ParquetStore string
 }
 
 // Connect opens a reader of a stream. Remote: a feeder goroutine waits for a
@@ -88,8 +96,28 @@ func (t *process) Connect(name string, o ConnectOptions) (*Attached, error) {
 		opts.RowGroupRows = groupRows
 		archOpt = &opts
 	}
+	var files pqc.Sink
+	if o.Parquet != nil {
+		who := fmt.Sprintf("Connect(%q)", name)
+		if o.ParquetStore == "" {
+			return nil, fmt.Errorf("%s: a reader with ConnectOptions.Parquet "+
+				"needs ConnectOptions.ParquetStore: the store its files go to", who)
+		}
+		if sameStore(o.ParquetStore, root) {
+			return nil, fmt.Errorf("%s: ParquetStore %s is the store the "+
+				"stream is in, and streams/%s/ there holds its writer's "+
+				"files. Give this reader a store of its own for its files",
+				who, o.ParquetStore, name)
+		}
+		if _, _, err := t.resolve(o.ParquetStore); err != nil {
+			return nil, err
+		}
+		if files, err = t.files(o.ParquetStore); err != nil {
+			return nil, err
+		}
+	}
 	a := &Attached{Name: name, capacity: ringRows, columns: o.Columns,
-		archOpt: archOpt, closed: make(chan struct{}), log: t.log,
+		archOpt: archOpt, files: files, closed: make(chan struct{}), log: t.log,
 		proc: t, root: root, tickets: tickets}
 	rules, err := newReaderRules(fmt.Sprintf("Connect(%q)", name), name, root,
 		o.Ticket != nil)
@@ -111,6 +139,21 @@ func (t *process) Connect(name string, o ConnectOptions) (*Attached, error) {
 	a.done.Add(1)
 	go a.lifecycle(t)
 	return a, nil
+}
+
+// sameStore reports whether two store names are one place.
+func sameStore(a, b string) bool {
+	clean := func(s string) string {
+		s = strings.TrimPrefix(s, "file://")
+		if strings.Contains(s, "://") {
+			return strings.TrimRight(s, "/")
+		}
+		if abs, err := filepath.Abs(s); err == nil {
+			return abs
+		}
+		return s
+	}
+	return a != "" && b != "" && clean(a) == clean(b)
 }
 
 func (a *Attached) State() string { return a.state.Load().(string) }
@@ -238,8 +281,8 @@ func (a *Attached) StartParquet(label string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.archOpt == nil {
-		return fmt.Errorf("attach %s: StartParquet needs ConnectOptions.Parquet: "+
-			"it says where the files go", a.Name)
+		return fmt.Errorf("attach %s: StartParquet needs ConnectOptions.Parquet "+
+			"and ConnectOptions.ParquetStore", a.Name)
 	}
 	a.label = label
 	a.armed.Store(true)
@@ -409,7 +452,7 @@ func (a *Attached) receive(tk *Ticket) error {
 		}
 		a.ring, a.ownRing = r, true
 		if a.archOpt != nil {
-			arch, err := newArchiver(r, a.Name, tk.Run, *a.archOpt, nil, nil, a.log)
+			arch, err := newArchiver(r, a.Name, tk.Run, *a.archOpt, a.files, nil, nil, a.log)
 			if err != nil {
 				a.mu.Unlock()
 				return err

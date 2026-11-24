@@ -298,8 +298,8 @@ func main() {
 		hold, _ := strconv.ParseFloat(os.Args[5], 64)
 		o := streaming.StreamOptions{Store: store, Memory: &streaming.MemoryOptions{Rows: int64(rows) * 2}}
 		if len(os.Args) > 6 && os.Args[6] == "pq" {
-			// files under the root, where a reader of the root finds them
-			o.Parquet = &streaming.ParquetOptions{BaseDir: os.Args[2],
+			// the files go to the store, where a reader of it finds them
+			o.Parquet = &streaming.ParquetOptions{
 				RowGroupRows: 500, CheckpointSeconds: 0.1}
 		}
 		s, err := streaming.CreateStream(name, schema(), o)
@@ -336,10 +336,11 @@ func main() {
 		}
 		var parquet *streaming.ParquetOptions
 		if pqdir != "" {
-			parquet = &streaming.ParquetOptions{BaseDir: pqdir,
+			parquet = &streaming.ParquetOptions{
 				RowGroupRows: 500, CheckpointSeconds: 0.1}
 		}
-		a, err := streaming.Connect(name, streaming.ConnectOptions{Store: store, Parquet: parquet})
+		a, err := streaming.Connect(name, streaming.ConnectOptions{Store: store, Parquet: parquet,
+			ParquetStore: pqdir})
 		if err != nil {
 			die(err)
 		}

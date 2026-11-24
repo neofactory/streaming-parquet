@@ -151,7 +151,7 @@ The rule: the two languages have the same concepts, the same words and the same 
 | Create a stream | `sp.create_stream(name, schema, ...)` | `streaming.CreateStream(name, schema, StreamOptions{...})` |
 | Rows kept in memory | `memory=sp.MemoryOptions(rows=n)` | `Memory: &MemoryOptions{Rows: n}` |
 | Parquet options | `parquet=sp.ParquetOptions(...)`; `None` = no files | `StreamOptions.Parquet *ParquetOptions`; `nil` = no files |
-| Where the files go | the store, through the spool for S3 | `ParquetOptions.BaseDir` or `ParquetOptions.Sink` |
+| Where the files go | the store, through the spool for S3 | the store, written straight into |
 | Published or internal | `publish=True`; `s.publish()`, `s.unpublish()` | `StreamOptions.Internal`; `s.Publish()`, `s.Unpublish()`, `s.Published()` |
 | Write a row | `row = s.get_mutable_row()`; `row.x = 1.0`; `s.commit()` | `row, err := s.MutableRow(block)`; `row.SetF64(x, 1.0)`; `s.Commit()` |
 | A column, for the Go setters and getters | the attribute `row.x` | `x, err := s.Column("x")` |
@@ -184,9 +184,9 @@ The same in both, because one C core decides it:
 Not yet the same (each of these is a difference in words or in reach, not in the stored data):
 
 - **Published**: Go's option is `Internal` (the reverse sense of `publish`).
-- **Where files go**: Go names a `BaseDir` or a `Sink` in the Parquet options and has no spool, no `ship_seconds` and no mirror state.
+- **The spool**: Go has none, so no `ship_seconds` and no mirror state: with a bucket store, the bucket is the first copy. Python with no store writes its files to the spool; Go with no store writes none.
 - **Views**: Go has none.
-- **A reader that writes files**: Go's reader can (`ConnectOptions.Parquet`); Python's cannot.
+- **A reader that writes files**: Go's reader can (`ConnectOptions.Parquet`, with `ParquetStore`, a store of its own for its files); Python's cannot.
 - **A row's number**: Go's rows have `RowNumber()`; Python's rows do not show it.
 - **Rows from a value on**: Python's `cursor` and `arrow_table` take `since=(column, value)`; Go's do not.
 - **One flat row from a dict**: Python's `append` takes one; Go has no such form.

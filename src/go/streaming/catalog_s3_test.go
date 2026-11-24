@@ -14,7 +14,8 @@ import (
 
 // The catalog on a real bucket: the conditional upload and the footer
 // reads as S3 does them. Runs only when SP_TEST_S3_BUCKET names a
-// bucket; it writes under streams/test/go-catalog-check/ there and
+// bucket; it writes under streams/test/go-catalog-check/ there, and
+// the stream's ticket at tickets/test/go-catalog-check.json, and
 // deletes every object it wrote.
 func TestCatalogRealS3(t *testing.T) {
 	bucket := os.Getenv("SP_TEST_S3_BUCKET")
@@ -45,6 +46,12 @@ func TestCatalogRealS3(t *testing.T) {
 				t.Errorf("cleanup %s: %v", n, err)
 			}
 		}
+		ticket := "tickets/" + name + ".json"
+		if root.Exists(ticket) { // a stream that did not close leaves it
+			if err := root.Delete(ticket); err != nil {
+				t.Errorf("cleanup %s: %v", ticket, err)
+			}
+		}
 		names, _ = mine.List("")
 		t.Logf("deleted the test's objects; %d left under streams/%s/", len(names), name)
 	}()
@@ -56,8 +63,8 @@ func TestCatalogRealS3(t *testing.T) {
 		}
 		defer tel.Close()
 		t00 := time.Now()
-		s, err := tel.CreateStream(name, testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400},
-			Parquet: &ParquetOptions{Sink: root}})
+		s, err := tel.CreateStream(name, testSchema(), StreamOptions{Store: "s3://" + bucket,
+			Memory: &MemoryOptions{Rows: 400}, Parquet: &ParquetOptions{}})
 		if err != nil {
 			t.Fatal(err)
 		}

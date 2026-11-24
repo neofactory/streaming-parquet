@@ -114,9 +114,11 @@ func (m *MemoryOptions) rows() int64 {
 //
 // Memory says how many rows the stream keeps in memory.
 //
-// Parquet says how the stream's rows are written to parquet, and with
-// its BaseDir or Sink where. With it, the stream writes files from its
-// first row. Nil means no files until a StartParquet that gives options.
+// Parquet says how the stream's rows are written to parquet; the files
+// go to the store, at <store>/streams/<name>/. With it, the stream
+// writes files from its first row. Nil means no files until a
+// StartParquet that gives options. A stream with no store has no place
+// for files: parquet is refused.
 //
 // Internal makes a stream that other processes cannot find or read: no
 // ticket, not served. Publish and Unpublish change it later.
@@ -551,7 +553,7 @@ func (s *Stream) heartbeat(stop chan struct{}) {
 //
 // o replaces the stream's parquet options whole, from this file on. Nil
 // means the options the stream has; a stream that never had any needs
-// them here, because they say where the files go. A row group the ring
+// them here. A row group the ring
 // cannot hold is refused: the ring was sized at CreateStream.
 func (s *Stream) StartParquet(label string, o *ParquetOptions) error {
 	s.io.Lock()
@@ -561,7 +563,7 @@ func (s *Stream) StartParquet(label string, o *ParquetOptions) error {
 	if o == nil {
 		if s.parquet == nil {
 			return fmt.Errorf("stream %s: StartParquet needs ParquetOptions: "+
-				"the stream has none, and they say where the files go", s.Name)
+				"the stream has none", s.Name)
 		}
 		if s.arch != nil {
 			err := s.arch.start(label)
@@ -587,7 +589,16 @@ func (s *Stream) StartParquet(label string, o *ParquetOptions) error {
 		}
 		lost = s.arch.lost()
 	}
-	arch, err := newArchiver(s.ring, s.Name, s.run, opts, s.store, s.catalogFor, s.proc.log)
+	if s.root == "" {
+		return fmt.Errorf("stream %s: StartParquet: the stream has no store, "+
+			"so there is no place for its files. Give StreamOptions.Store "+
+			"at CreateStream, or set $STREAMING_PARQUET_STORE", s.Name)
+	}
+	files, err := s.proc.files(s.root)
+	if err != nil {
+		return err
+	}
+	arch, err := newArchiver(s.ring, s.Name, s.run, opts, files, s.store, s.catalogFor, s.proc.log)
 	if err != nil {
 		return err
 	}

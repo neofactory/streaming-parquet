@@ -122,8 +122,9 @@ func TestAttachedArchivesParquet(t *testing.T) {
 		t.Fatal(err)
 	}
 	a, err := tel.Connect("t/arch", ConnectOptions{
-		Ticket: &Ticket{Name: "t/arch", Host: "127.0.0.1", Port: tel.FlightPort()},
-		Parquet: &ParquetOptions{BaseDir: subDir, RowGroupRows: 200,
+		Ticket:       &Ticket{Name: "t/arch", Host: "127.0.0.1", Port: tel.FlightPort()},
+		ParquetStore: subDir,
+		Parquet: &ParquetOptions{RowGroupRows: 200,
 			CheckpointSeconds: 0.05},
 	})
 	if err != nil {

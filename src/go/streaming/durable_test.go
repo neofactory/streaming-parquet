@@ -29,7 +29,7 @@ func TestDurableFollowsTheCheckpoint(t *testing.T) {
 	}
 	s, err := tel.CreateStream("t/durable", testSchema(),
 		StreamOptions{Memory: &MemoryOptions{Rows: 2000},
-			Parquet: &ParquetOptions{BaseDir: t.TempDir(), CheckpointSeconds: 0.05}})
+			Store: t.TempDir(), Parquet: &ParquetOptions{CheckpointSeconds: 0.05}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestRingHoldsTwoRowGroups(t *testing.T) {
 	}
 	defer tel.Close()
 	_, err = tel.CreateStream("t/small", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 1999},
-		Parquet: &ParquetOptions{BaseDir: t.TempDir(), RowGroupRows: 1000}})
+		Store: t.TempDir(), Parquet: &ParquetOptions{RowGroupRows: 1000}})
 	if err == nil || !strings.Contains(err.Error(), "less than two row groups") {
 		t.Fatalf("CreateStream: %v, want the ring refused", err)
 	}
@@ -97,7 +97,7 @@ func TestCheckpointSkipsWhenNothingNew(t *testing.T) {
 	defer tel.Close()
 	dir := t.TempDir()
 	s, err := tel.CreateStream("t/idle", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 2000},
-		Parquet: &ParquetOptions{BaseDir: dir, CheckpointSeconds: 0.05}})
+		Store: dir, Parquet: &ParquetOptions{CheckpointSeconds: 0.05}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestFileIsCutByBytes(t *testing.T) {
 	dir := t.TempDir()
 	s, err := tel.CreateStream("t/bytecut", testSchema(),
 		StreamOptions{Memory: &MemoryOptions{Rows: 400},
-			Parquet: &ParquetOptions{BaseDir: dir, RowGroupRows: 200, Compression: "none"}})
+			Store: dir, Parquet: &ParquetOptions{RowGroupRows: 200, Compression: "none"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +279,7 @@ func TestStartParquetIsAMark(t *testing.T) {
 	defer tel.Close()
 	dir := t.TempDir()
 	s, err := tel.CreateStream("t/mark", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400},
-		Parquet: &ParquetOptions{BaseDir: dir}})
+		Store: dir, Parquet: &ParquetOptions{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +315,7 @@ func TestStartParquetOnAStreamCreatedWithNone(t *testing.T) {
 	}
 	defer tel.Close()
 	dir := t.TempDir()
-	s, err := tel.CreateStream("t/late", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400}})
+	s, err := tel.CreateStream("t/late", testSchema(), StreamOptions{Store: dir, Memory: &MemoryOptions{Rows: 400}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,11 +327,11 @@ func TestStartParquetOnAStreamCreatedWithNone(t *testing.T) {
 		!strings.Contains(err.Error(), "needs ParquetOptions") {
 		t.Fatalf("StartParquet with no options: %v, want it refused", err)
 	}
-	if err := s.StartParquet("X", &ParquetOptions{BaseDir: dir, RowGroupRows: 300}); err == nil ||
+	if err := s.StartParquet("X", &ParquetOptions{RowGroupRows: 300}); err == nil ||
 		!strings.Contains(err.Error(), "less than two row groups") {
 		t.Fatalf("a row group of 300 in a ring of 400: %v, want it refused", err)
 	}
-	if err := s.StartParquet("DBG", &ParquetOptions{BaseDir: dir}); err != nil {
+	if err := s.StartParquet("DBG", &ParquetOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	writeRows(t, s, 25, 15)
@@ -363,7 +363,7 @@ func TestArchiveStateShowsAWriteFault(t *testing.T) {
 	defer tel.Close()
 	dir := t.TempDir()
 	s, err := tel.CreateStream("t/fault", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 2000},
-		Parquet: &ParquetOptions{BaseDir: dir, CheckpointSeconds: 0.05}})
+		Store: dir, Parquet: &ParquetOptions{CheckpointSeconds: 0.05}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -453,7 +453,7 @@ func TestWriterWaitsForRowsNotYetWritten(t *testing.T) {
 	defer tel.Close()
 	dir := t.TempDir()
 	s, err := tel.CreateStream("t/wait", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400},
-		Parquet: &ParquetOptions{BaseDir: dir, RowGroupRows: 200}})
+		Store: dir, Parquet: &ParquetOptions{RowGroupRows: 200}})
 	if err != nil {
 		t.Fatal(err)
 	}

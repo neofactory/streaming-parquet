@@ -25,12 +25,17 @@
 package streaming
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/neofactory/streaming-parquet/src/go/pqc"
 )
 
 // process holds what the streams of one process share: the Flight
@@ -46,6 +51,7 @@ type process struct {
 	streams map[string]*Stream
 	readers map[*Attached]struct{}
 	stores  map[string]ticketStore // the ticket store of each store used
+	sinks   map[string]pqc.Sink    // where the files of each store used go
 }
 
 // processConfig is what newProcess takes.
@@ -62,7 +68,7 @@ func newProcess(cfg processConfig) (*process, error) {
 	}
 	t := &process{flight: f, log: cfg.Logger, store: cfg.Store,
 		streams: map[string]*Stream{}, readers: map[*Attached]struct{}{},
-		stores: map[string]ticketStore{}}
+		stores: map[string]ticketStore{}, sinks: map[string]pqc.Sink{}}
 	if t.log == nil {
 		t.log = slog.New(slog.NewTextHandler(os.Stderr,
 			&slog.HandlerOptions{Level: slog.LevelWarn}))
@@ -83,6 +89,12 @@ func (t *process) resolve(store string) (string, ticketStore, error) {
 	if store == "" {
 		return "", nil, nil
 	}
+	if _, prefix, ok := parseS3Root(store); ok && prefix != "" {
+		return "", nil, fmt.Errorf("store %q: a store is a whole bucket; %q is "+
+			"a prefix inside it. Give the bucket alone; the layout "+
+			"streams/<name>/ and tickets/<name>.json is its contents",
+			store, strings.TrimSuffix(prefix, "/"))
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if tickets, ok := t.stores[store]; ok {
@@ -94,6 +106,35 @@ func (t *process) resolve(store string) (string, ticketStore, error) {
 	}
 	t.stores[store] = tickets
 	return store, tickets, nil
+}
+
+// files answers where the files of a store go: the store itself, a
+// directory or a bucket. The store is one resolve answered.
+func (t *process) files(store string) (pqc.Sink, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if sink, ok := t.sinks[store]; ok {
+		return sink, nil
+	}
+	var sink pqc.Sink
+	if bucket, _, ok := parseS3Root(store); ok {
+		cfg, err := config.LoadDefaultConfig(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("store %s: %w", store, err)
+		}
+		sink = pqc.NewS3Sink(s3.NewFromConfig(cfg), bucket, "")
+	} else if dir := strings.TrimPrefix(store, "file://"); !strings.Contains(dir, "://") {
+		ds, err := pqc.NewDirSink(dir)
+		if err != nil {
+			return nil, fmt.Errorf("store %s: %w", store, err)
+		}
+		sink = ds
+	} else {
+		return nil, fmt.Errorf("store %q: files go to a directory, a "+
+			"file:// path or s3://bucket", store)
+	}
+	t.sinks[store] = sink
+	return sink, nil
 }
 
 // ListStreams names every stream with a ticket in the store (a listed
