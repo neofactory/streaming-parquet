@@ -12,12 +12,12 @@ import (
 // stored row stays.
 func TestTicketSaysWhatTheStoreHolds(t *testing.T) {
 	root := t.TempDir()
-	tel, err := Init(Config{Root: root})
+	tel, err := Init(Config{Store: root})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tel.Close()
-	s, err := tel.CreateStream("t/store", testSchema(), StreamOptions{RingRows: 400,
+	s, err := tel.CreateStream("t/store", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400},
 		Parquet: &ParquetOptions{BaseDir: root, RowGroupRows: 100, CheckpointSeconds: 0.05}})
 	if err != nil {
 		t.Fatal(err)

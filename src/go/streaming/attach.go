@@ -48,28 +48,28 @@ type Attached struct {
 	reason atomic.Value // string
 	direct *Ticket      // the caller's ticket, or nil
 	local  *Stream      // the stream of this process read in place
-	first  readerStep   // the step of the poll Attach made
+	first  readerStep   // the step of the poll Connect made
 	closed chan struct{}
 	done   sync.WaitGroup
 }
 
-type AttachOptions struct {
-	RingRows int64           // local ring rows; see ringSizes for the default
-	Columns  []string        // subset subscription; nil = all
-	Ticket   *Ticket         // dial directly, skipping root discovery
-	Parquet  *ParquetOptions // for a reader that writes the rows it receives to parquet; nil = it writes none
+type ConnectOptions struct {
+	Memory  *MemoryOptions  // rows this reader keeps in memory; nil = the default
+	Columns []string        // subset subscription; nil = all
+	Ticket  *Ticket         // dial directly, with no look in the store
+	Parquet *ParquetOptions // for a reader that writes the rows it receives to parquet; nil = it writes none
 }
 
-// Attach opens the read face. Remote: a feeder goroutine waits for a
+// Connect opens a reader of a stream. Remote: a feeder goroutine waits for a
 // live ticket, connects, and appends every received batch into the
 // local ring (reconnecting with backoff). State() reports where it is.
-func (t *Telemetry) Attach(name string, o AttachOptions) (*Attached, error) {
+func (t *Telemetry) Connect(name string, o ConnectOptions) (*Attached, error) {
 	var archOpt *ParquetOptions
 	var givenGroupRows int64
 	if o.Parquet != nil {
 		givenGroupRows = o.Parquet.RowGroupRows
 	}
-	ringRows, groupRows, err := ringSizes(name, o.RingRows, givenGroupRows)
+	ringRows, groupRows, err := ringSizes(name, o.Memory.rows(), givenGroupRows)
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +80,7 @@ func (t *Telemetry) Attach(name string, o AttachOptions) (*Attached, error) {
 	}
 	a := &Attached{Name: name, capacity: ringRows, columns: o.Columns,
 		archOpt: archOpt, closed: make(chan struct{}), log: t.log}
-	rules, err := newReaderRules(fmt.Sprintf("Attach(%q)", name), name, t.root,
+	rules, err := newReaderRules(fmt.Sprintf("Connect(%q)", name), name, t.root,
 		o.Ticket != nil)
 	if err != nil {
 		return nil, err
@@ -227,7 +227,7 @@ func (a *Attached) StartParquet(label string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.archOpt == nil {
-		return fmt.Errorf("attach %s: StartParquet needs AttachOptions.Parquet: "+
+		return fmt.Errorf("attach %s: StartParquet needs ConnectOptions.Parquet: "+
 			"it says where the files go", a.Name)
 	}
 	a.label = label

@@ -96,7 +96,7 @@ tier or mode.
   must hold the unfinished row group and the rows written during the
   store's lag. The default ring, two row groups, does that below about
   3,000 rows per second; a view whose ring is too short says so
-  (`ring_note`) and names the `MemoryOptions(lookback=...)` to set.
+  (`ring_note`) and names the `MemoryOptions(rows=...)` to set.
 
 ## The margins
 
@@ -347,7 +347,7 @@ names and the checkpoint versions it names are one consistent picture.
 A live reader learns of each ticket write from the revision on its
 connection; a reader without one reads the ticket on the schedule its
 `ts` and `beat_seconds` give. Missing ticket = no publisher; `ts` older
-than `stale_after` = dead publisher, and `standing()` says which it was.
+than `stale_after` = dead publisher, and `reason` says which it was.
 There is no broker: discovery is the same kind of thing as the archive,
 objects at a location.
 
@@ -397,7 +397,7 @@ The Go writer keeps the same catalog in the same way (`go/streaming/catalog.go`)
 a Python view reads a Go writer's finished files through it, and a
 writer in either language adds to a catalog the other started. Both
 need the system's SQLite library (Ubuntu: `libsqlite3-dev` to build).
-A Go reader that writes files (`Attach` with parquet options) keeps no
+A Go reader that writes files (`Connect` with parquet options) keeps no
 catalog.
 
 ## Parquet encodings
@@ -498,14 +498,12 @@ create_stream(name, schema, store=STORE, spool=DEFAULT_SPOOL, memory=MemoryOptio
     #       ticket at tickets/<name>.json)
     # spool: the local write-behind copy a bucket store writes through;
     #        default /var/tmp/streaming-parquet/<user>/, None for none
-    # MemoryOptions(lookback, maximum, segment_bytes): rows on this core
+    # MemoryOptions(rows, segment_bytes): the rows kept in memory
     # ParquetOptions(checkpoint_seconds, row_group_rows, row_group_seconds, ship_seconds,
     #         catalog_copy_seconds, compression): tuning; None = no files
     #         until a start_parquet
     # publish: False = an internal stream: no ticket, not served to other
     #         processes; this process reads it with connect(name)
-    # Memory, Archive, archive= and Archive(parquet=) are old names that
-    # still work: docs/deprecations.md
 create_playback_stream(name, parquet_path, timestamp_column, latency_s, memory)
 connect(name | ticket, store=STORE, memory=MemoryOptions(...), columns)
 list_streams(store=STORE)
@@ -529,7 +527,7 @@ reading (a stream we write and one we connect to, alike):
                       the archive views follow the ticket; con opened with
                       allow_unsigned_extensions (the parquet_checkpoint extension)
                   memory_state() -> MemoryState
-                  .name .schema .state standing() is_connected() close()
+                  .name .schema .state .reason is_connected() close()
 
 results: ArchiveState(failing, error, lost_rows, location, file, catalog_error)
          MirrorState(failing, error, pending)   MemoryState(rows, rows_unarchived, capacity)
@@ -547,7 +545,7 @@ import pyarrow as pa
 import streaming_parquet as sp
 
 s = sp.create_stream(name, pa.schema([...]), store="s3://my-bucket",
-                     memory=sp.MemoryOptions(lookback=200_000),
+                     memory=sp.MemoryOptions(rows=200_000),
                      parquet=sp.ParquetOptions(checkpoint_seconds=15, ship_seconds=15))
 row = s.get_mutable_row()            # the ring vocabulary
 row.servo.pos = 100                  # struct leaves; strings; lists
@@ -604,11 +602,11 @@ does not exist is a wrong path, and `connect` raises `ValueError` at
 once; the error names the folder. A folder is made the first time a
 writer of a stream under it runs, so in a new store the writer starts
 before its readers. A reader that waits says so: one log line when the wait starts,
-one warning when it has waited 30 seconds, and `standing()` gives the
+one warning when it has waited 30 seconds, and `reason` gives the
 reason at any time. When the writer starts again (a new run in the
 ticket) the reader starts on a fresh ring, since row numbers start
-again at 0. Go has the same rules: `Attach` returns the error, and
-`Reason()` is `standing()`. These rules are in the stream core
+again at 0. Go has the same rules: `Connect` returns the error, and
+`Reason()` is `reason`. These rules are in the stream core
 (`src/core/sp.h`, THE READER), once, for both languages.
 
 **One writer per stream.** A stream takes its writer lock the first time
@@ -659,31 +657,29 @@ its duration.
 Python loggers to the file, one line each with the time of day. Before
 2026-11-22 the Python library always wrote `telemetry-diag.log` in the
 working directory and printed its lines on standard error; a program
-that wants that file now calls `log_to_file`. `suppress_console()` and
-`set_verbosity()` are old names (docs/deprecations.md). The DuckDB
+that wants that file now calls `log_to_file`. The DuckDB
 extension writes no log lines: its faults are DuckDB errors.
 
 ## Go host (go/streaming)
 
-The Go host is on the OLD API (Init/Root/Attach) and has none
-of the store, catalog, ticket revision or ownership work; it writes
-versioned checkpoints and reads 8- or 16-byte side data. Bringing it
-up, or replacing it with the C core of V2B, is an open issue. One
-production service writes through it.
+The Go host binds the same C cores as this module, so the ticket,
+the ownership check, the write plan, the store state, a reader's rules
+and the catalog are the same code. What it does not have yet is in the
+repository README ("Not yet the same").
 
-A complete second implementation, wire-compatible with this module
-(same root tickets, same Flight contract) and symmetric by design:
+It is wire-compatible with this module
+(the same tickets in the store, the same Flight contract) and symmetric by design:
 there is no server role, only the two verbs, and ANY ring can archive
 — an attached process may StartParquet exactly like a creating one,
 because the parquet path consumes a ring and does not care whose.
 
 ```go
-tel, _ := streaming.Init(streaming.Config{Root: "/data/streams"})
+tel, _ := streaming.Init(streaming.Config{Store: "/data/streams"})
 s, _ := tel.CreateStream("press/fieldbus", schema,
         streaming.StreamOptions{
             Parquet: &streaming.ParquetOptions{BaseDir: dir,
                 CheckpointSeconds: 2}})   // nil = no files until a StartParquet
-// The ring holds two row groups: RingRows and ParquetOptions.RowGroupRows
+// The ring holds two row groups: MemoryOptions.Rows and ParquetOptions.RowGroupRows
 // default to 245,760 and DuckDB's 122,880; give one and the other
 // follows; a ring under two row groups is refused.
 // Archive on S3 instead: ParquetOptions{Sink: pqc.NewS3Sink(s3client,
@@ -701,7 +697,7 @@ s, _ := tel.CreateStream("press/fieldbus", schema,
 // StreamOptions{Internal: true} makes a stream no other process finds
 // or reads; s.Publish() and s.Unpublish() change it later.
 
-a, _ := tel.Attach("probe/voltages", streaming.AttachOptions{
+a, _ := tel.Connect("probe/voltages", streaming.ConnectOptions{
         Parquet: &streaming.ParquetOptions{BaseDir: dir}})
 r, _ := a.WaitRing(5 * time.Second)   // local ring fed by Flight
 a.StartParquet("cal-run")             // symmetric archival

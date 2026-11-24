@@ -1430,7 +1430,7 @@ struct SpReader {
 };
 
 static const char *const READER_STATE[] = {
-    "no-ticket", "root-unreachable", "waiting", "connecting", "streaming",
+    "no-ticket", "store-unreachable", "waiting", "connecting", "streaming",
     "reconnecting", "closed",
 };
 
@@ -1564,7 +1564,7 @@ static void reader_poll(SpReader *r, int found, const SpTicket *ticket,
         }
         r->asked_folder = 0;
         int known = r->folder_known;      /* the store said nothing */
-        reader_wait(r, step, SP_R_ROOT_UNREACHABLE, mono, 1);
+        reader_wait(r, step, SP_R_STORE_UNREACHABLE, mono, 1);
         r->folder_known = known;
         return;
     }
@@ -1929,7 +1929,7 @@ static void view_note_ring(SpView *v, int why, int64_t stored,
                 "the ring holds rows %lld to %lld and the store ends at row "
                 "%lld: the ring is too short for the store's lag of %lld "
                 "rows, so the view reads the files only and is that far "
-                "behind. Connect with MemoryOptions(lookback=%lld) or more "
+                "behind. Connect with MemoryOptions(rows=%lld) or more "
                 "(now %lld).",
                 (long long)oldest, (long long)newest, (long long)stored,
                 (long long)behind, (long long)want, (long long)capacity);
@@ -1937,7 +1937,7 @@ static void view_note_ring(SpView *v, int why, int64_t stored,
             snprintf(note, sizeof note,
                 "the store is %lld rows behind a ring of %lld: a running "
                 "query has less than a quarter of the ring to reach memory. "
-                "Connect with MemoryOptions(lookback=%lld) or more.",
+                "Connect with MemoryOptions(rows=%lld) or more.",
                 (long long)behind, (long long)capacity, (long long)want);
     }
     if ((note[0] == 0) != (v->note[0] == 0)) {
@@ -2205,7 +2205,7 @@ static char *view_sql(const SpView *v, const char *catalog, Report *report) {
                      "a running query, or this reader connected a moment "
                      "ago and the store has not reached its first row yet. "
                      "Run it again; for longer queries connect with a "
-                     "larger MemoryOptions(lookback=...).') ELSE true END)");
+                     "larger MemoryOptions(rows=...).') ELSE true END)");
     }
     if (!pieces) {
         if (!v->empty) {

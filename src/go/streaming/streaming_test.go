@@ -53,18 +53,18 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 
 // One process, no discovery: create a stream, attach by direct ticket, the
 // attached ring fills over real Flight on loopback.
-func TestLoopbackAttach(t *testing.T) {
+func TestLoopbackConnect(t *testing.T) {
 	tel, err := Init(Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tel.Close()
 	s, err := tel.CreateStream("t/loop", testSchema(),
-		StreamOptions{RingRows: 1000})
+		StreamOptions{Memory: &MemoryOptions{Rows: 1000}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := tel.Attach("t/loop", AttachOptions{
+	a, err := tel.Connect("t/loop", ConnectOptions{
 		Ticket: &Ticket{Name: "t/loop", Host: "127.0.0.1", Port: tel.FlightPort()},
 	})
 	if err != nil {
@@ -117,11 +117,11 @@ func TestAttachedArchivesParquet(t *testing.T) {
 	defer tel.Close()
 	subDir := t.TempDir()
 	s, err := tel.CreateStream("t/arch", testSchema(),
-		StreamOptions{RingRows: 2000})
+		StreamOptions{Memory: &MemoryOptions{Rows: 2000}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := tel.Attach("t/arch", AttachOptions{
+	a, err := tel.Connect("t/arch", ConnectOptions{
 		Ticket: &Ticket{Name: "t/arch", Host: "127.0.0.1", Port: tel.FlightPort()},
 		Parquet: &ParquetOptions{BaseDir: subDir, RowGroupRows: 200,
 			CheckpointSeconds: 0.05},

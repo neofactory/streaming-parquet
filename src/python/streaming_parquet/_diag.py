@@ -23,8 +23,6 @@ condition someone should look at, INFO is a milestone (a stream starts,
 a file is finished, the catalog is published), DEBUG is detail for a
 person who is looking for a fault (with DEBUG on "parquet_checkpoint",
 every S3 call is logged with its duration).
-
-suppress_console() and set_verbosity() are old names (docs/deprecations.md).
 """
 
 import logging
@@ -39,7 +37,6 @@ _diag = logging.getLogger(LOGGER)
 
 _lock = threading.Lock()
 _files = {}             # absolute path -> the FileHandler writing it
-_suppressed = None      # the NullHandler of suppress_console(True)
 
 #: The format of a line in a log_to_file() file: the one the library's
 #: file has had (the time of day, then the line).
@@ -66,42 +63,6 @@ def log_to_file(path):
             logger.addHandler(handler)
             if logger.level == logging.NOTSET:
                 logger.setLevel(logging.INFO)
-
-
-def suppress_console(suppress: bool = True):
-    """An old name. While suppressed, the library's lines go to its own
-    handlers only (a log_to_file() file): not to the program's handlers
-    and not to standard error. The standard way: put a handler of your
-    own on the logger "streaming_parquet" and set its `propagate` to
-    False."""
-    from ._deprecations import old_name
-    old_name("suppress_console")
-    global _suppressed
-    with _lock:
-        if suppress and _suppressed is None:
-            _suppressed = logging.NullHandler()
-            for name in LOGGERS:
-                logger = logging.getLogger(name)
-                logger.addHandler(_suppressed)
-                logger.propagate = False
-        elif not suppress and _suppressed is not None:
-            for name in LOGGERS:
-                logger = logging.getLogger(name)
-                logger.removeHandler(_suppressed)
-                logger.propagate = True
-            _suppressed = None
-
-
-def set_verbosity(level: int):
-    """An old name. 0: INFO and above; 1: DEBUG too; 2: DEBUG also for
-    the checkpoint layer (every S3 call with its duration). The
-    standard way: logging.getLogger("streaming_parquet").setLevel(...)."""
-    from ._deprecations import old_name
-    old_name("set_verbosity")
-    logging.getLogger(LOGGER).setLevel(
-        logging.DEBUG if level >= 1 else logging.INFO)
-    logging.getLogger("parquet_checkpoint").setLevel(
-        logging.DEBUG if level >= 2 else logging.INFO)
 
 
 if os.environ.get("STREAMING_PARQUET_DIAG_LOG"):

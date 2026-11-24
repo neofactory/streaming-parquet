@@ -13,21 +13,21 @@ import (
 // refusal names the holder; the stream is free once the holder closes.
 func TestSecondWriterOnThisServerIsRefused(t *testing.T) {
 	root := t.TempDir()
-	first, err := Init(Config{Root: root})
+	first, err := Init(Config{Store: root})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer first.Close()
-	second, err := Init(Config{Root: root})
+	second, err := Init(Config{Store: root})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer second.Close()
-	s, err := first.CreateStream("t/own", testSchema(), StreamOptions{RingRows: 400})
+	s, err := first.CreateStream("t/own", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = second.CreateStream("t/own", testSchema(), StreamOptions{RingRows: 400})
+	_, err = second.CreateStream("t/own", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400}})
 	if err == nil {
 		t.Fatal("the second writer was not refused")
 	}
@@ -39,7 +39,7 @@ func TestSecondWriterOnThisServerIsRefused(t *testing.T) {
 		}
 	}
 	s.Close()
-	s2, err := second.CreateStream("t/own", testSchema(), StreamOptions{RingRows: 400})
+	s2, err := second.CreateStream("t/own", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400}})
 	if err != nil {
 		t.Fatalf("after the holder closed: %v", err)
 	}
@@ -50,15 +50,15 @@ func TestSecondWriterOnThisServerIsRefused(t *testing.T) {
 // can each have one of the same name. Publish takes the lock.
 func TestInternalStreamTakesNoLock(t *testing.T) {
 	root := t.TempDir()
-	a, _ := Init(Config{Root: root})
+	a, _ := Init(Config{Store: root})
 	defer a.Close()
-	b, _ := Init(Config{Root: root})
+	b, _ := Init(Config{Store: root})
 	defer b.Close()
-	sa, err := a.CreateStream("t/in", testSchema(), StreamOptions{RingRows: 400, Internal: true})
+	sa, err := a.CreateStream("t/in", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400}, Internal: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	sb, err := b.CreateStream("t/in", testSchema(), StreamOptions{RingRows: 400, Internal: true})
+	sb, err := b.CreateStream("t/in", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400}, Internal: true})
 	if err != nil {
 		t.Fatalf("a second internal stream of the name: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestInternalStreamTakesNoLock(t *testing.T) {
 // taken over.
 func TestTicketOfAnotherServer(t *testing.T) {
 	root := t.TempDir()
-	tel, err := Init(Config{Root: root})
+	tel, err := Init(Config{Store: root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,13 +94,13 @@ func TestTicketOfAnotherServer(t *testing.T) {
 		}
 	}
 	ticket(5)
-	_, err = tel.CreateStream("t/other", testSchema(), StreamOptions{RingRows: 400})
+	_, err = tel.CreateStream("t/other", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400}})
 	if err == nil || !strings.Contains(err.Error(),
 		"the server at 10.9.9.9:4242 writes this stream") {
 		t.Fatalf("a fresh ticket from another server: %v", err)
 	}
 	ticket(3600)
-	s, err := tel.CreateStream("t/other", testSchema(), StreamOptions{RingRows: 400})
+	s, err := tel.CreateStream("t/other", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400}})
 	if err != nil {
 		t.Fatalf("a stale ticket was not taken over: %v", err)
 	}

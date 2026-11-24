@@ -76,12 +76,6 @@ type ParquetOptions struct {
 	Dictionary        []string // top-level columns to dictionary-encode; default none
 }
 
-// ArchiveOptions is the old name of ParquetOptions.
-//
-// Deprecated: use ParquetOptions. Removed on or after 2027-02-11
-// (docs/deprecations.md).
-type ArchiveOptions = ParquetOptions
-
 // defaultRowGroupRows is DuckDB's row group, 60 of its 2,048-row
 // vectors: DuckDB, the archive's main reader, reads row groups in
 // parallel.

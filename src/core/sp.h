@@ -492,7 +492,7 @@ typedef struct SpReader SpReader;
 
 typedef enum {
     SP_R_NO_TICKET = 0,       /* "no-ticket" */
-    SP_R_ROOT_UNREACHABLE,    /* "root-unreachable": the store cannot be read */
+    SP_R_STORE_UNREACHABLE,    /* "store-unreachable": the store cannot be read */
     SP_R_WAITING,             /* "waiting": a stale ticket */
     SP_R_CONNECTING,          /* "connecting" */
     SP_R_STREAMING,           /* "streaming" */

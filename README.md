@@ -117,7 +117,7 @@ These are the Python names. Go has the same concepts: see [Python and Go: the sa
 - `close()` — flush, finish open files, and shut down Flight cleanly.
 
 **Options**
-- `MemoryOptions(lookback, maximum, segment_bytes)` — how many rows the ring holds. Default: two row groups.
+- `MemoryOptions(rows)` — how many rows the ring holds. Default: two row groups.
 - `ParquetOptions(checkpoint_seconds, row_group_rows, row_group_seconds, ship_seconds, compression, catalog_copy_seconds)` — how the files are written. Where they go is the store and the spool.
 
 **Writing (`Stream`)**
@@ -138,9 +138,7 @@ These are the Python names. Go has the same concepts: see [Python and Go: the sa
 
 **Health & status**
 - `archive_state()` / `mirror_state()` / `memory_state()` — check durability errors, S3 mirror backlog, and ring utilization.
-- `standing()` / `is_connected()` — check a reader's connection state in plain words.
-
-Names that changed keep their old form for three months: [docs/deprecations.md](docs/deprecations.md).
+- `reason` / `is_connected()` — check a reader's connection state in plain words.
 
 ## Python and Go: the same shape
 
@@ -149,9 +147,9 @@ The rule: the two languages have the same concepts, the same words and the same 
 | Concept | Python (`import streaming_parquet as sp`) | Go (`.../src/go/streaming`) |
 |---|---|---|
 | The process's context | the module `sp` | `tel, err := streaming.Init(streaming.Config{...})` |
-| The store | `store=` on each call, else `$STREAMING_PARQUET_STORE` | `Config.Root`, else `$STREAMING_PARQUET_ROOT` |
+| The store | `store=` on each call, else `$STREAMING_PARQUET_STORE` | `Config.Store`, else `$STREAMING_PARQUET_STORE` |
 | Create a stream | `sp.create_stream(name, schema, ...)` | `tel.CreateStream(name, schema, StreamOptions{...})` |
-| Rows kept in memory | `memory=sp.MemoryOptions(lookback=rows)` | `StreamOptions.RingRows` |
+| Rows kept in memory | `memory=sp.MemoryOptions(rows=n)` | `Memory: &MemoryOptions{Rows: n}` |
 | Parquet options | `parquet=sp.ParquetOptions(...)`; `None` = no files | `StreamOptions.Parquet *ParquetOptions`; `nil` = no files |
 | Where the files go | the store, through the spool for S3 | `ParquetOptions.BaseDir` or `ParquetOptions.Sink` |
 | Published or internal | `publish=True`; `s.publish()`, `s.unpublish()` | `StreamOptions.Internal`; `s.Publish()`, `s.Unpublish()`, `s.Published()` |
@@ -161,9 +159,9 @@ The rule: the two languages have the same concepts, the same words and the same 
 | End the file, begin the next | `s.cut(label)` | `s.Cut()`; `s.CutLabel(label)` |
 | Parquet on and off | `s.start_parquet(label, options)`; `s.stop_parquet()` | `s.StartParquet(label, options)`; `s.StopParquet()` |
 | The standing of the files | `s.archive_state()`; `s.mirror_state()` | `s.ArchiveState()`; `s.Durable()` |
-| Read a stream | `a = sp.connect(name, store=...)` | `a, err := tel.Attach(name, AttachOptions{...})` |
+| Read a stream | `a = sp.connect(name, store=...)` | `a, err := tel.Connect(name, ConnectOptions{...})` |
 | A reader's rows | `a.newest_row()`; `a.cursor()`; `a.arrow_table()` | `a.Ring()`: getters, `Pin(lo, hi)` record sets |
-| A reader's standing | `a.state`; `a.standing()`; `a.is_connected()` | `a.State()`; `a.Reason()` |
+| A reader's state, and why it is not streaming | `a.state`; `a.reason` | `a.State()`; `a.Reason()` |
 | DuckDB views | `duckdb_live`, `duckdb_archive`, `duckdb_all` | none: a Go program queries the store with DuckDB directly |
 | List the streams | `sp.list_streams(store)` | `tel.ListStreams()` |
 | Log lines | logger `streaming_parquet`; `sp.log_to_file(path)` | `Config.Logger *slog.Logger` |
@@ -182,14 +180,14 @@ The same in both, because one C core decides it:
 
 Not yet the same (each of these is a difference in words or in reach, not in the stored data):
 
-- **The word for the store**: Go still says `Root` and `$STREAMING_PARQUET_ROOT`.
-- **Memory size**: Go has `RingRows` and no `MemoryOptions`.
 - **Published**: Go's option is `Internal` (the reverse sense of `publish`).
 - **The ring**: a Go program writes and reads through `Ring()`; Python hides the ring.
 - **Where files go**: Go names a `BaseDir` or a `Sink` in the Parquet options and has no spool, no `ship_seconds` and no mirror state.
 - **Views**: Go has none.
-- **A reader that writes files**: Go's `Attached` can (`AttachOptions.Parquet`); Python's cannot.
+- **A reader that writes files**: Go's reader can (`ConnectOptions.Parquet`); Python's cannot.
 - **State of memory**: Go has no `memory_state`.
+- **The stored row number**: Go has `Durable()`; Python has no call for it.
+- **The process's context**: the Go type is still named `Telemetry`.
 
 ## The C cores
 
@@ -233,7 +231,7 @@ Go: module `github.com/neofactory/streaming-parquet/src/go`, packages `ring`, `p
 - `src/go/` — the Go module (`src/go/sync_core.py` copies the cores into it)
 - `src/duckdb/` — the [DuckDB extension](src/duckdb/README.md) that reads unfinished files
 - `tests/` — the Python test scripts: unit, stress, and each language against the other
-- `docs/` — [what a checkpoint costs](docs/checkpoint-cost.md), [failure modes](docs/failure-modes.md), [old names and when they stop](docs/deprecations.md)
+- `docs/` — [what a checkpoint costs](docs/checkpoint-cost.md), [failure modes](docs/failure-modes.md)
 
 ## Status & License
 

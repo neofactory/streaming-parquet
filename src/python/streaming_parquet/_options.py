@@ -2,13 +2,12 @@
 
 Options, given once at create_stream / attach:
 
-    MemoryOptions(lookback, maximum, segment_bytes)
+    MemoryOptions(rows, segment_bytes)
     ParquetOptions(checkpoint_seconds, row_group_rows, row_group_seconds,
                    ship_seconds, compression, catalog_copy_seconds)
 
 A name that ends in Options is given; a name that ends in State is read
-back. Memory and Archive are the old names of the two options (see
-_deprecations).
+back.
 
 Results, read whenever a host wants them:
 
@@ -24,23 +23,16 @@ AttributeError at the call site, not a KeyError somewhere later.
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from ._deprecations import old_name
-
 
 @dataclass(frozen=True)
 class MemoryOptions:
     """How much a stream keeps in memory.
 
-    lookback: rows the ring holds (on this core a row count; the V2B
-              core takes a duration). None = the library default, two
-              parquet row groups (245,760 rows).
-    maximum:  bytes at which the writer stalls. Not enforced on this
-              core (the ring is a fixed capacity); accepted so a host
-              can say it now.
+    rows: rows the ring holds. None = the library default, two
+          parquet row groups (245,760 rows).
     segment_bytes: the variable-width pool's segment size (tests).
     """
-    lookback: Optional[int] = None
-    maximum: Optional[int] = None
+    rows: Optional[int] = None
     segment_bytes: Optional[int] = None
 
 
@@ -53,7 +45,7 @@ class ParquetOptions:
             most this many seconds. None = durability per row group.
     row_group_rows: rows per parquet row group. None = DuckDB's
             122,880. Also sizes the ring at two row groups when MemoryOptions
-            gives no lookback.
+            gives no rows.
     row_group_seconds: also end a row group after this long. None =
             size-bound only.
     ship_seconds: cadence of the pass that moves the spool's files to a
@@ -70,25 +62,6 @@ class ParquetOptions:
     ship_seconds: float = 5.0
     compression: dict = field(default_factory=dict)
     catalog_copy_seconds: Optional[float] = 86400.0
-
-
-def Memory(*args, **kwargs):
-    """The old name of MemoryOptions."""
-    old_name("Memory")
-    return MemoryOptions(*args, **kwargs)
-
-
-def Archive(*args, **kwargs):
-    """The old name of ParquetOptions. Its `parquet` field is
-    ParquetOptions' `compression`."""
-    old_name("Archive")
-    if "parquet" in kwargs:
-        old_name("Archive(parquet=...)")
-        if "compression" in kwargs:
-            raise TypeError("Archive: parquet and compression are one "
-                            "field under two names; give compression")
-        kwargs["compression"] = kwargs.pop("parquet")
-    return ParquetOptions(*args, **kwargs)
 
 
 @dataclass(frozen=True)

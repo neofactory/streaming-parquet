@@ -48,11 +48,11 @@ func checkpointsOf(t *testing.T, folder string) int {
 // beside their checkpoints and its catalog pass has nothing to add.
 func TestCatalog(t *testing.T) {
 	dir := t.TempDir()
-	tel, err := Init(Config{Root: dir})
+	tel, err := Init(Config{Store: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := tel.CreateStream("t/cat", testSchema(), StreamOptions{RingRows: 400,
+	s, err := tel.CreateStream("t/cat", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400},
 		Parquet: &ParquetOptions{BaseDir: dir}})
 	if err != nil {
 		t.Fatal(err)
@@ -96,12 +96,12 @@ func TestCatalog(t *testing.T) {
 	tel.Close()
 	before, _ := os.Stat(published)
 
-	tel, err = Init(Config{Root: dir})
+	tel, err = Init(Config{Store: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tel.Close()
-	s, err = tel.CreateStream("t/cat", testSchema(), StreamOptions{RingRows: 400,
+	s, err = tel.CreateStream("t/cat", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400},
 		Parquet: &ParquetOptions{BaseDir: dir}})
 	if err != nil {
 		t.Fatal(err)

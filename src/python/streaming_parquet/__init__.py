@@ -13,7 +13,7 @@ calls one of the reader verbs, and it all just works.
 
     # ---- writing ------------------------------------------------------
     s = sp.create_stream(name, arrow_schema, store=STORE,   # spool= for the local copy's place
-            memory=sp.MemoryOptions(lookback=rows),
+            memory=sp.MemoryOptions(rows=rows),
             parquet=sp.ParquetOptions(checkpoint_seconds=15, ship_seconds=15, compression={...}),   # None = no files until start_parquet
             publish=True)                                   # False = internal: this process only
     row = s.get_mutable_row(); row.x = 1.0; s.commit()      # one row
@@ -26,7 +26,7 @@ calls one of the reader verbs, and it all just works.
     s.close()
 
     # ---- reading (a Stream reads the same way) -----------------------
-    a = sp.connect(name, store=STORE, memory=sp.MemoryOptions(lookback=rows))
+    a = sp.connect(name, store=STORE, memory=sp.MemoryOptions(rows=rows))
     a.newest_row()                       # one row: row.tv, row.x ...
     for row in a.cursor(): ...           # the rows this reader has not seen
     a.cursor().arrow_table()             #   the same rows as one table
@@ -34,7 +34,7 @@ calls one of the reader verbs, and it all just works.
     a.duckdb_live(con)                   # memory as a DuckDB view, current
     a.duckdb_archive(con)                # the files as a DuckDB view
     a.duckdb_all(con)                    # memory plus the files, exact
-    a.name, a.schema, a.state, a.standing(), a.memory_state(), a.close()
+    a.name, a.schema, a.state, a.reason, a.memory_state(), a.close()
 
     # ---- module ---------------------------------------------------------
     sp.list_streams(store=STORE)
@@ -52,7 +52,7 @@ import threading
 
 import pyarrow as pa
 
-from ._diag import log_to_file, suppress_console, set_verbosity  # noqa: F401 -- public API
+from ._diag import log_to_file  # noqa: F401 -- public API
 from ._clock import set_clock  # noqa: F401 -- public API
 from ._clock import run_start
 from . import _catalog
@@ -63,8 +63,6 @@ from ._tickets import DEFAULT_PUBLIC_STORE, DEFAULT_SPOOL  # noqa: F401 -- publi
 from ._parquet_writer import ParquetWriter
 from ._options import (MemoryOptions, ParquetOptions, ArchiveState,  # noqa: F401
                        MirrorState, MemoryState, View)
-from ._options import Memory, Archive  # noqa: F401 -- old names, see _deprecations
-from ._deprecations import old_name as _old_name
 from ._stream import Stream, DEFAULT_ROW_GROUP_ROWS, KEEP_LABEL  # noqa: F401 -- public API
 from ._attach import Attached, Cursor, _Feeder  # noqa: F401
 from ._flight_server import start_flight_server
@@ -100,7 +98,7 @@ def _ensure_flight_server():
 
 
 def create_stream(name, schema, store=None, spool=DEFAULT_SPOOL,
-                  memory=None, parquet=None, *, archive=None, publish=True):
+                  memory=None, parquet=None, *, publish=True):
     """Create a stream this process writes.
 
     name:    the stream's whole path under the store
@@ -120,13 +118,12 @@ def create_stream(name, schema, store=None, spool=DEFAULT_SPOOL,
              /var/tmp/streaming-parquet/<user>/. None = no local copy,
              the bucket is the first copy. Ignored for a directory
              store, which is written straight into.
-    memory:  MemoryOptions(lookback, maximum, segment_bytes). None =
+    memory:  MemoryOptions(rows, segment_bytes). None =
              the defaults: a ring of two parquet row groups.
     parquet: ParquetOptions(checkpoint_seconds, row_group_rows,
              row_group_seconds, ship_seconds, compression,
              catalog_copy_seconds): the tuning. None = no files until
              a start_parquet.
-    archive: the old name of `parquet` (docs/deprecations.md).
     publish: True = other processes can find the stream (its ticket in
              the store) and read it (the Flight server). False = an
              internal stream: no ticket, not served; code in this
@@ -147,12 +144,6 @@ def create_stream(name, schema, store=None, spool=DEFAULT_SPOOL,
     if memory is not None and not isinstance(memory, MemoryOptions):
         raise TypeError(f"create_stream: memory must be a MemoryOptions, "
                         f"got {type(memory).__name__}")
-    if archive is not None:
-        _old_name("create_stream(archive=...)")
-        if parquet is not None:
-            raise TypeError("create_stream: archive is the old name of "
-                            "parquet; give parquet only")
-        parquet = archive
     if parquet is not None and not isinstance(parquet, ParquetOptions):
         raise TypeError(f"create_stream: parquet must be a ParquetOptions, "
                         f"got {type(parquet).__name__}")
@@ -279,7 +270,7 @@ def create_playback_stream(name, parquet_path, *,
 
     table = pq.read_table(parquet_path)
     if memory is None:
-        memory = MemoryOptions(lookback=max(1, table.num_rows))
+        memory = MemoryOptions(rows=max(1, table.num_rows))
 
     stream = create_stream(name, table.schema, store=store, memory=memory,
                            parquet=None)
@@ -310,7 +301,7 @@ def connect(name=None, store=None, memory=None, columns=None, ticket=None):
         is accepted and has no effect: the reader sees the publisher's
         ring, as the publisher sized it (so the same call works whether
         the stream is published here or elsewhere).
-      - Otherwise a Flight feeder fills a local ring: `memory.lookback`
+      - Otherwise a Flight feeder fills a local ring: `memory.rows`
         sizes it (default two DuckDB row groups, 245,760 rows), `columns`
         may request a top-level field subset. The feeder polls the
         ticket at <store>/tickets/<name> (store: the argument, else
@@ -321,8 +312,8 @@ def connect(name=None, store=None, memory=None, columns=None, ticket=None):
     ("s3://bucket/streams/air/dfw"): the store rides in the name.
 
     Returns a Stream to read. Check `.state`: "streaming" means data
-    flows; "root-unreachable", "no-ticket", "waiting", "connecting",
-    "reconnecting" say why not, and `.standing()` says it in words.
+    flows; "store-unreachable", "no-ticket", "waiting", "connecting",
+    "reconnecting" say why not, and `.reason` says it in words.
     """
     if name is None and ticket is None:
         raise ValueError("connect() requires name or ticket")
@@ -378,7 +369,7 @@ def connect(name=None, store=None, memory=None, columns=None, ticket=None):
 
     memory = memory or MemoryOptions()
     feeder = _Feeder(resolved_name, ticket=ticket, store=feeder_store,
-                     capacity=(memory.lookback if memory.lookback is not None
+                     capacity=(memory.rows if memory.rows is not None
                                else 2 * DEFAULT_ROW_GROUP_ROWS),
                      columns=columns, segment_bytes=memory.segment_bytes,
                      local=local if ticket is None else None,

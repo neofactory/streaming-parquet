@@ -28,7 +28,7 @@ func TestDurableFollowsTheCheckpoint(t *testing.T) {
 		t.Fatal("a configured Flight address did not bind")
 	}
 	s, err := tel.CreateStream("t/durable", testSchema(),
-		StreamOptions{RingRows: 2000,
+		StreamOptions{Memory: &MemoryOptions{Rows: 2000},
 			Parquet: &ParquetOptions{BaseDir: t.TempDir(), CheckpointSeconds: 0.05}})
 	if err != nil {
 		t.Fatal(err)
@@ -76,12 +76,12 @@ func TestRingHoldsTwoRowGroups(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tel.Close()
-	_, err = tel.CreateStream("t/small", testSchema(), StreamOptions{RingRows: 1999,
+	_, err = tel.CreateStream("t/small", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 1999},
 		Parquet: &ParquetOptions{BaseDir: t.TempDir(), RowGroupRows: 1000}})
 	if err == nil || !strings.Contains(err.Error(), "less than two row groups") {
 		t.Fatalf("CreateStream: %v, want the ring refused", err)
 	}
-	if _, err := tel.Attach("t/small", AttachOptions{RingRows: 1999,
+	if _, err := tel.Connect("t/small", ConnectOptions{Memory: &MemoryOptions{Rows: 1999},
 		Parquet: &ParquetOptions{RowGroupRows: 1000}}); err == nil {
 		t.Fatal("Attach accepted a ring under two row groups")
 	}
@@ -96,7 +96,7 @@ func TestCheckpointSkipsWhenNothingNew(t *testing.T) {
 	}
 	defer tel.Close()
 	dir := t.TempDir()
-	s, err := tel.CreateStream("t/idle", testSchema(), StreamOptions{RingRows: 2000,
+	s, err := tel.CreateStream("t/idle", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 2000},
 		Parquet: &ParquetOptions{BaseDir: dir, CheckpointSeconds: 0.05}})
 	if err != nil {
 		t.Fatal(err)
@@ -137,7 +137,7 @@ func TestFileIsCutByBytes(t *testing.T) {
 	defer tel.Close()
 	dir := t.TempDir()
 	s, err := tel.CreateStream("t/bytecut", testSchema(),
-		StreamOptions{RingRows: 400,
+		StreamOptions{Memory: &MemoryOptions{Rows: 400},
 			Parquet: &ParquetOptions{BaseDir: dir, RowGroupRows: 200, Compression: "none"}})
 	if err != nil {
 		t.Fatal(err)
@@ -199,12 +199,12 @@ func parquetRows(path string) (int, error) {
 // not say gets the rule for a writer with no beat.
 func TestTicketSaysWhenItIsStale(t *testing.T) {
 	root := t.TempDir()
-	tel, err := Init(Config{Root: root})
+	tel, err := Init(Config{Store: root})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tel.Close()
-	s, err := tel.CreateStream("t/stale", testSchema(), StreamOptions{RingRows: 2000})
+	s, err := tel.CreateStream("t/stale", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 2000}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestStartParquetIsAMark(t *testing.T) {
 	}
 	defer tel.Close()
 	dir := t.TempDir()
-	s, err := tel.CreateStream("t/mark", testSchema(), StreamOptions{RingRows: 400,
+	s, err := tel.CreateStream("t/mark", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400},
 		Parquet: &ParquetOptions{BaseDir: dir}})
 	if err != nil {
 		t.Fatal(err)
@@ -315,7 +315,7 @@ func TestStartParquetOnAStreamCreatedWithNone(t *testing.T) {
 	}
 	defer tel.Close()
 	dir := t.TempDir()
-	s, err := tel.CreateStream("t/late", testSchema(), StreamOptions{RingRows: 400})
+	s, err := tel.CreateStream("t/late", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +362,7 @@ func TestArchiveStateShowsAWriteFault(t *testing.T) {
 	}
 	defer tel.Close()
 	dir := t.TempDir()
-	s, err := tel.CreateStream("t/fault", testSchema(), StreamOptions{RingRows: 2000,
+	s, err := tel.CreateStream("t/fault", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 2000},
 		Parquet: &ParquetOptions{BaseDir: dir, CheckpointSeconds: 0.05}})
 	if err != nil {
 		t.Fatal(err)
@@ -391,13 +391,13 @@ func TestArchiveStateShowsAWriteFault(t *testing.T) {
 // Unpublish change a running stream.
 func TestPublishedOrInternal(t *testing.T) {
 	root := t.TempDir()
-	tel, err := Init(Config{Root: root})
+	tel, err := Init(Config{Store: root})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tel.Close()
 	s, err := tel.CreateStream("t/int", testSchema(),
-		StreamOptions{RingRows: 400, Internal: true})
+		StreamOptions{Memory: &MemoryOptions{Rows: 400}, Internal: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -425,7 +425,7 @@ func TestPublishedOrInternal(t *testing.T) {
 	if !s.Published() || !served() {
 		t.Fatal("after Publish the stream is not served")
 	}
-	a, err := tel.Attach("t/int", AttachOptions{})
+	a, err := tel.Connect("t/int", ConnectOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -452,7 +452,7 @@ func TestWriterWaitsForRowsNotYetWritten(t *testing.T) {
 	}
 	defer tel.Close()
 	dir := t.TempDir()
-	s, err := tel.CreateStream("t/wait", testSchema(), StreamOptions{RingRows: 400,
+	s, err := tel.CreateStream("t/wait", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400},
 		Parquet: &ParquetOptions{BaseDir: dir, RowGroupRows: 200}})
 	if err != nil {
 		t.Fatal(err)

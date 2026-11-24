@@ -103,7 +103,7 @@ func main() {
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
 	deadline := time.Now().Add(time.Duration(seconds * float64(time.Second)))
 
-	tel, err := streaming.Init(streaming.Config{Root: root})
+	tel, err := streaming.Init(streaming.Config{Store: root})
 	if err != nil {
 		die(err)
 	}
@@ -124,7 +124,7 @@ func runPub(tel *streaming.Telemetry, name, kind string, rate int,
 	rng *rand.Rand, archdir string, deadline time.Time,
 	stop chan os.Signal) {
 	s, err := tel.CreateStream(name, schemaFor(kind),
-		streaming.StreamOptions{RingRows: int64(rate) * 6})
+		streaming.StreamOptions{Memory: &streaming.MemoryOptions{Rows: int64(rate) * 6}})
 	if err != nil {
 		die(err)
 	}
@@ -222,8 +222,8 @@ func runSub(tel *streaming.Telemetry, name, kind string, rate int,
 			RowGroupSeconds: 3, CheckpointSeconds: 0.7,
 			RowGroupRows: int64(rate) * 3}
 	}
-	a, err := tel.Attach(name, streaming.AttachOptions{
-		RingRows: int64(rate) * 6, Parquet: parquet})
+	a, err := tel.Connect(name, streaming.ConnectOptions{
+		Memory: &streaming.MemoryOptions{Rows: int64(rate) * 6}, Parquet: parquet})
 	if err != nil {
 		die(err)
 	}

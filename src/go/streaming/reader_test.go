@@ -21,19 +21,19 @@ func waitState(t *testing.T, a *Attached, want string) {
 
 // A reader of a name whose folder does not exist is refused at once;
 // a name in a folder that exists, and a name with no folder, wait.
-func TestAttachFolderRule(t *testing.T) {
+func TestConnectFolderRule(t *testing.T) {
 	root := t.TempDir()
-	tel, err := Init(Config{Root: root})
+	tel, err := Init(Config{Store: root})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tel.Close()
 
-	_, err = tel.Attach("no/such/place", AttachOptions{})
+	_, err = tel.Connect("no/such/place", ConnectOptions{})
 	if err == nil {
 		t.Fatal("Attach waited for a name in no folder")
 	}
-	for _, part := range []string{`Attach("no/such/place"): the folder no/such does not exist in the store`,
+	for _, part := range []string{`Connect("no/such/place"): the folder no/such does not exist in the store`,
 		"made the first time a writer of a stream under no/such runs",
 		"check the path"} {
 		if !strings.Contains(err.Error(), part) {
@@ -41,7 +41,7 @@ func TestAttachFolderRule(t *testing.T) {
 		}
 	}
 
-	a, err := tel.Attach("alone", AttachOptions{})
+	a, err := tel.Connect("alone", ConnectOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestAttachFolderRule(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "streams", "rd", "old", "x"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	a, err = tel.Attach("rd/old/y", AttachOptions{})
+	a, err = tel.Connect("rd/old/y", ConnectOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,19 +68,19 @@ func TestAttachFolderRule(t *testing.T) {
 // its ring in place (an internal stream: no ticket, no Flight). When
 // the stream closes the reader waits again, and finds the next one.
 func TestAttachFindsLocalStream(t *testing.T) {
-	tel, err := Init(Config{Root: t.TempDir()})
+	tel, err := Init(Config{Store: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tel.Close()
 	other, err := tel.CreateStream("rd/late/other", testSchema(),
-		StreamOptions{RingRows: 400, Internal: true})
+		StreamOptions{Memory: &MemoryOptions{Rows: 400}, Internal: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer other.Close()
 
-	a, err := tel.Attach("rd/late/s", AttachOptions{}) // the folder exists in this process alone
+	a, err := tel.Connect("rd/late/s", ConnectOptions{}) // the folder exists in this process alone
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestAttachFindsLocalStream(t *testing.T) {
 	}
 	for round := 0; round < 2; round++ {
 		s, err := tel.CreateStream("rd/late/s", testSchema(),
-			StreamOptions{RingRows: 400, Internal: true})
+			StreamOptions{Memory: &MemoryOptions{Rows: 400}, Internal: true})
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -27,10 +27,10 @@ nothing calls them back (house polling idiom).
     a.duckdb_archive(con)                the files as a DuckDB view
     a.duckdb_all(con)                    memory plus the files, exact
     a.memory_state()                     rows held, rows not on disk
-    a.name, a.schema, a.state, a.standing(), a.close()
+    a.name, a.schema, a.state, a.reason, a.close()
 
 Feeder states (attached.state):
-    "root-unreachable" -- the store can't be read (remote)
+    "store-unreachable" -- the store can't be read (remote)
     "no-ticket"    -- store readable, no ticket there (remote)
     "waiting"      -- have a stale ticket, publisher appears dead (remote)
     "connecting"   -- attempting Flight connection (remote)
@@ -295,14 +295,14 @@ class Attached:
         con.register(vname, DynamicRelation(d))
         return View(con, vname, unregister=lambda: con.unregister(vname))
 
-    def standing(self):
-        """The conditions standing between this reader and a live
-        stream, in words: [] while streaming (or local). A dashboard
-        shows them; a daemon's check folds them into its own."""
+    @property
+    def reason(self):
+        """Why this reader is not streaming, in words; None while it is
+        (and always for a local stream). A dashboard shows it; a
+        daemon's check folds it into its own."""
         if self._feeder is None or self.state == "streaming":
-            return []
-        reason = self._feeder.reason
-        return [reason] if reason else [f"not streaming: {self.state}"]
+            return None
+        return self._feeder.reason or f"not streaming: {self.state}"
 
     def _view_source(self, store):
         """The TicketSource for this reader's archive views: its own
@@ -343,7 +343,7 @@ class Attached:
         the extent that rows are in memory the view uses them: the seam
         is the oldest row boundary the store has above the ring's
         oldest quarter (_views). Without the live connection the memory
-        piece is left out and `standing()` says why; the files still
+        piece is left out and `reason` says why; the files still
         answer. row_ids: as duckdb_live."""
         from ._views import StoreView
         src = self._view_source(store)

@@ -56,7 +56,7 @@ func TestCatalogRealS3(t *testing.T) {
 		}
 		defer tel.Close()
 		t00 := time.Now()
-		s, err := tel.CreateStream(name, testSchema(), StreamOptions{RingRows: 400,
+		s, err := tel.CreateStream(name, testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400},
 			Parquet: &ParquetOptions{Sink: root}})
 		if err != nil {
 			t.Fatal(err)

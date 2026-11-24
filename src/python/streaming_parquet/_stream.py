@@ -94,7 +94,7 @@ class Stream:
         self._archive = parquet
         self._store = store
         row_group_rows = parquet.row_group_rows if parquet else None
-        ring_rows, row_group_rows = _ring_sizes(name, memory.lookback,
+        ring_rows, row_group_rows = _ring_sizes(name, memory.rows,
                                                 row_group_rows)
         self._ring_rows = ring_rows
         self._make_writer = make_writer

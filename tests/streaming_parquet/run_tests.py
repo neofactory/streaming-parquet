@@ -153,7 +153,7 @@ print("\n--- local streams ---")
 
 @test("create stream, write rows, local attach reads")
 def _():
-    s = sp.create_stream("v2test/basic", SCHEMA, memory=MemoryOptions(lookback=500))
+    s = sp.create_stream("v2test/basic", SCHEMA, memory=MemoryOptions(rows=500))
     fill(s, 10)
     a = sp.connect("v2test/basic")
     assert a.state == "streaming"
@@ -170,7 +170,7 @@ def _():
     # row.servo.pos leaves; a dict write to a struct raises).
     flat = pa.schema([F('tv', pa.float64(), nullable=False),
                       F('label', pa.utf8(), nullable=False)])
-    s = sp.create_stream("v2test/writes2", flat, memory=MemoryOptions(lookback=500))
+    s = sp.create_stream("v2test/writes2", flat, memory=MemoryOptions(rows=500))
     s.append({'tv': 1.0, 'label': 'a'})
     s.append(pa.record_batch({'tv': [2.0, 3.0],
                                     'label': ['b', 'c']}, schema=flat))
@@ -182,9 +182,9 @@ def _():
 @test("local attach accepts memory (the publisher's ring as it is); "
       "rejects columns")
 def _():
-    s = sp.create_stream("v2test/local", SCHEMA, memory=MemoryOptions(lookback=100))
+    s = sp.create_stream("v2test/local", SCHEMA, memory=MemoryOptions(rows=100))
     fill(s, 80)
-    a = sp.connect("v2test/local", memory=MemoryOptions(lookback=368_640))
+    a = sp.connect("v2test/local", memory=MemoryOptions(rows=368_640))
     assert a.newest_row() is not None
     a.close()
     try:
@@ -196,7 +196,7 @@ def _():
 
 @test("a record set over the ring's rows via a._ring + DuckDB over the hot window")
 def _():
-    s = sp.create_stream("v2test/rel", SCHEMA, memory=MemoryOptions(lookback=500))
+    s = sp.create_stream("v2test/rel", SCHEMA, memory=MemoryOptions(rows=500))
     fill(s, 100)
     a = sp.connect("v2test/rel")
     with all_rows(a._ring) as rs:
@@ -211,7 +211,7 @@ def _():
 
 @test("hot relation: register once, stays current")
 def _():
-    s = sp.create_stream("v2test/dyn", SCHEMA, memory=MemoryOptions(lookback=500))
+    s = sp.create_stream("v2test/dyn", SCHEMA, memory=MemoryOptions(rows=500))
     fill(s, 20)
     a = sp.connect("v2test/dyn")
     con = duckdb.connect()
@@ -225,7 +225,7 @@ def _():
 
 @test("seq_at_or_after finds the window edge")
 def _():
-    s = sp.create_stream("v2test/seek", SCHEMA, memory=MemoryOptions(lookback=500))
+    s = sp.create_stream("v2test/seek", SCHEMA, memory=MemoryOptions(rows=500))
     fill(s, 50)
     a = sp.connect("v2test/seek")
     assert a._seq_at_or_after('tv', 25.0) == 25
@@ -236,7 +236,7 @@ def _():
 
 @test("wrap: old rows recycle, StaleReadError is loud")
 def _():
-    s = sp.create_stream("v2test/wrap", SCHEMA, memory=MemoryOptions(lookback=32))
+    s = sp.create_stream("v2test/wrap", SCHEMA, memory=MemoryOptions(rows=32))
     fill(s, 50)
     a = sp.connect("v2test/wrap")
     assert a._oldest_seq == 18 and a._newest_seq == 49
@@ -250,7 +250,7 @@ def _():
 
 @test("a held pin on the oldest row stalls the writer, loudly, then releases")
 def _():
-    s = sp.create_stream("v2test/pin", SCHEMA, memory=MemoryOptions(lookback=32))
+    s = sp.create_stream("v2test/pin", SCHEMA, memory=MemoryOptions(rows=32))
     fill(s, 32)
     a = sp.connect("v2test/pin")
     rs = all_rows(a._ring)
@@ -276,7 +276,7 @@ def _():
     import struct as _s
     flat = pa.schema([F('cnt', pa.uint16(), nullable=False),
                       F('pos', pa.float64(), nullable=False)])
-    s = sp.create_stream("v2test/wire", flat, memory=MemoryOptions(lookback=100))
+    s = sp.create_stream("v2test/wire", flat, memory=MemoryOptions(rows=100))
     wm = s.wire_map([('cnt', 0, 2), ('pos', 2, 8)])
     for i in range(5):
         frame = _s.pack('<Hd', i, i * 1.5)
@@ -293,7 +293,7 @@ print("\n--- parquet sessions ---")
 @test("session-gated parquet with label; rows land; file readable")
 def _():
     with tempfile.TemporaryDirectory() as tmp:
-        s = sp.create_stream("v2test/pq", SCHEMA, memory=MemoryOptions(lookback=500), store=tmp, parquet=ParquetOptions(row_group_seconds=0.05))
+        s = sp.create_stream("v2test/pq", SCHEMA, memory=MemoryOptions(rows=500), store=tmp, parquet=ParquetOptions(row_group_seconds=0.05))
         s.start_parquet("O9999")
         fill(s, 40)
         time.sleep(0.1)          # exceed row_group_seconds
@@ -321,7 +321,7 @@ def _():
     with tempfile.TemporaryDirectory() as tmp:
         # the row group (ring/2 = 250 rows) is never reached: only the tail
         # checkpoint makes the rows durable
-        s = sp.create_stream("v2test/ck", SCHEMA, memory=MemoryOptions(lookback=500), store=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05))
+        s = sp.create_stream("v2test/ck", SCHEMA, memory=MemoryOptions(rows=500), store=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05))
         s._parquet.superseded_keep_s = 0   # checkpoints go as soon as superseded
         s.start_parquet("CKPT")
         fill(s, 30)
@@ -361,7 +361,7 @@ def _():
 @test("an idle stream writes no checkpoint: the tail is claimed once")
 def _():
     with tempfile.TemporaryDirectory() as tmp:
-        s = sp.create_stream("v2test/idle", SCHEMA, memory=MemoryOptions(lookback=500), store=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05))
+        s = sp.create_stream("v2test/idle", SCHEMA, memory=MemoryOptions(rows=500), store=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05))
         s.start_parquet("IDLE")
         fill(s, 10)
         time.sleep(0.1)
@@ -385,10 +385,10 @@ def _():
 @test("start_parquet records from THIS moment (no pre-start rows)")
 def _():
     with tempfile.TemporaryDirectory() as tmp:
-        s = sp.create_stream("v2test/pq2", SCHEMA, memory=MemoryOptions(lookback=500))
+        s = sp.create_stream("v2test/pq2", SCHEMA, memory=MemoryOptions(rows=500))
         # no archive -> recording off; write some rows first
         sp.close()
-        s = sp.create_stream("v2test/pq3", SCHEMA, memory=MemoryOptions(lookback=500), store=tmp, parquet=ParquetOptions(row_group_seconds=0.05))
+        s = sp.create_stream("v2test/pq3", SCHEMA, memory=MemoryOptions(rows=500), store=tmp, parquet=ParquetOptions(row_group_seconds=0.05))
         s.stop_parquet()                 # gate off
         fill(s, 25)                      # pre-session rows
         s.start_parquet("SES")
@@ -416,8 +416,8 @@ def _():
 def _():
     from hostile import hostile_table, assert_hostile_equal, HOSTILE_SCHEMA
     with tempfile.TemporaryDirectory() as tmp:
-        s = sp.create_stream("v2test/hostile", HOSTILE_SCHEMA, memory=MemoryOptions(lookback=6000), store=tmp, parquet=ParquetOptions(checkpoint_seconds=0.15, row_group_rows=500, row_group_seconds=0.4))
-        a = sp.connect(ticket=s._ticket, memory=MemoryOptions(lookback=6000))
+        s = sp.create_stream("v2test/hostile", HOSTILE_SCHEMA, memory=MemoryOptions(rows=6000), store=tmp, parquet=ParquetOptions(checkpoint_seconds=0.15, row_group_rows=500, row_group_seconds=0.4))
+        a = sp.connect(ticket=s._ticket, memory=MemoryOptions(rows=6000))
         wait_for(lambda: a.state == "streaming", what="feeder connect")
         N = 2000
         for k in range(4):
@@ -451,7 +451,7 @@ def _():
     with tempfile.TemporaryDirectory() as tmp:
         flat = pa.schema([F('n', pa.int64(), nullable=False),
                           F('x', pa.float64(), nullable=False)])
-        s = sp.create_stream("v2test/cr", flat, memory=MemoryOptions(lookback=5000), store=tmp, parquet=ParquetOptions(checkpoint_seconds=0.2, row_group_rows=250, row_group_seconds=0.5))
+        s = sp.create_stream("v2test/cr", flat, memory=MemoryOptions(rows=5000), store=tmp, parquet=ParquetOptions(checkpoint_seconds=0.2, row_group_rows=250, row_group_seconds=0.5))
 
         def burst(a, k):
             s.append(pa.record_batch(
@@ -466,7 +466,7 @@ def _():
             burst(w * 200, 200)
             time.sleep(0.3)
         time.sleep(0.5)
-        a = sp.connect(ticket=s._ticket, memory=MemoryOptions(lookback=5000))
+        a = sp.connect(ticket=s._ticket, memory=MemoryOptions(rows=5000))
         wait_for(lambda: a.state == "streaming", what="feeder connect")
         con = view_con()
         rel = a.duckdb_all(con, store=tmp)       # a direct ticket names no store
@@ -493,7 +493,7 @@ def _():
 @test("flush_parquet(label): cut at a boundary, no row skipped, label set then cleared")
 def _():
     with tempfile.TemporaryDirectory() as tmp:
-        s = sp.create_stream("v2test/cut", SCHEMA, memory=MemoryOptions(lookback=500), store=tmp, parquet=ParquetOptions())
+        s = sp.create_stream("v2test/cut", SCHEMA, memory=MemoryOptions(rows=500), store=tmp, parquet=ParquetOptions())
         fill(s, 30)
         s.cut(label="O1105")         # cut; next file labeled
         fill(s, 20, start=30)
@@ -519,7 +519,7 @@ def _():
 @test("ParquetOptions(compression=...): per-column encodings (delta, BSS, dictionary list) reach the file")
 def _():
     with tempfile.TemporaryDirectory() as tmp:
-        s = sp.create_stream("v2test/encoding", SCHEMA, memory=MemoryOptions(lookback=500), store=tmp, parquet=ParquetOptions(compression={"compression": "zstd", "compression_level": 9,
+        s = sp.create_stream("v2test/encoding", SCHEMA, memory=MemoryOptions(rows=500), store=tmp, parquet=ParquetOptions(compression={"compression": "zstd", "compression_level": 9,
                           "use_dictionary": ["label"],
                           "column_encoding": {"servo.pos": "DELTA_BINARY_PACKED",
                                               "servo.vel": "DELTA_BINARY_PACKED",
@@ -546,7 +546,7 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as tmp:
         def written(name, archive):
-            s = sp.create_stream(name, SCHEMA, memory=MemoryOptions(lookback=500),
+            s = sp.create_stream(name, SCHEMA, memory=MemoryOptions(rows=500),
                                         store=tmp, parquet=archive)
             fill(s, 300)
             s.cut()
@@ -580,7 +580,7 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as tmp:
         flat = pa.schema([F('n', pa.int64(), nullable=False)])
-        s = sp.create_stream("v2test/jam", flat, memory=MemoryOptions(lookback=64), store=tmp, parquet=ParquetOptions(row_group_rows=32, row_group_seconds=0.2, checkpoint_seconds=0.1))
+        s = sp.create_stream("v2test/jam", flat, memory=MemoryOptions(rows=64), store=tmp, parquet=ParquetOptions(row_group_rows=32, row_group_seconds=0.2, checkpoint_seconds=0.1))
         a = sp.connect("v2test/jam")
 
         def alloc(i, block_s=0.05):
@@ -622,7 +622,7 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as tmp:
         flat = pa.schema([F('n', pa.int64(), nullable=False)])
-        s = sp.create_stream("v2test/crs", flat, memory=MemoryOptions(lookback=4000), store=tmp, parquet=ParquetOptions(checkpoint_seconds=0.15, row_group_rows=200, row_group_seconds=0.4))
+        s = sp.create_stream("v2test/crs", flat, memory=MemoryOptions(rows=4000), store=tmp, parquet=ParquetOptions(checkpoint_seconds=0.15, row_group_rows=200, row_group_seconds=0.4))
         for w in range(3):
             s.append(pa.record_batch([pa.array(range(w * 150,
                                                            w * 150 + 150))],
@@ -669,7 +669,7 @@ print("\n--- the reader verbs ---")
 
 @test("newest_row: None while empty, then the newest row")
 def _():
-    s = sp.create_stream("v2test/newest", SCHEMA, memory=MemoryOptions(lookback=100))
+    s = sp.create_stream("v2test/newest", SCHEMA, memory=MemoryOptions(rows=100))
     a = sp.connect("v2test/newest")
     assert a.newest_row() is None and s.newest_row() is None
     fill(s, 7)
@@ -678,7 +678,7 @@ def _():
 
 @test("cursor: the rows since the last pass, lost counted, since= starts in the past")
 def _():
-    s = sp.create_stream("v2test/cursor", SCHEMA, memory=MemoryOptions(lookback=32))
+    s = sp.create_stream("v2test/cursor", SCHEMA, memory=MemoryOptions(rows=32))
     fill(s, 10)
     a = sp.connect("v2test/cursor")
     c = a.cursor()                       # starts at the newest row
@@ -707,7 +707,7 @@ def _():
 @test("arrow_table: unarchived by default, rows=N, since=, columns=; the table is the pin")
 def _():
     with tempfile.TemporaryDirectory() as tmp:
-        s = sp.create_stream("v2test/table", SCHEMA, memory=MemoryOptions(lookback=500),
+        s = sp.create_stream("v2test/table", SCHEMA, memory=MemoryOptions(rows=500),
                                     store=tmp, parquet=ParquetOptions(checkpoint_seconds=1.0))
         fill(s, 40)
         a = sp.connect("v2test/table")
@@ -723,7 +723,7 @@ def _():
         assert a.arrow_table().column('tv').to_pylist() == [40.0, 41.0, 42.0]
         assert a.memory_state().rows == 43 and a.memory_state().capacity == 500
         # a reader with no archive of its own: everything it holds
-        s2 = sp.create_stream("v2test/table2", SCHEMA, memory=MemoryOptions(lookback=50))
+        s2 = sp.create_stream("v2test/table2", SCHEMA, memory=MemoryOptions(rows=50))
         fill(s2, 12)
         assert sp.connect("v2test/table2").arrow_table().num_rows == 12
         # the table pins ITS rows and no others: held across a near-full
@@ -746,7 +746,7 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as tmp:
         flat = pa.schema([F('n', pa.int64(), nullable=False)])
-        s = sp.create_stream("v2test/views", flat, memory=MemoryOptions(lookback=4000),
+        s = sp.create_stream("v2test/views", flat, memory=MemoryOptions(rows=4000),
                                     store=tmp, parquet=ParquetOptions(row_group_rows=200, row_group_seconds=0.4, checkpoint_seconds=0.15))
         for w in range(3):
             s.append(pa.record_batch([pa.array(range(w * 150, w * 150 + 150))], schema=flat))
@@ -772,7 +772,7 @@ def _():
 @test("archive_state().file: the open file's name, None between files")
 def _():
     with tempfile.TemporaryDirectory() as tmp:
-        s = sp.create_stream("v2test/openfile", SCHEMA, memory=MemoryOptions(lookback=500),
+        s = sp.create_stream("v2test/openfile", SCHEMA, memory=MemoryOptions(rows=500),
                                     store=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05))
         assert s.archive_state().file is None          # nothing written yet
         fill(s, 5)
@@ -790,7 +790,7 @@ def _():
 def _():
     from streaming_parquet import _clock
     with tempfile.TemporaryDirectory() as tmp:
-        s = sp.create_stream("v2test/stamp", SCHEMA, memory=MemoryOptions(lookback=500),
+        s = sp.create_stream("v2test/stamp", SCHEMA, memory=MemoryOptions(rows=500),
                                     store=tmp, parquet=ParquetOptions(checkpoint_seconds=0.2))
         fill(s, 5)
         s.cut(label="STAMP")            # ends the first file; the next is unnamed until a row
@@ -813,9 +813,9 @@ def _():
 
 @test("a reader that attaches later gets rows from then on: its first request starts at the newest row")
 def _():
-    s = sp.create_stream("v2test/nosub", SCHEMA, memory=MemoryOptions(lookback=500))
+    s = sp.create_stream("v2test/nosub", SCHEMA, memory=MemoryOptions(rows=500))
     fill(s, 50)                          # nobody attached; nothing is sent to anyone
-    a = sp.connect(ticket=s._ticket, memory=MemoryOptions(lookback=500))
+    a = sp.connect(ticket=s._ticket, memory=MemoryOptions(rows=500))
     wait_for(lambda: a.state == "streaming", what="feeder connect")
     fill(s, 10, start=50)
     wait_for(lambda: a._newest_seq == 59, what="rows after attach")
@@ -827,7 +827,7 @@ def _():
 def _():
     import struct as _s
     import pyarrow.flight as flight
-    s = sp.create_stream("v2test/pull", SCHEMA, memory=MemoryOptions(lookback=500))
+    s = sp.create_stream("v2test/pull", SCHEMA, memory=MemoryOptions(rows=500))
     for i in range(100):                 # one hundred commits
         fill(s, 1, start=i)
     t = s._ticket
@@ -865,7 +865,7 @@ def _():
         pass
     client.close()
     # the feeder on the same wire: at rest, one row commits and arrives within a round trip
-    a = sp.connect(ticket=s._ticket, memory=MemoryOptions(lookback=500))
+    a = sp.connect(ticket=s._ticket, memory=MemoryOptions(rows=500))
     wait_for(lambda: a.state == "streaming", what="feeder connect")
     t0 = time.monotonic()
     fill(s, 1, start=101)
@@ -879,17 +879,17 @@ print("\n--- flight loopback (remote attach) ---")
 def _():
     import tempfile
     with tempfile.TemporaryDirectory() as root:
-        s = sp.create_stream("v2test/disc", SCHEMA, memory=MemoryOptions(lookback=500), store=root)
+        s = sp.create_stream("v2test/disc", SCHEMA, memory=MemoryOptions(rows=500), store=root)
         wait_for(lambda: sp.list_streams(store=root) == ["v2test/disc"],
                  what="ticket lands in the store")
         # by-name connect from "another process": defeat the local fast
         # path by connecting through the fully-qualified URI (the store
         # rides in the name; the feeder discovers the ticket)
         a = sp.connect(f"file://{root}/streams/v2test/disc",
-                              memory=MemoryOptions(lookback=500))
+                              memory=MemoryOptions(rows=500))
         wait_for(lambda: a.state == "streaming",
                  what="feeder connect via store discovery")
-        assert a.standing() == [], a.standing()
+        assert a.reason is None, a.reason
         fill(s, 25)
         wait_for(lambda: a._newest_seq == 24, what="rows over Flight")
         assert a._read_row(24).tv == 24.0
@@ -913,14 +913,14 @@ def _():
         assert "whole bucket" in str(e), e
 
 
-@test("the archive views need no connection: a dead publisher's files still answer, and standing() says why")
+@test("the archive views need no connection: a dead publisher's files still answer, and reason says why")
 def _():
     import json as _json
     import tempfile
     flat = pa.schema([F('n', pa.int64(), nullable=False)])
     with tempfile.TemporaryDirectory() as root:
         # a publisher wrote two files and died, leaving a stale ticket
-        s = sp.create_stream("v2test/dead", flat, memory=MemoryOptions(lookback=500), store=root,
+        s = sp.create_stream("v2test/dead", flat, memory=MemoryOptions(rows=500), store=root,
                                     parquet=ParquetOptions(checkpoint_seconds=0.05))
         s.append(pa.record_batch([pa.array(range(100))], schema=flat))
         s.cut()
@@ -931,9 +931,9 @@ def _():
         with open(tpath, "w") as f:
             _json.dump({"name": "v2test/dead", "host": "127.0.0.1", "port": 1,
                         "ts": time.time() - 3600, "run": "x"}, f)
-        a = sp.connect("v2test/dead", store=root, memory=MemoryOptions(lookback=500))
+        a = sp.connect("v2test/dead", store=root, memory=MemoryOptions(rows=500))
         wait_for(lambda: a.state == "waiting", what="stale ticket seen")
-        assert a.standing() and "stale" in a.standing()[0], a.standing()
+        assert a.reason and "stale" in a.reason, a.reason
         con = view_con()
         arch = a.duckdb_archive(con)
         assert con.sql(f"SELECT count(*), max(n) FROM {arch.name}").fetchall()[0] == (150, 149)
@@ -954,7 +954,7 @@ def _():
         with open(path, "w") as f:
             _json.dump({"name": "v2test/stale", "host": "127.0.0.1",
                         "port": 1, "ts": time.time() - 3600}, f)
-        a = sp.connect("v2test/stale", memory=MemoryOptions(lookback=500), store=root)
+        a = sp.connect("v2test/stale", memory=MemoryOptions(rows=500), store=root)
         wait_for(lambda: a.state == "waiting", what="stale ticket seen")
         a.close()
 
@@ -963,16 +963,16 @@ def _():
 def _():
     import tempfile
     with tempfile.TemporaryDirectory() as root:
-        s = sp.create_stream("v2test/epoch", SCHEMA, memory=MemoryOptions(lookback=500), store=root)
+        s = sp.create_stream("v2test/epoch", SCHEMA, memory=MemoryOptions(rows=500), store=root)
         # through the URI so the feeder path is exercised, not the local face
-        a = sp.connect(f"file://{root}/streams/v2test/epoch", memory=MemoryOptions(lookback=500))
+        a = sp.connect(f"file://{root}/streams/v2test/epoch", memory=MemoryOptions(rows=500))
         wait_for(lambda: a.state == "streaming", what="first epoch connect")
         fill(s, 20)
         wait_for(lambda: a._newest_seq == 19, what="epoch-1 rows")
         s.close()   # deletes the ticket AND unregisters the name
         # respawn: same name, new epoch, seq axis restarts at 0 — the
         # feeder must resync (fresh ring), not livelock on regression
-        s2 = sp.create_stream("v2test/epoch", SCHEMA, memory=MemoryOptions(lookback=500), store=root)
+        s2 = sp.create_stream("v2test/epoch", SCHEMA, memory=MemoryOptions(rows=500), store=root)
         # a real publisher keeps publishing through the reconnect; feed
         # a row at a time until an epoch-2 row (tv >= 100, offset makes
         # them distinguishable from epoch-1's) lands in the fresh ring
@@ -1005,7 +1005,7 @@ def _():
     with tempfile.TemporaryDirectory() as root:
         def write_run(start):
             s = sp.create_stream("v2test/run", flat,
-                                        memory=MemoryOptions(lookback=500), store=root,
+                                        memory=MemoryOptions(rows=500), store=root,
                                         parquet=ParquetOptions(checkpoint_seconds=0.05))
             run = s._ticket["run"]
             s.append(pa.record_batch([pa.array(range(start, start + 10))],
@@ -1037,8 +1037,8 @@ def _():
 
 @test("remote attach by ticket: publish -> Flight -> local ring")
 def _():
-    s = sp.create_stream("v2test/flight", SCHEMA, memory=MemoryOptions(lookback=500))
-    a = sp.connect(ticket=s._ticket, memory=MemoryOptions(lookback=500))
+    s = sp.create_stream("v2test/flight", SCHEMA, memory=MemoryOptions(rows=500))
+    a = sp.connect(ticket=s._ticket, memory=MemoryOptions(rows=500))
     wait_for(lambda: a.state == "streaming", what="feeder connect")
     fill(s, 30)
     wait_for(lambda: a._newest_seq == 29, what="rows over Flight")
@@ -1059,7 +1059,7 @@ def _():
     # (The push protocol this replaced held a pin per batch in transit;
     # one stuck 2.6 s stopped the writer and ended brother-connector.)
     import pyarrow.flight as flight
-    s = sp.create_stream("v2test/stuck", SCHEMA, memory=MemoryOptions(lookback=2_000))
+    s = sp.create_stream("v2test/stuck", SCHEMA, memory=MemoryOptions(rows=2_000))
     fill(s, 100)
     t = s._ticket
     client = flight.FlightClient(f"grpc://{t['host']}:{t['port']}")
@@ -1080,9 +1080,9 @@ def _():
 
 @test("wire seq alignment: mid-stream attach lands on publisher's axis")
 def _():
-    s = sp.create_stream("v2test/seqax", SCHEMA, memory=MemoryOptions(lookback=500))
+    s = sp.create_stream("v2test/seqax", SCHEMA, memory=MemoryOptions(rows=500))
     fill(s, 40)                      # published BEFORE anyone attaches
-    a = sp.connect(ticket=s._ticket, memory=MemoryOptions(lookback=500))
+    a = sp.connect(ticket=s._ticket, memory=MemoryOptions(rows=500))
     wait_for(lambda: a.state == "streaming", what="feeder connect")
     fill(s, 20, start=40)
     wait_for(lambda: a._newest_seq == 59, what="post-attach rows")
@@ -1099,8 +1099,8 @@ def _():
 def _():
     flat = pa.schema([F('tv', pa.float64(), nullable=False),
                       F('big', pa.utf8(), nullable=False)])
-    s = sp.create_stream("v2test/cols", flat, memory=MemoryOptions(lookback=500))
-    a = sp.connect(ticket=s._ticket, memory=MemoryOptions(lookback=500), columns=['tv'])
+    s = sp.create_stream("v2test/cols", flat, memory=MemoryOptions(rows=500))
+    a = sp.connect(ticket=s._ticket, memory=MemoryOptions(rows=500), columns=['tv'])
     wait_for(lambda: a.state == "streaming", what="feeder connect")
     for i in range(10):
         s.append({'tv': float(i), 'big': 'x' * 100})
@@ -1138,7 +1138,7 @@ def _():
     from parquet_checkpoint import FakeS3
     with tempfile.TemporaryDirectory() as tmp:
         only = FakeS3(part_min=4096)
-        s = sp.create_stream("v2test/only", SCHEMA, memory=MemoryOptions(lookback=500), store=only, spool=None, parquet=ParquetOptions(checkpoint_seconds=0.05))
+        s = sp.create_stream("v2test/only", SCHEMA, memory=MemoryOptions(rows=500), store=only, spool=None, parquet=ParquetOptions(checkpoint_seconds=0.05))
         assert s.archive_state() == ArchiveState(failing=False, error=None, lost_rows=0,
                                                  location='fake-s3://streams/v2test/only/',
                                                  file=None)
@@ -1161,7 +1161,7 @@ def _():
     from parquet_checkpoint import FakeS3
     with tempfile.TemporaryDirectory() as tmp:
         only = FakeS3(part_min=4096)
-        s = sp.create_stream("v2test/arch", SCHEMA, memory=MemoryOptions(lookback=500), store=only, spool=None, parquet=ParquetOptions(checkpoint_seconds=0.05))
+        s = sp.create_stream("v2test/arch", SCHEMA, memory=MemoryOptions(rows=500), store=only, spool=None, parquet=ParquetOptions(checkpoint_seconds=0.05))
         s.start_parquet("ARCH")
         only.fail_next('put:streams/', n=3)   # the files' writes, not the ticket's
         fill(s, 10)
@@ -1178,7 +1178,7 @@ def _():
 @test("archive state: rows recycled before their flush count as lost, forever")
 def _():
     with tempfile.TemporaryDirectory() as tmp:
-        s = sp.create_stream("v2test/lost", SCHEMA, memory=MemoryOptions(lookback=64), store=tmp, parquet=ParquetOptions(row_group_rows=32))
+        s = sp.create_stream("v2test/lost", SCHEMA, memory=MemoryOptions(rows=64), store=tmp, parquet=ParquetOptions(row_group_rows=32))
         s.start_parquet("LOST")
         # 200 rows in ONE commit into a 64-row ring: the flush pins the
         # pending region at the commit, and by then rows 0..135 are
@@ -1198,7 +1198,7 @@ def _():
     from parquet_checkpoint import FakeS3
     with tempfile.TemporaryDirectory() as tmp:
         remote = FakeS3(part_min=4096)
-        s = sp.create_stream("v2test/rem", SCHEMA, memory=MemoryOptions(lookback=500), store=remote, spool=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05, ship_seconds=0.02))
+        s = sp.create_stream("v2test/rem", SCHEMA, memory=MemoryOptions(rows=500), store=remote, spool=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05, ship_seconds=0.02))
         pq_dir = s.archive_state().location
         s.start_parquet("REM")
         fill(s, 30)
@@ -1259,7 +1259,7 @@ def _():
 
     with tempfile.TemporaryDirectory() as tmp:
         remote = Dark(part_min=4096)
-        s = sp.create_stream("v2test/dark", SCHEMA, memory=MemoryOptions(lookback=500), store=remote, spool=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05, ship_seconds=0.02))
+        s = sp.create_stream("v2test/dark", SCHEMA, memory=MemoryOptions(rows=500), store=remote, spool=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05, ship_seconds=0.02))
         s.start_parquet("DARK")
         fill(s, 30)
         time.sleep(0.1)
@@ -1286,7 +1286,7 @@ def _():
     with tempfile.TemporaryDirectory() as tmp:
         remote = FakeS3(part_min=4096)
         pq_dir = os.path.join(tmp, "streams", "v2test/half")
-        s = sp.create_stream("v2test/half", SCHEMA, memory=MemoryOptions(lookback=500), store=remote, spool=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05, ship_seconds=0.02))
+        s = sp.create_stream("v2test/half", SCHEMA, memory=MemoryOptions(rows=500), store=remote, spool=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05, ship_seconds=0.02))
         s.start_parquet("HALF")
         fill(s, 20)
         time.sleep(0.1)
@@ -1299,7 +1299,7 @@ def _():
         sp.close()                # the closing pass fails the same way
         assert [n for n in remote.list('') if n.endswith('.ckpt') and 'HALF' in n]
         remote.clear_faults()
-        s2 = sp.create_stream("v2test/half", SCHEMA, memory=MemoryOptions(lookback=500), store=remote, spool=tmp, parquet=ParquetOptions(ship_seconds=0.02))
+        s2 = sp.create_stream("v2test/half", SCHEMA, memory=MemoryOptions(rows=500), store=remote, spool=tmp, parquet=ParquetOptions(ship_seconds=0.02))
         s2.stop_parquet()                # nothing local in flight: the sweep alone
         pump(s2, lambda: not s2._parquet.get_in_flight()
              and any(n.endswith('.parquet') and 'HALF' in n for n in remote.list(''))
@@ -1317,7 +1317,7 @@ def _():
     with tempfile.TemporaryDirectory() as tmp:
         remote = FakeS3(part_min=4096)
         pq_dir = os.path.join(tmp, "streams", "v2test/boot")
-        s = sp.create_stream("v2test/boot", SCHEMA, memory=MemoryOptions(lookback=500), store=remote, spool=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05, ship_seconds=0.02))
+        s = sp.create_stream("v2test/boot", SCHEMA, memory=MemoryOptions(rows=500), store=remote, spool=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05, ship_seconds=0.02))
         s.start_parquet("BOOT")
         fill(s, 20)
         time.sleep(0.1)
@@ -1336,7 +1336,7 @@ def _():
         # file and the first mirror passes finish it
         remote.clear_faults()
         # (the checkpoint is seconds old: the owner finishes it anyway)
-        s2 = sp.create_stream("v2test/boot", SCHEMA, memory=MemoryOptions(lookback=500), store=remote, spool=tmp, parquet=ParquetOptions(ship_seconds=0.02))
+        s2 = sp.create_stream("v2test/boot", SCHEMA, memory=MemoryOptions(rows=500), store=remote, spool=tmp, parquet=ParquetOptions(ship_seconds=0.02))
         assert s2._parquet.get_in_flight(), "boot sweep must register the pending file"
         s2.stop_parquet()                # recording off: the heartbeat alone drives the mirror
         pump(s2, lambda: not s2._parquet.get_in_flight(), what="pending file finished")
@@ -1354,7 +1354,7 @@ import streaming_parquet as sp
 root, mode = sys.argv[1], sys.argv[2]
 flat = pa.schema([("n", pa.int64())])
 s = sp.create_stream("v2test/own", flat, store=root,
-                     memory=sp.MemoryOptions(lookback=500),
+                     memory=sp.MemoryOptions(rows=500),
                      parquet=sp.ParquetOptions(checkpoint_seconds=0.05))
 s.append(pa.record_batch([pa.array(range(40))], schema=flat))
 d = os.path.join(root, "streams", "v2test", "own")
@@ -1391,7 +1391,7 @@ def _():
         try:
             try:
                 sp.create_stream("v2test/own", flat, store=root,
-                                        memory=MemoryOptions(lookback=500))
+                                        memory=MemoryOptions(rows=500))
                 raise AssertionError("second writer was not refused")
             except RuntimeError as e:
                 assert "another process on this server" in str(e), e
@@ -1400,7 +1400,7 @@ def _():
             child.stdin.close()
             child.wait(timeout=30)
         s = sp.create_stream("v2test/own", flat, store=root,
-                                    memory=MemoryOptions(lookback=500))
+                                    memory=MemoryOptions(rows=500))
         s.close()
 
 
@@ -1417,7 +1417,7 @@ def _():
         left = [f for f in os.listdir(d) if f.endswith(".ckpt")]
         assert len(left) == 1, os.listdir(d)
         s = sp.create_stream("v2test/own", flat, store=root,
-                                    memory=MemoryOptions(lookback=500),
+                                    memory=MemoryOptions(rows=500),
                                     parquet=ParquetOptions(checkpoint_seconds=0.05))
         try:
             assert not [f for f in os.listdir(d) if f.endswith(".ckpt")], os.listdir(d)
@@ -1446,13 +1446,13 @@ def _():
         ticket(5)
         try:
             sp.create_stream("v2test/other", flat, store=root,
-                                    memory=MemoryOptions(lookback=500))
+                                    memory=MemoryOptions(rows=500))
             raise AssertionError("a fresh ticket from another server was not refused")
         except RuntimeError as e:
             assert "the server at 10.9.9.9:4242 writes this stream" in str(e), e
         ticket(3600)
         s = sp.create_stream("v2test/other", flat, store=root,
-                                    memory=MemoryOptions(lookback=500))
+                                    memory=MemoryOptions(rows=500))
         s.close()
 
 
@@ -1473,7 +1473,7 @@ def _():
             except (FileNotFoundError, ValueError):
                 return None
         s = sp.create_stream("v2test/tk", flat, store=root,
-                                    memory=MemoryOptions(lookback=500),
+                                    memory=MemoryOptions(rows=500),
                                     parquet=ParquetOptions(checkpoint_seconds=0.05))
         try:
             s.append(pa.record_batch([pa.array(range(30))], schema=flat))
@@ -1511,7 +1511,7 @@ def _():
     with tempfile.TemporaryDirectory() as spool:
         remote = FakeS3(part_min=4096)
         s = sp.create_stream("v2test/tkr", flat, store=remote, spool=spool,
-                                    memory=MemoryOptions(lookback=500),
+                                    memory=MemoryOptions(rows=500),
                                     parquet=ParquetOptions(checkpoint_seconds=0.05,
                                                     ship_seconds=0.05))
         try:
@@ -1543,24 +1543,24 @@ def _():
         with open(path, "w") as f:
             _json.dump({"name": "v2test/st", "host": "127.0.0.1", "port": 1,
                         "ts": time.time() - 3, "stale_after": 1.0}, f)
-        a = sp.connect("v2test/st", memory=MemoryOptions(lookback=500), store=root)
+        a = sp.connect("v2test/st", memory=MemoryOptions(rows=500), store=root)
         wait_for(lambda: a.state == "waiting", what="stale by its own stale_after")
-        assert "stale after 1 s" in a.standing()[0], a.standing()
+        assert "stale after 1 s" in a.reason, a.reason
         a.close()
         with open(path, "w") as f:
             _json.dump({"name": "v2test/st", "host": "127.0.0.1", "port": 1,
                         "ts": time.time() - 20}, f)
-        a = sp.connect("v2test/st", memory=MemoryOptions(lookback=500), store=root)
+        a = sp.connect("v2test/st", memory=MemoryOptions(rows=500), store=root)
         wait_for(lambda: a.state in ("connecting", "reconnecting"),
                  what="a 20 s old ticket without stale_after is live")
         a.close()
         with open(path, "w") as f:
             _json.dump({"name": "v2test/st", "host": "127.0.0.1", "port": 1,
                         "ts": time.time() - 40}, f)
-        a = sp.connect("v2test/st", memory=MemoryOptions(lookback=500), store=root)
+        a = sp.connect("v2test/st", memory=MemoryOptions(rows=500), store=root)
         wait_for(lambda: a.state == "waiting",
                  what="a 40 s old ticket without stale_after is stale")
-        assert "stale after 30 s" in a.standing()[0], a.standing()
+        assert "stale after 30 s" in a.reason, a.reason
         a.close()
         # the one rule: three beats, at least 30 seconds
         assert sp._tickets.stale_after({}) == parquet_checkpoint.dead_after() == 30.0
@@ -1580,7 +1580,7 @@ def _catalog_rows(folder, sql="SELECT count(*), min(n), max(n) FROM b.data"):
 
 def _catalog_writer_run(root, schema, batches, name="v2test/cat"):
     s = sp.create_stream(name, schema, store=root,
-                                memory=MemoryOptions(lookback=500),
+                                memory=MemoryOptions(rows=500),
                                 parquet=ParquetOptions(checkpoint_seconds=0.05))
     for b in batches:
         s.append(pa.record_batch(b, schema=schema))
@@ -1596,7 +1596,7 @@ def _():
     flat = pa.schema([("n", pa.int64())])
     with tempfile.TemporaryDirectory() as root:
         s = sp.create_stream("v2test/cat", flat, store=root,
-                                    memory=MemoryOptions(lookback=500),
+                                    memory=MemoryOptions(rows=500),
                                     parquet=ParquetOptions(checkpoint_seconds=0.05))
         d = os.path.join(root, "streams", "v2test", "cat")
         tpath = os.path.join(root, "tickets", "v2test", "cat.json")
@@ -1630,7 +1630,7 @@ def _():
         d = os.path.join(root, "streams", "v2test", "cat")
         os.remove(os.path.join(d, "catalog.sqlite"))
         s = sp.create_stream("v2test/cat", flat, store=root,
-                                    memory=MemoryOptions(lookback=500),
+                                    memory=MemoryOptions(rows=500),
                                     parquet=ParquetOptions(checkpoint_seconds=0.05))
         try:
             wait_for(lambda: s._parquet.catalog.files == 2, what="rebuilt from the files")
@@ -1652,7 +1652,7 @@ def _():
             [(1, None), (2, None), (3, "x")]
         bad = pa.schema([("n", pa.string())])
         s = sp.create_stream("v2test/cat", bad, store=root,
-                                    memory=MemoryOptions(lookback=500),
+                                    memory=MemoryOptions(rows=500),
                                     parquet=ParquetOptions(checkpoint_seconds=0.05,
                                                     ship_seconds=60))
         try:
@@ -1673,7 +1673,7 @@ def _():
     flat = pa.schema([("n", pa.int64())])
     with tempfile.TemporaryDirectory() as root:
         s = sp.create_stream("v2test/cat", flat, store=root,
-                                    memory=MemoryOptions(lookback=500),
+                                    memory=MemoryOptions(rows=500),
                                     parquet=ParquetOptions(checkpoint_seconds=0.05))
         d = os.path.join(root, "streams", "v2test", "cat")
         try:
@@ -1704,7 +1704,7 @@ def _():
         def copies():
             return sorted(n for n in os.listdir(d) if copy_name.match(n))
         s = sp.create_stream("v2test/copy", flat, store=root,
-                                    memory=MemoryOptions(lookback=500),
+                                    memory=MemoryOptions(rows=500),
                                     parquet=ParquetOptions(checkpoint_seconds=0.05,
                                                     ship_seconds=0.1,
                                                     catalog_copy_seconds=1.5))
@@ -1729,7 +1729,7 @@ def _():
     with tempfile.TemporaryDirectory() as root:
         _catalog_writer_run(root, flat, [[pa.array([1])]], name="v2test/nocopy")
         s = sp.create_stream("v2test/nocopy", flat, store=root,
-                                    memory=MemoryOptions(lookback=500),
+                                    memory=MemoryOptions(rows=500),
                                     parquet=ParquetOptions(checkpoint_seconds=0.05,
                                                     catalog_copy_seconds=None))
         s.append(pa.record_batch([pa.array([2])], schema=flat))
@@ -1888,7 +1888,7 @@ def _():
         try:
             with _LogLines() as lines:
                 s = sp.create_stream("v2test/cclose", flat, store=root,
-                                            memory=MemoryOptions(lookback=500),
+                                            memory=MemoryOptions(rows=500),
                                             parquet=ParquetOptions(checkpoint_seconds=0.05))
                 wait_for(lambda: s._parquet.catalog.progress[0] >= 2,
                          what="the start's reconcile under way")
@@ -1915,7 +1915,7 @@ def _():
     with tempfile.TemporaryDirectory() as spool:
         remote = FakeS3(part_min=4096)
         s = sp.create_stream("v2test/slowup", flat, store=remote, spool=spool,
-                                    memory=MemoryOptions(lookback=500),
+                                    memory=MemoryOptions(rows=500),
                                     parquet=ParquetOptions(checkpoint_seconds=0.05,
                                                     ship_seconds=0.05))
         s.append(pa.record_batch([pa.array(range(100))], schema=flat))
@@ -1970,7 +1970,7 @@ def _():
             except (FileNotFoundError, ValueError):
                 return None
         s = sp.create_stream("v2test/ext", flat, store=root,
-                                    memory=MemoryOptions(lookback=500),
+                                    memory=MemoryOptions(rows=500),
                                     parquet=ParquetOptions(checkpoint_seconds=0.05))
         try:
             con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
@@ -2037,12 +2037,12 @@ def _():
             except (FileNotFoundError, ValueError):
                 return None
         s = sp.create_stream("v2test/rev", flat, store=root,
-                                    memory=MemoryOptions(lookback=500),
+                                    memory=MemoryOptions(rows=500),
                                     parquet=ParquetOptions(checkpoint_seconds=0.05))
         try:
             wait_for(lambda: (ticket() or {}).get("revision", 0) >= 1,
                      what="the first ticket")
-            a = sp.connect(ticket=s._ticket, memory=MemoryOptions(lookback=500))
+            a = sp.connect(ticket=s._ticket, memory=MemoryOptions(rows=500))
             s.append(pa.record_batch([pa.array(range(10))], schema=flat))
             wait_for(lambda: a._feeder.ticket_revision is not None,
                      what="a revision on the connection")
@@ -2077,7 +2077,7 @@ def _():
                 return None
         undo = _slow_catalog(1.5)        # the catalog pass takes 1.5 s a file
         s = sp.create_stream("v2test/seqb", flat, store=root,
-                                    memory=MemoryOptions(lookback=500),
+                                    memory=MemoryOptions(rows=500),
                                     parquet=ParquetOptions(checkpoint_seconds=0.05))
         s._parquet.superseded_keep_s = 0.5  # 10 minutes in service
         try:
@@ -2134,7 +2134,7 @@ def _():
         assert sink.exists("20260101-000000.parquet")
         assert parquet_checkpoint.ckpt_versions(sink, "20260101-000000.parquet")
         s = sp.create_stream("v2test/kept", flat, store=root,
-                                    memory=MemoryOptions(lookback=500),
+                                    memory=MemoryOptions(rows=500),
                                     parquet=ParquetOptions(checkpoint_seconds=0.05))
         s._parquet.superseded_keep_s = 0.5  # 10 minutes in service
         try:
@@ -2158,7 +2158,7 @@ def _():
     with tempfile.TemporaryDirectory() as root:
         # a 1 s beat: the reader polls about every 2 s
         s = sp.create_stream("v2test/poll", flat, store=root,
-                                    memory=MemoryOptions(lookback=500),
+                                    memory=MemoryOptions(rows=500),
                                     parquet=ParquetOptions(checkpoint_seconds=1.0))
         try:
             s.append(pa.record_batch([pa.array(range(30))], schema=flat))
@@ -2191,7 +2191,7 @@ import streaming_parquet as sp
 from streaming_parquet import MemoryOptions, ParquetOptions
 flat = pa.schema([("n", pa.int64())])
 root = tempfile.mkdtemp()
-s = sp.create_stream("x/exit", flat, store=root, memory=MemoryOptions(lookback=500),
+s = sp.create_stream("x/exit", flat, store=root, memory=MemoryOptions(rows=500),
                      parquet=ParquetOptions(checkpoint_seconds=0.05))
 s.append(pa.record_batch([pa.array(range(10))], schema=flat))
 time.sleep(0.5)
@@ -2262,7 +2262,7 @@ def _():
             except (FileNotFoundError, ValueError):
                 return None
         s = sp.create_stream("v2test/tfiles", flat, store=root,
-                             memory=MemoryOptions(lookback=400),
+                             memory=MemoryOptions(rows=400),
                              parquet=ParquetOptions(checkpoint_seconds=0.05,
                                              row_group_rows=200))
         try:
@@ -2296,7 +2296,7 @@ def _():
     flat = pa.schema([F('n', pa.int64(), nullable=False)])
     with tempfile.TemporaryDirectory() as tmp:
         s = sp.create_stream("v2test/ringseam", flat, store=tmp,
-                             memory=MemoryOptions(lookback=400),
+                             memory=MemoryOptions(rows=400),
                              parquet=ParquetOptions(checkpoint_seconds=0.05,
                                              row_group_rows=200))
         try:
@@ -2335,7 +2335,7 @@ def _():
     flat = pa.schema([F('n', pa.int64(), nullable=False)])
     with tempfile.TemporaryDirectory() as tmp:
         s = sp.create_stream("v2test/ringgone", flat, store=tmp,
-                             memory=MemoryOptions(lookback=400),
+                             memory=MemoryOptions(rows=400),
                              parquet=ParquetOptions(checkpoint_seconds=0.05,
                                              row_group_rows=200))
         try:
@@ -2363,7 +2363,7 @@ def _():
                 except duckdb.Error as e:
                     assert ("the ring does not hold row 600; it begins "
                             "at row 750") in str(e), e
-                    assert "MemoryOptions(lookback" in str(e), e
+                    assert "MemoryOptions(rows" in str(e), e
             # the view follows again, and every row is there
 
             def counts():
@@ -2385,7 +2385,7 @@ def _():
     flat = pa.schema([F('n', pa.int64(), nullable=False)])
     with tempfile.TemporaryDirectory() as tmp:
         s = sp.create_stream("v2test/ringshort", flat, store=tmp,
-                             memory=MemoryOptions(lookback=400),
+                             memory=MemoryOptions(rows=400),
                              parquet=ParquetOptions(checkpoint_seconds=0.05,
                                              row_group_rows=200))
         try:
@@ -2413,7 +2413,7 @@ def _():
     _core.test_set_clock(1001.0, 5.0)
     said = look((200, 599, 400))
     assert "too short for the store's lag of 589 rows" in rules.ring_note, rules.ring_note
-    assert "MemoryOptions(lookback=786)" in rules.ring_note, rules.ring_note
+    assert "MemoryOptions(rows=786)" in rules.ring_note, rules.ring_note
     assert [lv for lv, _ in said] == [_core.LOG_WARNING] and \
         said[0][1] == f"[v2test/ringshort] view sp_x: {rules.ring_note}", said
     assert look((200, 599, 400)) == [], "said once"
@@ -2442,7 +2442,7 @@ def _():
         # run 2: two finished files, then rows in the unfinished file
         # and in memory; n = 1000 + the row number
         s = sp.create_stream("v2test/rid", flat, store=root,
-                             memory=MemoryOptions(lookback=500),
+                             memory=MemoryOptions(rows=500),
                              parquet=ParquetOptions(checkpoint_seconds=0.05))
         con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
         views = []
@@ -2459,7 +2459,7 @@ def _():
                     [pa.array(range(1020 + k * 5, 1025 + k * 5))], schema=flat))
                 time.sleep(0.2)
             a = sp.connect("v2test/rid", store=root,
-                           memory=MemoryOptions(lookback=500))
+                           memory=MemoryOptions(rows=500))
             wait_for(lambda: a.state == "streaming" and a.newest_row() is not None
                      and a.newest_row().n == 1034, what="the reader has every row")
 
@@ -2504,7 +2504,7 @@ def _():
             # a stream with a column of one of the two names is refused
             clash = pa.schema([("n", pa.int64()), ("sp_run_row_number", pa.int64())])
             c = sp.create_stream("v2test/ridclash", clash, store=root,
-                                 memory=MemoryOptions(lookback=100))
+                                 memory=MemoryOptions(rows=100))
             try:
                 for make in (c.duckdb_live, c.duckdb_all):
                     try:
@@ -2543,7 +2543,7 @@ def _():
     flat = pa.schema([("n", pa.int64())])
     with tempfile.TemporaryDirectory() as root:
         s = sp.create_stream("v2test/twice", flat, store=root,
-                             memory=MemoryOptions(lookback=500),
+                             memory=MemoryOptions(rows=500),
                              parquet=ParquetOptions(checkpoint_seconds=0.05))
         con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
         a = w = r = None
@@ -2553,7 +2553,7 @@ def _():
             cat = s._parquet.catalog
             wait_for(lambda: cat.files == 1, what="the first file listed")
             a = sp.connect("v2test/twice", store=root,
-                           memory=MemoryOptions(lookback=500))
+                           memory=MemoryOptions(rows=500))
             w = s.duckdb_all(con, name="tw_w")
             r = a.duckdb_archive(con, name="tw_r")
             # hold the moment after the catalog is published and before
@@ -2626,7 +2626,7 @@ def _():
     flat = pa.schema([F('n', pa.int64(), nullable=False)])
     with tempfile.TemporaryDirectory() as tmp:
         s = sp.create_stream("v2test/outlive", flat, store=tmp,
-                             memory=MemoryOptions(lookback=400),
+                             memory=MemoryOptions(rows=400),
                              parquet=ParquetOptions(checkpoint_seconds=0.05,
                                              row_group_rows=200))
         con = view_con()
@@ -2672,7 +2672,7 @@ def _():
     try:
         with tempfile.TemporaryDirectory() as tmp:
             s = sp.create_stream("v2test/bytecut", flat, store=tmp,
-                                 memory=MemoryOptions(lookback=400),
+                                 memory=MemoryOptions(rows=400),
                                  parquet=ParquetOptions(checkpoint_seconds=0.05,
                                                  row_group_rows=200))
             try:
@@ -2727,7 +2727,7 @@ def _():
     log.addHandler(h)
     propagate, log.propagate = log.propagate, False
     s = sp.create_stream("v2test/ringline", schema,
-                         memory=MemoryOptions(lookback=64, segment_bytes=256))
+                         memory=MemoryOptions(rows=64, segment_bytes=256))
     try:
         t0 = time.time()
         row = s.get_mutable_row()
@@ -2792,34 +2792,6 @@ def _():
         assert 'probe-info' in open(moved).read()
 
 
-@test("the old names suppress_console and set_verbosity still work, with "
-      "one warning each")
-def _():
-    import logging
-    from streaming_parquet import _deprecations
-    log = logging.getLogger("streaming_parquet")
-    level = log.level
-    try:
-        with _LogLines() as lines:
-            _deprecations._told.discard("suppress_console")
-            _deprecations._told.discard("set_verbosity")
-            sp.set_verbosity(1)
-            assert log.level == logging.DEBUG
-            sp.set_verbosity(0)
-            assert log.level == logging.INFO
-            sp.suppress_console(True)
-            assert log.propagate is False
-            log.warning("kept from the console")
-            sp.suppress_console(False)
-            assert log.propagate is True
-        said = [t for _l, t in lines if "old name" in t]
-        assert len(said) == 2 and "set_verbosity" in said[0] \
-            and "suppress_console" in said[1], said
-        assert any("kept from the console" in t for _l, t in lines)
-    finally:
-        log.setLevel(level)
-
-
 print("\n--- parquet on and off at any time ---")
 
 
@@ -2839,7 +2811,7 @@ def files_rows(folder):
 def _():
     with tempfile.TemporaryDirectory() as tmp:
         s = sp.create_stream("v2test/mark", SCHEMA, store=tmp,
-                             memory=MemoryOptions(lookback=500),
+                             memory=MemoryOptions(rows=500),
                              parquet=ParquetOptions())
         fill(s, 25)
         s.start_parquet("B")
@@ -2857,7 +2829,7 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as tmp:
         s = sp.create_stream("v2test/late", SCHEMA, store=tmp,
-                             memory=MemoryOptions(lookback=500))
+                             memory=MemoryOptions(rows=500))
         assert s.parquet_options is None
         assert s.archive_state().location is None
         fill(s, 25)
@@ -2879,7 +2851,7 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as tmp:
         s = sp.create_stream("v2test/opts", SCHEMA, store=tmp,
-                             memory=MemoryOptions(lookback=500),
+                             memory=MemoryOptions(rows=500),
                              parquet=ParquetOptions(checkpoint_seconds=7.0))
         fill(s, 10)
         snappy = ParquetOptions(compression={"compression": "snappy"})
@@ -2905,7 +2877,7 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as tmp:
         s = sp.create_stream("v2test/toobig", SCHEMA, store=tmp,
-                             memory=MemoryOptions(lookback=500))
+                             memory=MemoryOptions(rows=500))
         try:
             s.start_parquet(options=ParquetOptions(row_group_rows=400))
         except ValueError as e:
@@ -2919,7 +2891,7 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as tmp:
         s = sp.create_stream("v2test/quick", SCHEMA, store=tmp,
-                             memory=MemoryOptions(lookback=500))
+                             memory=MemoryOptions(rows=500))
         fill(s, 5)
         s.start_parquet("Q")
         fill(s, 5, start=5)
@@ -2935,7 +2907,7 @@ def _():
 @test("start_parquet with no store and no spool is refused at the call")
 def _():
     s = sp.create_stream("v2test/nowhere", SCHEMA, spool=None,
-                         memory=MemoryOptions(lookback=500))
+                         memory=MemoryOptions(rows=500))
     try:
         s.start_parquet()
     except ValueError as e:
@@ -2948,10 +2920,10 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as tmp:
         on = sp.create_stream("v2test/mod-on", SCHEMA, store=tmp,
-                              memory=MemoryOptions(lookback=500),
+                              memory=MemoryOptions(rows=500),
                               parquet=ParquetOptions())
         off = sp.create_stream("v2test/mod-off", SCHEMA, store=tmp,
-                               memory=MemoryOptions(lookback=500))
+                               memory=MemoryOptions(rows=500))
         sp.start_parquet("M")
         fill(on, 5)
         fill(off, 5)
@@ -2965,10 +2937,10 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as tmp:
         on = sp.create_stream("v2test/all-on", SCHEMA, store=tmp,
-                              memory=MemoryOptions(lookback=500),
+                              memory=MemoryOptions(rows=500),
                               parquet=ParquetOptions())
         off = sp.create_stream("v2test/all-off", SCHEMA, store=tmp,
-                               memory=MemoryOptions(lookback=500))
+                               memory=MemoryOptions(rows=500))
         given = ParquetOptions(checkpoint_seconds=3.0)
         sp.start_parquet("M", options=given)
         fill(on, 5)
@@ -2985,7 +2957,7 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as tmp:
         s = sp.create_stream("v2test/beat", SCHEMA, store=tmp,
-                             memory=MemoryOptions(lookback=500))
+                             memory=MemoryOptions(rows=500))
         wait_for(lambda: sp._tickets.get_ticket(tmp, "v2test/beat") is not None,
                  what="the first ticket")
         assert sp._tickets.get_ticket(tmp, "v2test/beat")["beat_seconds"] == 5.0
@@ -3002,7 +2974,7 @@ print("\n--- published or internal ---")
 def _():
     with tempfile.TemporaryDirectory() as tmp:
         s = sp.create_stream("v2test/int", SCHEMA, store=tmp, publish=False,
-                             memory=MemoryOptions(lookback=500))
+                             memory=MemoryOptions(rows=500))
         assert not s.published
         fill(s, 10)
         time.sleep(0.3)                  # a heartbeat or two
@@ -3014,7 +2986,7 @@ def _():
         # another process, even one that knows the host and port, does not
         direct = {"name": "v2test/int", "host": "127.0.0.1", "port": s._port,
                   "run": s._run}
-        b = sp.connect(ticket=direct, memory=MemoryOptions(lookback=500))
+        b = sp.connect(ticket=direct, memory=MemoryOptions(rows=500))
         time.sleep(1.0)
         assert b.state != "streaming", b.state
         b.close()
@@ -3024,14 +2996,14 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as tmp:
         s = sp.create_stream("v2test/pub", SCHEMA, store=tmp, publish=False,
-                             memory=MemoryOptions(lookback=500))
+                             memory=MemoryOptions(rows=500))
         fill(s, 10)
         s.publish()
         assert s.published
         wait_for(lambda: sp._tickets.get_ticket(tmp, "v2test/pub") is not None,
                  what="the ticket after publish()")
         b = sp.connect(ticket=sp._tickets.get_ticket(tmp, "v2test/pub"),
-                       memory=MemoryOptions(lookback=500))
+                       memory=MemoryOptions(rows=500))
         wait_for(lambda: b.state == "streaming",
                  what="a reader over Flight after publish()")
         fill(s, 5, start=10)
@@ -3052,7 +3024,7 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as tmp:
         s = sp.create_stream("v2test/intpq", SCHEMA, store=tmp, publish=False,
-                             memory=MemoryOptions(lookback=500))
+                             memory=MemoryOptions(rows=500))
         s.start_parquet("DBG", options=ParquetOptions(row_group_rows=50))
         fill(s, 120)
         con = view_con()
@@ -3087,7 +3059,7 @@ def _():
             assert proc.stdout.readline().strip() == "CREATED"
             # the same internal name here: no lock, so no refusal
             s = sp.create_stream("v2test/shared", SCHEMA, store=tmp, publish=False,
-                                 memory=MemoryOptions(lookback=500))
+                                 memory=MemoryOptions(rows=500))
             proc.stdin.write("\n"); proc.stdin.flush()
             assert proc.stdout.readline().strip() == "STARTED"
             for call in (s.start_parquet, s.publish):
@@ -3104,79 +3076,6 @@ def _():
             proc.wait()
 
 
-print("\n--- old names ---")
-
-@test("the old names Memory, Archive, parquet= and archive= still work")
-def _():
-    from streaming_parquet import _deprecations
-    _deprecations._told.clear()
-    old_memory = sp.Memory(lookback=500)
-    assert old_memory == MemoryOptions(lookback=500)
-    old_archive = sp.Archive(checkpoint_seconds=1, parquet={"compression": "snappy"})
-    assert old_archive == ParquetOptions(checkpoint_seconds=1,
-                                         compression={"compression": "snappy"})
-    with tempfile.TemporaryDirectory() as tmp:
-        s = sp.create_stream("v2test/oldnames", SCHEMA, store=tmp,
-                             memory=old_memory, archive=old_archive)
-        fill(s, 10)
-        s.close()
-        files = [f for _r, _d, fs in os.walk(tmp) for f in fs
-                 if f.endswith(".parquet")]
-        assert len(files) == 1, files
-    logging_names = {"suppress_console", "set_verbosity"}     # their own test
-    assert _deprecations._told - logging_names == \
-        set(_deprecations.OLD_NAMES) - logging_names, _deprecations._told
-
-
-@test("an old name warns once, with the new name and the day of removal")
-def _():
-    import logging
-    from streaming_parquet import _deprecations
-    got = []
-
-    class Keep(logging.Handler):
-        def emit(self, record):
-            got.append(record.getMessage())
-    handler = Keep()
-    log = logging.getLogger("streaming_parquet")
-    log.addHandler(handler)
-    try:
-        _deprecations._told.clear()
-        sp.Memory()
-        sp.Memory()
-    finally:
-        log.removeHandler(handler)
-    lines = [g for g in got if "old name" in g]
-    assert len(lines) == 1, lines
-    assert "Memory is an old name for MemoryOptions" in lines[0]
-    assert _deprecations.REMOVED_AFTER in lines[0]
-
-
-@test("archive= and parquet= together are refused")
-def _():
-    try:
-        sp.create_stream("v2test/both", SCHEMA, parquet=ParquetOptions(),
-                         archive=ParquetOptions())
-    except TypeError as e:
-        assert "old name of parquet" in str(e)
-    else:
-        raise AssertionError("both were accepted")
-
-
-@test("docs/deprecations.md and _deprecations.py list the same Python names")
-def _():
-    from streaming_parquet import _deprecations
-    repo = REPO
-    rows = {}
-    for line in open(os.path.join(repo, "docs", "deprecations.md")):
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cells) == 5 and cells[2] == "Python":
-            rows[cells[0].strip("`")] = (cells[1].strip("`"), cells[3], cells[4])
-    want = {old: (new, *_deprecations.days(old))
-            for old, new in _deprecations.OLD_NAMES.items()}
-    assert rows == want, (rows, want)
-
-
 print("\n--- the stream core, side by side ---")
 
 @test("the ticket in the store is the core's text, with every member")
@@ -3184,7 +3083,7 @@ def _():
     from streaming_parquet import _core
     with tempfile.TemporaryDirectory() as tmp:
         s = sp.create_stream("v2test/coretk", SCHEMA, store=tmp,
-                             memory=MemoryOptions(lookback=500),
+                             memory=MemoryOptions(rows=500),
                              parquet=ParquetOptions(checkpoint_seconds=0.1))
         fill(s, 10)
         path = os.path.join(tmp, "tickets", "v2test", "coretk.json")
@@ -3275,7 +3174,7 @@ def _():
                 # the folder rd/shop has a ticket: a wrong last part waits
                 a = sp.connect("rd/shop/two", store=tmp + "/")      # another store text: not the local path
                 assert a.state == "no-ticket", a.state
-                assert "no ticket for rd/shop/two" in a.standing()[0], a.standing()
+                assert "no ticket for rd/shop/two" in a.reason, a.reason
                 time.sleep(2.3)                                     # two more polls
                 said = [m for _lvl, m in lines if "rd/shop/two" in m]
                 assert len(said) == 1 and said[0].endswith("no writer is up: waiting for a writer"), said
@@ -3300,7 +3199,7 @@ def _():
         s.append(pa.record_batch([pa.array(range(10))], schema=flat))
         s.commit()
         wait_for(lambda: a.state == "streaming", what="the reader finds the local stream")
-        assert a.standing() == []
+        assert a.reason is None
         assert a.arrow_table().num_rows == 10
         cur = a.cursor()
         s.append(pa.record_batch([pa.array(range(10, 15))], schema=flat))

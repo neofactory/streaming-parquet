@@ -501,7 +501,7 @@ int main(void) {
         SpReader *r = t_reader_new("connect('a/b/c')", "a/b/c", "/data", 0);
         CHECK(r && strcmp(sp_reader_folder(r), "a/b") == 0);
         CHECK(sp_reader_state(r) == SP_R_NO_TICKET);
-        CHECK(strcmp(sp_reader_state_name(SP_R_ROOT_UNREACHABLE), "root-unreachable") == 0);
+        CHECK(strcmp(sp_reader_state_name(SP_R_STORE_UNREACHABLE), "store-unreachable") == 0);
         CHECK(sp_reader_state_name(99) == NULL && sp_reader_state_name(-1) == NULL);
 
         /* no ticket at the first poll: look for the folder; none: fail */
@@ -580,7 +580,7 @@ int main(void) {
         /* the store cannot be read: one error, then a line when it can */
         t_reader_lost(r, NULL, 600, &st);
         t_reader_poll(r, SP_FOUND_UNREADABLE, NULL, "timed out", T0, 600, 30, &st);
-        CHECK(st.action == SP_DO_WAIT && st.state == SP_R_ROOT_UNREACHABLE);
+        CHECK(st.action == SP_DO_WAIT && st.state == SP_R_STORE_UNREACHABLE);
         CHECK(t_reader_message(r, msg, sizeof msg) == REPORT_ERROR);
         CHECK(strcmp(msg, "[a/b/c] STORE UNREADABLE: /data: timed out") == 0);
         t_reader_poll(r, SP_FOUND_UNREADABLE, NULL, "timed out", T0, 601, 30, &st);
@@ -828,7 +828,7 @@ int main(void) {
         int64_t shortw[3] = {200, 599, 400}, good[3] = {0, 20, 400};
         t_view_plan(v, t, files, "r1", shortw, 1001, 108, 30, 600, &p);
         CHECK(!p.use_ring && strstr(sp_view_ring_note(v), "lag of 589 rows")
-              && strstr(sp_view_ring_note(v), "lookback=786"));
+              && strstr(sp_view_ring_note(v), "rows=786"));
         CHECK(t_view_message(v, msg, sizeof msg) == REPORT_WARNING
               && strstr(msg, "[a/b] view sp_x: the ring holds rows 200 to 599") == msg);
         t_view_plan(v, t, files, "r1", shortw, 1001, 109, 30, 600, &p);

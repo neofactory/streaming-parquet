@@ -87,7 +87,7 @@ func main() {
 	// standard error
 	logger := slog.New(slog.NewTextHandler(os.Stderr,
 		&slog.HandlerOptions{Level: slog.LevelInfo}))
-	tel, err := streaming.Init(streaming.Config{Root: os.Args[2], Logger: logger})
+	tel, err := streaming.Init(streaming.Config{Store: os.Args[2], Logger: logger})
 	if err != nil {
 		die(err)
 	}
@@ -98,7 +98,7 @@ func main() {
 		rows, _ := strconv.Atoi(os.Args[4])
 		hold, _ := strconv.ParseFloat(os.Args[5], 64)
 		s, err := tel.CreateStream(name, schemaRich(),
-			streaming.StreamOptions{RingRows: int64(rows) * 2})
+			streaming.StreamOptions{Memory: &streaming.MemoryOptions{Rows: int64(rows) * 2}})
 		if err != nil {
 			die(err)
 		}
@@ -146,7 +146,7 @@ func main() {
 		fmt.Println("served", rows)
 	case "attach-rich":
 		minRows, _ := strconv.Atoi(os.Args[4])
-		a, err := tel.Attach(name, streaming.AttachOptions{RingRows: 20000})
+		a, err := tel.Connect(name, streaming.ConnectOptions{Memory: &streaming.MemoryOptions{Rows: 20000}})
 		if err != nil {
 			die(err)
 		}
@@ -211,7 +211,7 @@ func main() {
 		rows, _ := strconv.Atoi(os.Args[4])
 		hold, _ := strconv.ParseFloat(os.Args[5], 64)
 		s, err := tel.CreateStream(name, schemaNX(),
-			streaming.StreamOptions{RingRows: int64(rows) * 2})
+			streaming.StreamOptions{Memory: &streaming.MemoryOptions{Rows: int64(rows) * 2}})
 		if err != nil {
 			die(err)
 		}
@@ -237,7 +237,7 @@ func main() {
 		fmt.Println("served", rows)
 	case "attach-nx":
 		minRows, _ := strconv.Atoi(os.Args[4])
-		a, err := tel.Attach(name, streaming.AttachOptions{})
+		a, err := tel.Connect(name, streaming.ConnectOptions{})
 		if err != nil {
 			die(err)
 		}
@@ -278,7 +278,7 @@ func main() {
 	case "serve":
 		rows, _ := strconv.Atoi(os.Args[4])
 		hold, _ := strconv.ParseFloat(os.Args[5], 64)
-		o := streaming.StreamOptions{RingRows: int64(rows) * 2}
+		o := streaming.StreamOptions{Memory: &streaming.MemoryOptions{Rows: int64(rows) * 2}}
 		if len(os.Args) > 6 && os.Args[6] == "pq" {
 			// files under the root, where a reader of the root finds them
 			o.Parquet = &streaming.ParquetOptions{BaseDir: os.Args[2],
@@ -321,7 +321,7 @@ func main() {
 			parquet = &streaming.ParquetOptions{BaseDir: pqdir,
 				RowGroupRows: 500, CheckpointSeconds: 0.1}
 		}
-		a, err := tel.Attach(name, streaming.AttachOptions{Parquet: parquet})
+		a, err := tel.Connect(name, streaming.ConnectOptions{Parquet: parquet})
 		if err != nil {
 			die(err)
 		}

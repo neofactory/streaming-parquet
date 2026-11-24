@@ -90,7 +90,21 @@ func (s *Stream) own() error {
 	return nil
 }
 
+// MemoryOptions says how much a stream, or a reader, keeps in memory.
+type MemoryOptions struct {
+	Rows int64 // rows kept in memory; 0 = the default, two row groups
+}
+
+func (m *MemoryOptions) rows() int64 {
+	if m == nil {
+		return 0
+	}
+	return m.Rows
+}
+
 // StreamOptions are given once, at CreateStream.
+//
+// Memory says how many rows the stream keeps in memory.
 //
 // Parquet says how the stream's rows are written to parquet, and with
 // its BaseDir or Sink where. With it, the stream writes files from its
@@ -99,7 +113,7 @@ func (s *Stream) own() error {
 // Internal makes a stream that other processes cannot find or read: no
 // ticket, not served. Publish and Unpublish change it later.
 type StreamOptions struct {
-	RingRows int64 // ring rows; see ringSizes for the default
+	Memory   *MemoryOptions // nil = the default: two row groups
 	Parquet  *ParquetOptions
 	Internal bool
 }
@@ -110,7 +124,7 @@ func (t *Telemetry) CreateStream(name string, schema *arrow.Schema,
 	if o.Parquet != nil {
 		givenGroupRows = o.Parquet.RowGroupRows
 	}
-	ringRows, _, err := ringSizes(name, o.RingRows, givenGroupRows)
+	ringRows, _, err := ringSizes(name, o.Memory.rows(), givenGroupRows)
 	if err != nil {
 		return nil, err
 	}
@@ -383,8 +397,8 @@ func (s *Stream) Publish() error {
 		s.hbDone.Add(1)
 		go s.heartbeat(s.stopHB)
 	} else {
-		s.tel.log.Info(fmt.Sprintf("[%s] no discovery root configured "+
-			"(Config.Root / $STREAMING_PARQUET_ROOT) — no ticket; "+
+		s.tel.log.Info(fmt.Sprintf("[%s] no store configured "+
+			"(Config.Store / $STREAMING_PARQUET_STORE) — no ticket; "+
 			"the stream is local + direct-ticket only", s.Name))
 	}
 	return nil

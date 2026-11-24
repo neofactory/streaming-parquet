@@ -124,7 +124,7 @@ def _():
 @test("Python publisher -> Go attach + Go archives parquet while attached")
 def _():
     with tempfile.TemporaryDirectory() as tmp:
-        s = sp.create_stream('x/pypub', SCHEMA, store=ROOT, memory=sp.MemoryOptions(lookback=8000))
+        s = sp.create_stream('x/pypub', SCHEMA, store=ROOT, memory=sp.MemoryOptions(rows=8000))
         child = subprocess.Popen(
             [BIN, 'attach', ROOT, 'x/pypub', '2500', tmp, 'XLNG'],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -212,7 +212,7 @@ def _():
 @test("type matrix Python -> Go: the same values verified by Go getters")
 def _():
     s = sp.create_stream('x/rich-py', RICH, store=ROOT,
-                                memory=sp.MemoryOptions(lookback=20000))
+                                memory=sp.MemoryOptions(rows=20000))
     child = subprocess.Popen(
         [BIN, 'attach-rich', ROOT, 'x/rich-py', '1200'],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -400,7 +400,7 @@ def _():
         a.close()
     # a Python writer takes the stream over: its file joins the Go catalog
     s = sp.create_stream('x/gocat', SCHEMA, store=ROOT,
-                         memory=sp.MemoryOptions(lookback=500),
+                         memory=sp.MemoryOptions(rows=500),
                          parquet=sp.ParquetOptions(checkpoint_seconds=0.05))
     try:
         s.append(pa.record_batch([pa.array([3000, 3001]), pa.array([0.5, 1.5]),

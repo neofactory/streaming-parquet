@@ -2,15 +2,15 @@
 // telemetry streaming and parquet archival in one system, composing
 // arrow-ring (the hot tier) and parquet-checkpoint (the durable
 // format). Wire-compatible with the Python module: JSON tickets at
-// <root>/tickets/<name>.json, Arrow Flight for batches.
+// <store>/tickets/<name>.json, Arrow Flight for batches.
 //
 // TWO VERBS, one machinery, no server role:
 //
-//	tel, _ := streaming.Init(streaming.Config{Root: "/data/streams"})
+//	tel, _ := streaming.Init(streaming.Config{Store: "/data/streams"})
 //	s, _ := tel.CreateStream("press/fieldbus", schema, opts)
 //	    // write via s.Ring(): RowBegin / Set* / Commit / wire maps
 //	    // s.Commit() after your rows; s.StartParquet("O0019", nil)
-//	a, _ := tel.Attach("probe/voltages", streaming.AttachOptions{})
+//	a, _ := tel.Connect("probe/voltages", streaming.ConnectOptions{})
 //	    // read via a.Ring(): getters, relations
 //	    // a.StartParquet("cal-run")  <- archival is symmetric: any
 //	    //                               ring can archive
@@ -28,11 +28,11 @@ import (
 )
 
 type Config struct {
-	Root string // discovery root: a directory, file:// or s3:// URI where
-	//             tickets live at <root>/tickets/<name>.json.
-	//             "" = $STREAMING_PARQUET_ROOT; still "" = no
-	//             discovery (attach needs explicit Tickets, ticket
-	//             publishing is disabled — loudly).
+	Store string // the store: a directory, file:// or s3:// URI. The
+	//              tickets are at <store>/tickets/<name>.json.
+	//              "" = $STREAMING_PARQUET_STORE; still "" = no store
+	//              (a reader needs an explicit Ticket, and a stream
+	//              writes no ticket and says so).
 	FlightAddr string // the Flight listen address, e.g. ":8815" for a
 	//                   process found by DNS; "" = any free port, which
 	//                   the ticket announces.
@@ -65,9 +65,9 @@ func Init(cfg Config) (*Telemetry, error) {
 		t.log = slog.New(slog.NewTextHandler(os.Stderr,
 			&slog.HandlerOptions{Level: slog.LevelWarn}))
 	}
-	root := cfg.Root
+	root := cfg.Store
 	if root == "" {
-		root = os.Getenv("STREAMING_PARQUET_ROOT")
+		root = os.Getenv("STREAMING_PARQUET_STORE")
 	}
 	if root != "" {
 		store, err := newTicketStore(root)

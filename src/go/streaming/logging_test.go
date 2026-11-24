@@ -35,7 +35,7 @@ func TestLoggerOfTheConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tel.Close()
-	s, err := tel.CreateStream("t/log", testSchema(), StreamOptions{RingRows: 400,
+	s, err := tel.CreateStream("t/log", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400},
 		Parquet: &ParquetOptions{BaseDir: t.TempDir()}})
 	if err != nil {
 		t.Fatal(err)
@@ -49,7 +49,7 @@ func TestLoggerOfTheConfig(t *testing.T) {
 	got := out.String()
 	for _, want := range []string{
 		"level=INFO", "[t/log] catalog: listed 1 file(s), 1 in all",
-		"[t/log] no discovery root configured",
+		"[t/log] no store configured",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("the logger did not get %q:\n%s", want, got)

@@ -83,7 +83,7 @@ func newTicketStore(root string) (ticketStore, error) {
 	}
 	if strings.Contains(root, "://") {
 		return nil, fmt.Errorf("ticket root %q: scheme not implemented "+
-			"(file://, s3:// and bare paths; use AttachOptions."+
+			"(file://, s3:// and bare paths; use ConnectOptions."+
 			"Ticket for direct dialing)", root)
 	}
 	return &fileStore{base: filepath.Join(root, "tickets")}, nil
