@@ -1,97 +1,242 @@
 # streaming-parquet
 
-Live telemetry streaming and parquet archival in one system: every
-committed row is queryable from the moment it is written until the
-end of the archive, through one SQL view.
+**Stream-first Parquet: write rows as they arrive, read them while the file is still open—no brokers, no ETL.**
 
-    a = telemetry.attach("plant/voltages")
-    view = a.duckdb_all(con)                 # register once
-    con.sql(f"SELECT ... FROM {view.name}")   # every query current
+```python
+a = sp.connect("plant/voltages", store="s3://my-bucket")
+view = a.duckdb_all(con)                  # register once
+con.sql(f"SELECT ... FROM {view.name}")   # archive + open file + live memory
+```
 
-Three packages, one contract, two languages (Python and Go over
-shared C cores):
+Write live streams directly into big, query-ready Parquet row groups while local and remote readers access new rows in milliseconds. Query memory and archive together as one table. No more trade-offs between row group size, latency, and crash loss:
 
-| package | role | docs |
+- **Big row groups** — standard `.parquet` files on disk or S3, fast to query with any tool
+- **Millisecond live access, anywhere** — read zero-copy in-process or stream immediately to other processes and machines
+- **Small data-loss window** — crash-durable in seconds while files are still open
+- **One query** — query the coldest archive right up to the latest committed row in one DuckDB view
+
+## How it works
+
+- **Parquet checkpointing (`parquet_checkpoint`):** Periodically write a small checkpoint footer alongside the in-progress Parquet file. Read them together before the file is complete, or recover into a standard Parquet file.
+- **Arrow ring buffer (`arrow_ring`):** Write into a zero-copy, recycling column-major buffer in memory. Committed rows are immutable while pinned.
+- **Arrow Flight streaming:** Pull live batches into a local ring from any remote reader, using the store for discovery with no broker.
+- **DuckDB integration:** Query live data plus the archive in one SQL view. Each query sees the latest data when it starts. During queries, DuckDB pins ring spans for under a millisecond.
+
+`streaming_parquet` ties these pieces together over shared C cores with thin bindings in Python and Go, plus a DuckDB extension. `arrow_ring` and `parquet_checkpoint` also stand on their own.
+
+## Quick look
+
+```python
+import pyarrow as pa
+import duckdb
+import streaming_parquet as sp
+
+STORE = "/data/streams"  # or "s3://my-bucket"
+
+schema = pa.schema([
+    pa.field("tv", pa.float64(), nullable=False),
+    pa.field("volts", pa.float32(), nullable=False),
+])
+
+# Writer (any process)
+s = sp.create_stream(
+    "plant/voltages",
+    schema,
+    store=STORE,
+    parquet=sp.ParquetOptions(checkpoint_seconds=15),
+)
+row = s.get_mutable_row()
+row.tv, row.volts = 1732200000.0, 24.1
+s.commit()
+
+# Reader (same process, another process, or another machine)
+a = sp.connect("plant/voltages", store=STORE)
+latest = a.newest_row()                                      # millisecond live read
+
+con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+view = a.duckdb_all(con)                                     # register once
+con.sql(f"SELECT avg(volts) FROM {view.name}").fetchall()    # archive + open file + memory
+```
+
+## Architecture at a glance
+
+```text
+  Writer ──► arrow_ring (hot memory) ──► Arrow Flight (pull) ──► Remote readers
+                  │
+                  ▼ (async, off the write thread)
+        parquet_checkpoint (open file: immutable chunks + versioned .ckpt footer)
+                  │
+                  ▼ (assembled once on cut, close, or recovery)
+         standard .parquet + DuckLake catalog ◄── DuckDB (duckdb_all view)
+```
+
+Everything durable lives under one store—either a local directory or a whole S3 bucket:
+
+```text
+<store>/
+  tickets/<name>.json                  # publisher discovery + current state
+  streams/<name>/<stamp>.parquet       # finished standard Parquet files
+  streams/<name>/<stamp>.<v>.ckpt      # versioned checkpoints (open files)
+  streams/<name>/<stamp>.chunks/       # immutable pieces of open files
+  streams/<name>/catalog.sqlite        # per-stream catalog of finished files
+```
+
+With an S3 store, writes land on a local write-behind **spool** first and mirror asynchronously to S3—so writers keep running through WAN outages and catch up automatically.
+
+## Glossary
+
+### Concepts
+
+| Term | Meaning |
+|---|---|
+| **Stream** | A named, Arrow-schema sequence of rows with one writer and any number of readers. |
+| **Store** | A local directory or whole S3 bucket holding tickets, open checkpoints, finished `.parquet` files, and catalogs. No broker needed. |
+| **Spool** | Local write-behind directory used with an S3 store to absorb network outages without blocking writes. |
+| **Ticket** | Small JSON file in `<store>/tickets/<name>.json` advertising the live writer, its Flight endpoint, open checkpoints, and catalog version. |
+| **Published / internal** | A published stream has a ticket and is served over Flight, so other processes find and read it. An internal stream has neither: only its own process reads it. |
+| **Run** | One life of a stream's writer, named by its start time. A row is identified by its run and its row number in that run. |
+| **Ring** | Fixed-size, recycling column-major buffer (`arrow_ring`) holding recent rows in memory for zero-copy Arrow reads. |
+| **Span / Pin** | A contiguous range of committed rows in the ring. Readers pin a span to keep those rows immutable until released. |
+| **Checkpoint** | Immutable, versioned footer (`.ckpt`) indexing the stored pieces of an in-progress file. Costs only the new rows since the previous checkpoint. |
+| **Assembly** | Combining an in-progress file's chunks and checkpoint footer into a standard `.parquet` file (server-side multipart copy on S3). Closing and crash recovery use the same step. |
+| **Cut** | End the open file at the last committed row; the next row begins a new file. No row is skipped or written twice. |
+| **Seam** | The exact row boundary where `duckdb_all` switches from stored files to live memory—no gaps, no duplicates. |
+| **Catalog** | Per-stream DuckLake catalog in a SQLite file (`catalog.sqlite`) indexing finished `.parquet` files with min/max stats for file skipping. |
+
+### Methods
+
+These are the Python names. Go has the same concepts: see [Python and Go: the same shape](#python-and-go-the-same-shape).
+
+**Module**
+- `create_stream(name, schema, store, spool, memory, parquet, publish)` — create and own a stream (one writer per stream). `parquet=None` writes no files until a `start_parquet`; `publish=False` makes an internal stream.
+- `connect(name, store, memory, columns)` — attach to a stream for reading (zero-copy in-process; Arrow Flight over the network). A reader that starts before its writer waits for it; a path whose folder does not exist is an error at once.
+- `list_streams(store)` — list stream names with a ticket in the store.
+- `create_playback_stream(name, parquet_path, ...)` — replay a recorded `.parquet` file as a live stream.
+- `cut(label)` / `start_parquet(label, options)` / `stop_parquet()` — roll, start, or pause archival across all local streams.
+- `log_to_file(path)` — write the library's log lines to a file (see [Logging](#logging)).
+- `close()` — flush, finish open files, and shut down Flight cleanly.
+
+**Options**
+- `MemoryOptions(lookback, maximum, segment_bytes)` — how many rows the ring holds. Default: two row groups.
+- `ParquetOptions(checkpoint_seconds, row_group_rows, row_group_seconds, ship_seconds, compression, catalog_copy_seconds)` — how the files are written. Where they go is the store and the spool.
+
+**Writing (`Stream`)**
+- `get_mutable_row(block_s)` / `commit()` — fill one row directly in ring memory and publish it; slow work (Flight, archival, S3) runs asynchronously.
+- `append(rows)` — bulk-ingest a PyArrow `RecordBatch`, `Table`, or `dict`.
+- `wire_map(entries)` / `from_wire(wmap, frame)` — scatter packed binary frames directly into ring columns in one C call.
+- `cut(label)` / `start_parquet(label, options)` / `stop_parquet()` — roll to a new file (with optional filename label), or toggle archival while keeping the stream live. `start_parquet` is a mark in the stream: the new file holds the rows committed after it.
+- `publish()` / `unpublish()` — make the stream published or internal while it runs.
+
+**Reading (`Stream` and connected readers)**
+- `newest_row()` — read the latest committed row in memory.
+- `cursor(since, columns)` — iterate unseen rows (or grab them as an Arrow table with `cursor.arrow_table()`).
+- `arrow_table(columns, rows, since)` — zero-copy PyArrow `Table` over memory.
+- `duckdb_live(con)` — live DuckDB view over memory only.
+- `duckdb_archive(con)` — live DuckDB view over finished and in-progress stored files.
+- `duckdb_all(con)` — unified DuckDB view across finished archive, open checkpoints, and live memory.
+- `row_ids=True` on any of the three views adds two columns that identify a row for good: `sp_run_start_time` and `sp_run_row_number`.
+
+**Health & status**
+- `archive_state()` / `mirror_state()` / `memory_state()` — check durability errors, S3 mirror backlog, and ring utilization.
+- `standing()` / `is_connected()` — check a reader's connection state in plain words.
+
+Names that changed keep their old form for three months: [docs/deprecations.md](docs/deprecations.md).
+
+## Python and Go: the same shape
+
+The rule: the two languages have the same concepts, the same words and the same defaults. Only the customs of each language differ (`snake_case` and keyword arguments in Python; `CamelCase`, option structs and returned errors in Go). The rules themselves are written once, in the C cores, so the two cannot decide differently.
+
+| Concept | Python (`import streaming_parquet as sp`) | Go (`.../src/go/streaming`) |
 |---|---|---|
-| [`arrow_ring`](arrow_ring/README.md) | the hot tier: a recycling builder over ring storage, zero-copy Arrow out | its README is the contract |
-| [`parquet_checkpoint`](parquet_checkpoint/README.md) | the durable format: crash-durable, queryable-while-open parquet (immutable objects + a checkpoint; a checkpoint costs what its new rows cost), local and S3 | includes the errata list |
-| [`streaming_parquet`](streaming_parquet/README.md) | the composition: create/attach streams, Flight fan-out, archival, the timeline relations | the system README |
+| The process's context | the module `sp` | `tel, err := streaming.Init(streaming.Config{...})` |
+| The store | `store=` on each call, else `$STREAMING_PARQUET_STORE` | `Config.Root`, else `$STREAMING_PARQUET_ROOT` |
+| Create a stream | `sp.create_stream(name, schema, ...)` | `tel.CreateStream(name, schema, StreamOptions{...})` |
+| Rows kept in memory | `memory=sp.MemoryOptions(lookback=rows)` | `StreamOptions.RingRows` |
+| Parquet options | `parquet=sp.ParquetOptions(...)`; `None` = no files | `StreamOptions.Parquet *ParquetOptions`; `nil` = no files |
+| Where the files go | the store, through the spool for S3 | `ParquetOptions.BaseDir` or `ParquetOptions.Sink` |
+| Published or internal | `publish=True`; `s.publish()`, `s.unpublish()` | `StreamOptions.Internal`; `s.Publish()`, `s.Unpublish()`, `s.Published()` |
+| Write a row | `row = s.get_mutable_row()`; `row.x = 1.0`; `s.commit()` | `s.Ring().RowBegin(block)`; `s.Ring().SetF64(leaf, 1.0)`; `s.Commit()` |
+| Write many rows | `s.append(table)` | `s.Ring().AppendRecord(rec)`; `s.Commit()` |
+| Packed binary frames | `s.wire_map(entries)`; `s.from_wire(m, frame)` | `s.Ring().NewWireMap(entries)`; `s.Ring().FromWire(m, frame)` |
+| End the file, begin the next | `s.cut(label)` | `s.Cut()`; `s.CutLabel(label)` |
+| Parquet on and off | `s.start_parquet(label, options)`; `s.stop_parquet()` | `s.StartParquet(label, options)`; `s.StopParquet()` |
+| The standing of the files | `s.archive_state()`; `s.mirror_state()` | `s.ArchiveState()`; `s.Durable()` |
+| Read a stream | `a = sp.connect(name, store=...)` | `a, err := tel.Attach(name, AttachOptions{...})` |
+| A reader's rows | `a.newest_row()`; `a.cursor()`; `a.arrow_table()` | `a.Ring()`: getters, `Pin(lo, hi)` record sets |
+| A reader's standing | `a.state`; `a.standing()`; `a.is_connected()` | `a.State()`; `a.Reason()` |
+| DuckDB views | `duckdb_live`, `duckdb_archive`, `duckdb_all` | none: a Go program queries the store with DuckDB directly |
+| List the streams | `sp.list_streams(store)` | `tel.ListStreams()` |
+| Log lines | logger `streaming_parquet`; `sp.log_to_file(path)` | `Config.Logger *slog.Logger` |
+| Close | `s.close()`; `sp.close()` | `s.Close()`; `tel.Close()` |
 
-Each package stands alone: use the ring without parquet, or the
-checkpoint writer without streaming. `streaming_parquet` composes
-them.
+The same in both, because one C core decides it:
+
+- **The ticket**: its members, its text, and the rule that calls a writer dead.
+- **One writer per stream**: the writer lock and the message that names its holder.
+- **When a write is due**: row groups by rows or by seconds, checkpoints by seconds.
+- **What the store holds**: which files are unfinished, which checkpoints are kept and for how long.
+- **A reader's rules**: wait for a writer, refuse a path whose folder does not exist, say why it is not streaming.
+- **The catalog**: `catalog.sqlite`, written by the same C code from either language.
+- **Defaults**: a row group of 122,880 rows, a ring of two row groups, zstd level 9, a file cut at 256 MB.
+- **File formats**: a Python reader reads a Go writer's stream and the reverse; the test suite runs each against the other.
+
+Not yet the same (each of these is a difference in words or in reach, not in the stored data):
+
+- **The word for the store**: Go still says `Root` and `$STREAMING_PARQUET_ROOT`.
+- **Memory size**: Go has `RingRows` and no `MemoryOptions`.
+- **Published**: Go's option is `Internal` (the reverse sense of `publish`).
+- **The ring**: a Go program writes and reads through `Ring()`; Python hides the ring.
+- **Where files go**: Go names a `BaseDir` or a `Sink` in the Parquet options and has no spool, no `ship_seconds` and no mirror state.
+- **Views**: Go has none.
+- **A reader that writes files**: Go's `Attached` can (`AttachOptions.Parquet`); Python's cannot.
+- **State of memory**: Go has no `memory_state`.
+
+## The C cores
+
+Three cores in C11 hold the rules, and each header is its specification:
+
+| Core | Header | What it decides |
+|---|---|---|
+| The ring | `src/core/arrow_ring.h` | Rows in memory: slots, commits, pins, record sets as Arrow. |
+| The checkpoint format | `src/core/pqc.h` | The bytes of a checkpoint and of the objects of an open file. |
+| The stream's rules | `src/core/sp.h` | The ticket, ownership, when a write is due, what the store holds, a reader's and a view's rules, the catalog. |
+
+A core does no input and no output, calls no function of its host, and never waits. A call returns a status; the reason for a failure and the lines for the host's log come back in a `Report` the caller passed ([`src/core/report.h`](src/core/report.h)). The host (Python, Go, the DuckDB extension) does the files, the network, the waiting and the logging. A test reads the three headers and holds them to this rule (`tests/core/run_header_tests.py`).
+
+## Logging
+
+The library logs the way each language does, and never prints by itself.
+
+- **Python**: the standard `logging` module, loggers `streaming_parquet`, `parquet_checkpoint` and `arrow_ring`. No handler and no file by default. `sp.log_to_file(path)` writes INFO and above to a file; `$STREAMING_PARQUET_DIAG_LOG` does the same at import.
+- **Go**: `Config.Logger`, a `*slog.Logger`. With none, warnings and errors go to standard error.
+- **The C cores**: no output. Their lines reach the host's log through the `Report`, each with the time the core made it. A line made on a writer's thread is logged by another thread.
 
 ## Install
 
-Python 3.11+. One distribution, `streaming-parquet`, holds all three
-packages; it depends on pyarrow and cffi. Extras: `duckdb` (the
-timeline relations) and `s3` (boto3: `S3Sink`, `s3://` stores). A uv
-project depends on a checkout like this:
+Python 3.11+. One distribution, `streaming-parquet`, holds the three packages; it depends on pyarrow and cffi. Extras: `duckdb` (the views) and `s3` (boto3: `S3Sink`, `s3://` stores). A uv project depends on a checkout like this:
 
-    dependencies = ["streaming-parquet[duckdb]"]
+```toml
+dependencies = ["streaming-parquet[duckdb]"]
 
-    [tool.uv.sources]
-    streaming-parquet = { path = "../streaming-parquet", editable = true }
+[tool.uv.sources]
+streaming-parquet = { path = "../streaming-parquet", editable = true }
+```
 
-The three packages load their C cores as libraries. `pip install`
-builds them (`setup.py`: `make` and the system C compiler; the stream
-core also needs the SQLite library and header, on Ubuntu
-`libsqlite3-dev`). In a checkout or an editable install each package
-builds its library from `src/core/` into its own directory the first
-time it is imported, so that directory must be writable.
+The packages load the C cores as libraries. `pip install` builds them with `make` and the system C compiler. The stream core also needs the SQLite library and header (on Ubuntu, `libsqlite3-dev`). In a checkout or an editable install, each package builds its library from `src/core/` into its own directory the first time it is imported, so that directory must be writable.
+
+Go: module `github.com/neofactory/streaming-parquet/src/go`, packages `ring`, `pqc` and `streaming`, built with cgo over checked-in copies of the same cores.
 
 ## Layout
 
-- `src/core/` — the three C cores (C11; each header is the spec): the
-  ring (`arrow_ring`), the checkpoint format (`pqc`) and the stream's
-  rules (`sp`), with their C tests and one Makefile
-- `src/python/` — the Python packages `arrow_ring`,
-  `parquet_checkpoint` and `streaming_parquet`
-- `src/go/` — the Go module, packages `ring`, `pqc` and `streaming`
-  (cgo over checked-in copies of the same cores: `src/go/sync_core.py`)
-- `src/duckdb/` — the DuckDB extension that reads unfinished files
-- `tests/` — the Python test scripts: unit, stress, and each language
-  against the other
-- `docs/` — documents that cross the packages:
-  [what a checkpoint costs](docs/checkpoint-cost.md),
-  [old names and when they stop](docs/deprecations.md)
+- `src/core/` — the three C cores, `report.h`, their C tests and one Makefile
+- `src/python/` — the Python packages, each with its own README: [`arrow_ring`](src/python/arrow_ring/README.md), [`parquet_checkpoint`](src/python/parquet_checkpoint/README.md), [`streaming_parquet`](src/python/streaming_parquet/README.md)
+- `src/go/` — the Go module (`src/go/sync_core.py` copies the cores into it)
+- `src/duckdb/` — the [DuckDB extension](src/duckdb/README.md) that reads unfinished files
+- `tests/` — the Python test scripts: unit, stress, and each language against the other
+- `docs/` — [what a checkpoint costs](docs/checkpoint-cost.md), [failure modes](docs/failure-modes.md), [old names and when they stop](docs/deprecations.md)
 
-## Open question: native implementations
+## Status & License
 
-What exists today, top layer to bottom:
+Active development (pre-1.0). The rules are in the shared C cores, and Python and Go bind them. See [docs/checkpoint-cost.md](docs/checkpoint-cost.md) for measured checkpoint write amplification across row rates.
 
-| language | streaming layer | ring + checkpoint cores |
-|---|---|---|
-| Python | native (the reference implementation) | binds the C cores (CFFI) |
-| Go | native | binds the C cores (cgo) |
-| C | — | the canonical cores (C11, libc-only; headers are the spec) |
-
-The open question is native implementations beyond these — **Rust,
-Java, C#, and a cgo-free native-Go core** — because the ecosystem
-precedent (arrow-rs, parquet-java, Parquet.NET) is that data-plane
-libraries get built natively per language, and we would rather those
-implementations live in this repo, validated by the same parity and
-stress suites, than appear beside it. The spec (the C headers, the
-PQC2 format doc, the errata list) plus the cross-implementation test
-harness exist precisely so a port can be written and PROVEN
-equivalent.
-
-Deliberately not yet: ports should target a mature contract, not a
-moving one. They start making sense after the library has more
-mileage — hardened tests, the bucket-based stream sharing, the
-example streams — so that a new implementation validates against
-settled behavior. If one of these is your itch, open an issue; the
-harness is ready even though the invitation is early.
-
-## Status
-
-Working system under active development; APIs documented in each
-package README. Suites: unit + crash gauntlets + C/Python byte
-parity + Go/Python wire compatibility. A cross-stack chaos rig, kept
-outside this repo, has verified 650M-row runs exact.
-
-## License
-
-Apache License 2.0 ([LICENSE](LICENSE)). The build scaffolding in
-`src/duckdb/` comes from DuckDB's extension template, under its
-MIT license ([src/duckdb/LICENSE](src/duckdb/LICENSE)).
+Apache License 2.0 ([LICENSE](LICENSE)). The build scaffolding in `src/duckdb/` comes from DuckDB's extension template, under its MIT license ([src/duckdb/LICENSE](src/duckdb/LICENSE)).
