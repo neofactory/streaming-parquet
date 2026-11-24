@@ -689,8 +689,9 @@ row.SetF64(x, 1.0)
 s.Commit()                      // readers see the rows at once; the
                                 // stream's goroutine writes the files
 // s.Append(record) writes the rows of an Arrow record batch and commits.
-// A write fault shows in s.ArchiveState(); s.Durable() is the first row
-// not yet in a file; s.MemoryState() is what memory holds.
+// A write fault shows in s.ArchiveState(); s.DurableRowNumber() is the
+// newest row safe in a file, to compare with s.NewestRowNumber() noted
+// after a commit; s.MemoryState() is what memory holds.
 // s.StartParquet("job-19", nil) is a mark: a new file from this row on.
 // Give options there to replace the stream's, or to start files on a
 // stream created with none.

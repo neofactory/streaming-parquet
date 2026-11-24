@@ -44,7 +44,7 @@ type Stream struct {
 	errText  string
 	file     string       // the file open right now, "" when none is
 	location atomic.Value // string: where the files land, "" before any
-	durable  atomic.Int64 // first seq not yet in a file or a checkpoint
+	durable  atomic.Int64 // the newest row in a file or a checkpoint; -1 for none
 
 	wake     chan struct{} // a commit: the work goroutine has rows to look at
 	stopWork chan struct{}
@@ -159,6 +159,7 @@ func (t *process) CreateStream(name string, schema *arrow.Schema,
 		store: newStoreState(pqc.SupersededKeep), ticketNow: make(chan struct{}, 1),
 		stopWork: make(chan struct{})}
 	s.location.Store("")
+	s.durable.Store(-1)
 	// Own the stream before anything of it is written: one writer per
 	// stream. An internal stream with no files takes no lock.
 	if !o.Internal || o.Parquet != nil {
@@ -329,7 +330,9 @@ func (s *Stream) write() {
 // wrote records the outcome of a write. Caller holds io and mu.
 func (s *Stream) wrote(err error) {
 	if s.arch != nil {
-		s.durable.Store(s.arch.durable)
+		if s.arch.storedRow > s.durable.Load() {
+			s.durable.Store(s.arch.storedRow)
+		}
 		s.file = s.arch.fileName
 	}
 	if err != nil {
@@ -653,15 +656,21 @@ func (s *Stream) StopParquet() error {
 	return err
 }
 
-// Durable answers the first seq not yet in the archive: every row below
-// it is in a written chunk or the checkpoint. A producer that must
-// acknowledge its input only once it is durable — a queue consumer —
-// compares the row's seq against this. It moves when the stream's
-// goroutine has written, a moment after the commit; a write fault shows
-// in ArchiveState. Meaningful while recording; equal to the recording's
-// first seq before anything landed, and 0 on a stream that never wrote
-// a file.
-func (s *Stream) Durable() int64 { return s.durable.Load() }
+// DurableRowNumber answers the number of the newest row that is in a
+// written piece of a file or in a checkpoint, and -1 when no row is
+// there yet. A program that must acknowledge its input only when the
+// row is safe (a queue consumer) notes NewestRowNumber after its
+// commit, and waits until this number reaches it. The number moves
+// when the stream's goroutine has written, a moment after the commit;
+// a write fault shows in ArchiveState. A row committed while parquet
+// was off is in no file: the number passes it when a later row is
+// written.
+func (s *Stream) DurableRowNumber() int64 { return s.durable.Load() }
+
+// NewestRowNumber answers the number of the newest committed row, and
+// -1 when there is none: after a Commit, the number of the last row
+// that commit held.
+func (s *Stream) NewestRowNumber() int64 { return s.ring.NewestSeq() }
 
 func (s *Stream) isClosed() bool {
 	s.pubMu.Lock()

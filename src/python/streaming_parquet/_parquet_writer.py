@@ -147,6 +147,10 @@ class ParquetWriter:
                                         # runs on the first mirror pass
         self._writer = None
         self._file_path = None
+        self._file_first_row = None   # the stream row number of the open file's first row
+        #: the newest stream row in a written piece or a checkpoint of the
+        #: first copy; -1 for none (Stream.get_durable_row_number)
+        self.durable_row = -1
         self._file_opened_at = None
         self._file_opened_tw = None     # TW epoch s of the current file's open
         self._next_label = None         # filename suffix for next _open()
@@ -261,6 +265,7 @@ class ParquetWriter:
             n += 1                       # same-second reopen: bump, loudly
             name = f"{base}-{n}.parquet"
         self._file_path = self._where(name)
+        self._file_first_row = None if first_seq is None else int(first_seq)
         md = dict(self._schema.metadata or {})
         md[b'sp_run'] = self._run.encode()
         if first_seq is not None:
@@ -353,6 +358,10 @@ class ParquetWriter:
         """Record what the writer's newest checkpoint version covers:
         the rows of its finished row groups, and its rows."""
         w = self._writer
+        if self._file_first_row is not None and w.rows_checkpointed > 0:
+            self.durable_row = max(
+                self.durable_row,
+                self._file_first_row + w.rows_checkpointed - 1)
         if w.ckpt_name is not None:
             with self._store_lock:
                 self._store.covers(w.name, self._version(w.ckpt_name),

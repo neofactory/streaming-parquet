@@ -125,6 +125,7 @@ class Stream:
 
         a = parquet or ParquetOptions()
         self._parquet = writer              # None: no file was ever started
+        self._durable_row = -1              # get_durable_row_number
         # The archive's standing: the first copy's last failure, and rows
         # the archive never got (recycled before their flush). A failing
         # first copy means rows are not durable anywhere but the ring.
@@ -562,6 +563,28 @@ class Stream:
                             file=self._parquet.get_open_file(),
                             catalog_error=(self._parquet.catalog.error
                                            if self._parquet.catalog else None))
+
+    def get_durable_row_number(self):
+        """The number of the newest row that is in a written piece of a
+        file or in a checkpoint, and -1 when no row is there yet. With
+        a spool that is the copy on the local disk: mirror_state() says
+        what the bucket has. A program that must acknowledge its input
+        only when the row is safe (a queue consumer) notes
+        get_newest_row_number() after its commit, and waits until this
+        number reaches it. The number moves when the library's worker
+        has written, a moment after the commit; a write fault shows in
+        archive_state(). A row committed while parquet was off is in no
+        file: the number passes it when a later row is written."""
+        w = self._parquet
+        if w is not None and w.durable_row > self._durable_row:
+            self._durable_row = w.durable_row
+        return self._durable_row
+
+    def get_newest_row_number(self):
+        """The number of the newest committed row, and -1 when there is
+        none: after a commit(), the number of the last row that commit
+        held. The first row a writer commits is 0."""
+        return self._ring.newest_seq
 
     def _archive_location(self):
         return self._parquet.get_dir() if self._parquet is not None else None

@@ -23,6 +23,8 @@ calls one of the reader verbs, and it all just works.
     s.start_parquet(label, options), s.stop_parquet()   # parquet on and off, stream live
     s.publish(), s.unpublish()           # found and read by other processes, or internal
     s.archive_state(), s.mirror_state(), s.memory_state()
+    s.get_newest_row_number()            # the last row committed
+    s.get_durable_row_number()           # the newest row safe in a file
     s.close()
 
     # ---- reading (a Stream reads the same way) -----------------------

@@ -56,7 +56,7 @@ type archiver struct {
 	w          *pqc.Writer
 	fileSchema *arrow.Schema
 	fileName   string
-	durable    int64 // first seq not yet in the archive: rows below it are in a chunk or the checkpoint
+	storedRow  int64 // the newest row in a written piece or a checkpoint; -1 for none
 }
 
 // recording reports whether rows are being planned into files.
@@ -146,6 +146,7 @@ func newArchiver(r *ring.Ring, name, run string, o ParquetOptions, store *storeS
 		return nil, err
 	}
 	a := &archiver{
+		storedRow:       -1,
 		wp:              wp,
 		log:             log,
 		store:           store,
@@ -444,7 +445,7 @@ func (a *archiver) write(w *work) error {
 			}
 		}
 		w.written = true
-		a.durable = w.hi
+		a.storedRow = w.hi - 1
 		a.noteStored()
 		if a.w.FileBytes() >= FileCutBytes {
 			// the file is large enough: the next row group begins a
@@ -467,7 +468,7 @@ func (a *archiver) write(w *work) error {
 	if err != nil {
 		return err
 	}
-	a.durable = w.hi
+	a.storedRow = w.hi - 1
 	a.noteStored()
 	return nil
 }
@@ -557,7 +558,6 @@ func (a *archiver) start(label string) error {
 		// off until now: the rows before the mark are not planned
 		committed := a.ring.NewestSeq() + 1
 		a.wp.start(committed)
-		a.durable = committed
 	}
 	return nil
 }

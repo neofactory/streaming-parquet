@@ -3076,6 +3076,43 @@ def _():
             proc.wait()
 
 
+print("\n--- the durable row number ---")
+
+@test("get_durable_row_number: -1 before a row is written, then the newest "
+      "row in a checkpoint; get_newest_row_number is the last committed row")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        s = sp.create_stream("v2test/durable", SCHEMA, store=tmp,
+                             memory=MemoryOptions(rows=500),
+                             parquet=ParquetOptions(checkpoint_seconds=0.05))
+        try:
+            assert s.get_newest_row_number() == -1
+            assert s.get_durable_row_number() == -1
+            fill(s, 10)
+            assert s.get_newest_row_number() == 9
+            deadline = time.time() + 5
+            while s.get_durable_row_number() < 9 and time.time() < deadline:
+                time.sleep(0.01)
+            assert s.get_durable_row_number() == 9, s.get_durable_row_number()
+            fill(s, 5)
+            wrote = s.get_newest_row_number()
+            assert wrote == 14
+            while s.get_durable_row_number() < wrote and time.time() < deadline:
+                time.sleep(0.01)
+            assert s.get_durable_row_number() == 14
+        finally:
+            s.close()
+        # a stream that writes no files: no row is ever durable
+        s = sp.create_stream("v2test/durable-none", SCHEMA,
+                             memory=MemoryOptions(rows=500))
+        try:
+            fill(s, 5)
+            assert s.get_newest_row_number() == 4
+            assert s.get_durable_row_number() == -1
+        finally:
+            s.close()
+
+
 print("\n--- the stream core, side by side ---")
 
 @test("the ticket in the store is the core's text, with every member")

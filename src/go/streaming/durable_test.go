@@ -33,24 +33,24 @@ func TestDurableFollowsTheCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := s.Durable(); got != 0 {
+	if got := s.DurableRowNumber(); got != -1 {
 		t.Fatalf("before any row: durable %d, want 0", got)
 	}
 	writeRows(t, s, 0, 10)
 	// Not yet: the checkpoint cadence has not elapsed.
-	if got := s.Durable(); got != 0 {
+	if got := s.DurableRowNumber(); got != -1 {
 		t.Fatalf("right after commit: durable %d, want 0", got)
 	}
 	// no call from here: the stream's goroutine writes the checkpoint
-	waitUntil(t, "the checkpoint", func() bool { return s.Durable() >= 10 })
-	if got := s.Durable(); got != 10 {
+	waitUntil(t, "the checkpoint", func() bool { return s.DurableRowNumber() >= 9 })
+	if got := s.DurableRowNumber(); got != 9 {
 		t.Fatalf("after the checkpoint: durable %d, want 10", got)
 	}
 	writeRows(t, s, 10, 5)
 	if err := s.StopParquet(); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.Durable(); got != 15 {
+	if got := s.DurableRowNumber(); got != 14 {
 		t.Fatalf("after stop: durable %d, want 15", got)
 	}
 }
@@ -103,7 +103,7 @@ func TestCheckpointSkipsWhenNothingNew(t *testing.T) {
 	}
 	writeRows(t, s, 0, 10)
 	// no call from here: the stream's goroutine writes the checkpoint
-	waitUntil(t, "the checkpoint", func() bool { return s.Durable() >= 10 })
+	waitUntil(t, "the checkpoint", func() bool { return s.DurableRowNumber() >= 9 })
 	ckpt := func() time.Time {
 		m, err := filepath.Glob(filepath.Join(dir, "streams", "t", "idle", "*.ckpt"))
 		if err != nil || len(m) != 1 {
@@ -146,7 +146,7 @@ func TestFileIsCutByBytes(t *testing.T) {
 		writeRows(t, s, k*200, 200)
 		// a ring of two row groups: let each group be written
 		want := int64(k+1) * 200
-		waitUntil(t, "the row group", func() bool { return s.Durable() >= want })
+		waitUntil(t, "the row group", func() bool { return s.DurableRowNumber() >= want-1 })
 	}
 	if err := s.StopParquet(); err != nil {
 		t.Fatal(err)
@@ -376,14 +376,14 @@ func TestArchiveStateShowsAWriteFault(t *testing.T) {
 	}
 	writeRows(t, s, 0, 10)
 	waitUntil(t, "the fault", func() bool { return s.ArchiveState().Failing })
-	if st := s.ArchiveState(); st.Error == "" || s.Durable() != 0 {
-		t.Fatalf("failing: %+v, durable %d", st, s.Durable())
+	if st := s.ArchiveState(); st.Error == "" || s.DurableRowNumber() != -1 {
+		t.Fatalf("failing: %+v, durable %d", st, s.DurableRowNumber())
 	}
 	if err := os.Chmod(folder, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	waitUntil(t, "the recovery", func() bool {
-		return !s.ArchiveState().Failing && s.Durable() == 10
+		return !s.ArchiveState().Failing && s.DurableRowNumber() == 9
 	})
 }
 
@@ -469,13 +469,13 @@ func TestWriterWaitsForRowsNotYetWritten(t *testing.T) {
 	if !ring.IsPinStalled(err) {
 		t.Fatalf("a row into a ring of unwritten rows: %v, want the writer to wait at the pin", err)
 	}
-	if st := s.ArchiveState(); st.LostRows != 0 || s.Durable() != 0 {
-		t.Fatalf("while the store fails: %+v, durable %d", st, s.Durable())
+	if st := s.ArchiveState(); st.LostRows != 0 || s.DurableRowNumber() != -1 {
+		t.Fatalf("while the store fails: %+v, durable %d", st, s.DurableRowNumber())
 	}
 	if err := os.Chmod(folder, 0o700); err != nil { // the store works again
 		t.Fatal(err)
 	}
-	waitUntil(t, "every row written", func() bool { return s.Durable() == 400 })
+	waitUntil(t, "every row written", func() bool { return s.DurableRowNumber() == 399 })
 	writeRows(t, s, 400, 10) // and the writer goes on
 	if st := s.ArchiveState(); st.Failing || st.LostRows != 0 {
 		t.Fatalf("after the store recovered: %+v", st)

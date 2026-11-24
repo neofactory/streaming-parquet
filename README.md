@@ -138,6 +138,7 @@ These are the Python names. Go has the same concepts: see [Python and Go: the sa
 
 **Health & status**
 - `archive_state()` / `mirror_state()` / `memory_state()` — check durability errors, S3 mirror backlog, and ring utilization.
+- `get_newest_row_number()` / `get_durable_row_number()` — the number of the last row committed, and of the newest row that is safe in a file. A program that must acknowledge its input only when the row is safe compares the two.
 - `reason` / `is_connected()` — check a reader's connection state in plain words.
 
 ## Python and Go: the same shape
@@ -158,7 +159,8 @@ The rule: the two languages have the same concepts, the same words and the same 
 | Packed binary frames | `s.wire_map(entries)`; `s.from_wire(m, frame)` | `s.WireMap(entries)`; `row.FromWire(m, frame)` |
 | End the file, begin the next | `s.cut(label)` | `s.Cut()`; `s.CutLabel(label)` |
 | Parquet on and off | `s.start_parquet(label, options)`; `s.stop_parquet()` | `s.StartParquet(label, options)`; `s.StopParquet()` |
-| The state of the files and of memory | `s.archive_state()`; `s.mirror_state()`; `s.memory_state()` | `s.ArchiveState()`; `s.Durable()`; `s.MemoryState()` |
+| The state of the files and of memory | `s.archive_state()`; `s.mirror_state()`; `s.memory_state()` | `s.ArchiveState()`; `s.MemoryState()` |
+| The last row committed, and the newest row safe in a file | `s.get_newest_row_number()`; `s.get_durable_row_number()` | `s.NewestRowNumber()`; `s.DurableRowNumber()` |
 | Read a stream | `a = sp.connect(name, store=...)` | `a, err := streaming.Connect(name, ConnectOptions{...})` |
 | Read rows (a stream and a reader alike) | `a.newest_row()`; `a.cursor()`; `a.arrow_table()` | `a.NewestRow()`; `a.Cursor()`; `a.ArrowTable()`, `a.ArrowTableNewest(rows)` |
 | One value of a row | `row.x` | `v, null, err := row.F64(x)` |
@@ -185,7 +187,6 @@ Not yet the same (each of these is a difference in words or in reach, not in the
 - **Where files go**: Go names a `BaseDir` or a `Sink` in the Parquet options and has no spool, no `ship_seconds` and no mirror state.
 - **Views**: Go has none.
 - **A reader that writes files**: Go's reader can (`ConnectOptions.Parquet`); Python's cannot.
-- **The stored row number**: Go has `Durable()`; Python has no call for it.
 - **A row's number**: Go's rows have `RowNumber()`; Python's rows do not show it.
 - **Rows from a value on**: Python's `cursor` and `arrow_table` take `since=(column, value)`; Go's do not.
 - **One flat row from a dict**: Python's `append` takes one; Go has no such form.
