@@ -67,7 +67,7 @@ branch (`v2.0-cyanoptera`). Every DuckDB update, patch releases
 included, needs a rebuild for each platform.
 
     DUCKDB_VERSION=v2.0.0 GEN=ninja make release
-    python3 run_extension_tests.py      # CKPT_TEST_STORE=s3://bucket adds the S3 case
+    python3 ../../tests/duckdb/run_extension_tests.py   # CKPT_TEST_STORE=s3://bucket adds the S3 case
 
 `DUCKDB_VERSION` names the version the binary declares. Without it the
 build takes it from `git describe`, and a shallow submodule (only the
