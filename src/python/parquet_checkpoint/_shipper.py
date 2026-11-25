@@ -9,14 +9,19 @@ version that the remote lacks, then that version under its own name --
 every intermediate version the outage swallowed, and every object only
 such a version named, is skipped by construction. The shipper deletes a
 remote version it shipped once it has been superseded
-SUPERSEDED_KEEP_S, in the poll that ships a later one, and with it the
-objects no version it keeps names.
+SUPERSEDED_KEEP_S, and with it the objects no version it keeps names.
+
+The RULES are the C core's (src/core/pqc.h, THE MIRROR): what is sent,
+the order, what is deleted, and the steps of the end of a file. This
+class does what the core asks: it reads the local sink, and it puts,
+deletes and assembles on the remote. The Go host does the same with
+the same core.
 
 Pollable, no threads: the host calls poll() from its own loop. A poll
 that cannot reach S3 RAISES -- the host logs it loudly and keeps
-polling; nothing is swallowed here. Ordering is preserved across the
-mirror: every chunk a checkpoint references is shipped before that
-checkpoint.
+polling; nothing is swallowed here, and the next poll goes on from what
+was done. Ordering is preserved across the mirror: every chunk a
+checkpoint references is shipped before that checkpoint.
 
     ship = Shipper('run.parquet', local=DirSink(d), remote=S3Sink(b))
     ship.poll()      # each host-loop tick; returns a status dict
@@ -27,12 +32,18 @@ checkpoint.
     ship.close()     # finalizes the REMOTE copy from its own
                      # artifacts -- byte-identical to the local file
 
+A host that ends files itself (a stream's writer) calls
+run(live=False): one pass that also takes the steps of the end of the
+file, in the core's order.
+
 Loss window if the local disk dies: rows since the last successful
 poll -- by design (see the streaming-parquet README).
 """
 
-from . import (SUPERSEDED_KEEP_S, CheckpointError, CheckpointReader,
-               _supersede, ckpt_versions, finalize)
+import time
+
+from . import (SUPERSEDED_KEEP_S, CheckpointError, ckpt_versions, finalize)
+from . import _core
 
 
 class Shipper:
@@ -41,65 +52,122 @@ class Shipper:
         self.name = name
         self.local = local
         self.remote = remote
+        try:
+            self._mirror = _core.Mirror(name, superseded_keep_s)
+        except _core.CoreError as e:
+            raise CheckpointError(f"{name}: {e}") from None
         self._last_shipped = None       # bytes of the last shipped version
         self._last_object = None        # its object name
-        # [remote version, superseded at, the objects it names]
-        self._shipped = []
-        self._there = set()             # objects known to be on the remote
-        self._keep_s = superseded_keep_s
-        # what the shipper is doing on the remote right now, for a host
-        # that waits on it (a stream's close): None between operations
-        self.doing = None
+        self.done = False               # finished in both copies
+
+    @property
+    def doing(self):
+        """What the shipper is doing on the remote right now, for a host
+        that waits on it (a stream's close): None between operations."""
+        return self._mirror.doing
 
     def _newest_local(self):
         v = ckpt_versions(self.local, self.name)
         return v[-1][1] if v else None
 
-    def poll(self):
-        """One mirror pass. Returns a status dict:
-        state 'idle' (nothing local yet), 'synced' (nothing new),
-        'shipped' (chunks and/or a checkpoint version copied; 'object'
-        names it), or 'local-finalized' (the local writer closed; call
-        close()). Raises on any sink failure -- the host retries next
-        poll."""
+    def run(self, live=True, keep_checkpoints=False, stored=None):
+        """One pass, as the core asks. live: the writer still has the
+        file open (the pass mirrors it and stops); False: the writer
+        ended it, and the pass also takes the steps of the end of the
+        file: the local assembly, then the remote one
+        (`keep_checkpoints`: leave the remote chunks and versions for
+        readers that were told of them). Returns a status dict: state
+        'idle' (nothing local yet), 'synced' (nothing new), 'shipped'
+        (chunks and/or a version copied; 'object' names it, 'watermark'
+        its rows), or 'local-finalized' (the finished file is there and
+        no version); 'done': True when the file is finished in both
+        copies; 'local_s', 'remote_s': the seconds the two assemblies
+        took. `stored(object, rows)` is called at the moment the remote
+        holds a new version, also in a pass that fails after it: what a
+        ticket may say. Raises on any sink failure: the host retries
+        next pass, which goes on from what was done."""
+        if self.done:
+            return {'state': 'idle', 'done': True}
         obj = self._newest_local()
-        if obj is None:
-            if self.local.exists(self.name):
-                return {'state': 'local-finalized'}
-            return {'state': 'idle'}
-        raw = self.local.get(obj)
-        if raw == self._last_shipped:
-            return {'state': 'synced', 'object': self._last_object}
-        r = CheckpointReader(raw)       # validates magic/version/CRC
-        shipped_chunks = 0
-        for cname, length, crc in r.manifest:
-            if cname in self._there:
-                continue                # sent or seen: it never changes
-            if (not self.remote.exists(cname)
-                    or self.remote.size(cname) != length):
-                self.doing = (f"uploading object {cname} "
-                              f"({length / 1e6:.1f} MB)")
-                try:
-                    self.remote.put(cname, self.local.get(cname))
-                finally:
-                    self.doing = None
-                shipped_chunks += 1
-            self._there.add(cname)
-        self.doing = f"uploading checkpoint {obj} ({len(raw) / 1e6:.1f} MB)"
+        raw = self.local.get(obj) if obj is not None else None
+        final = obj is None and self.local.exists(self.name)
+        m = self._mirror
         try:
-            self.remote.put(obj, raw)   # stored whole before any delete
-        finally:
-            self.doing = None
-        self._last_shipped = raw
-        self._last_object = obj
-        names = [m[0] for m in r.manifest]
-        self._shipped = _supersede(self.remote, self._shipped, obj,
-                                   self._keep_s, names)
-        # what the remote may lack again: an object deleted with its
-        # last version
-        self._there &= set().union(*(v[2] for v in self._shipped))
-        return {'state': 'shipped', 'chunks': shipped_chunks,
-                'watermark': r.watermark, 'object': obj}
+            m.local(obj, raw, final, live)
+        except _core.CoreError as e:
+            raise CheckpointError(str(e)) from None
+        status = {'state': ('synced' if obj is not None else
+                            'local-finalized' if final else 'idle'),
+                  'done': False}
+        if obj is not None and raw == self._last_shipped:
+            status['object'] = self._last_object
+        chunks = 0
+        try:
+            while True:
+                action, name, size, flag = m.next()
+                if action == _core.MIRROR_NOTHING:
+                    return status
+                if action == _core.MIRROR_DONE:
+                    self.done = True
+                    status['done'] = True
+                    return status
+                if action == _core.MIRROR_STAT:
+                    exists = self.remote.exists(name)
+                    m.remote_has(exists,
+                                 self.remote.size(name) if exists else 0)
+                    continue
+                if action == _core.MIRROR_UPLOAD:
+                    self.remote.put(name, self.local.get(name))
+                    chunks += 1
+                elif action == _core.MIRROR_UPLOAD_VERSION:
+                    self.remote.put(name, raw)   # stored whole before any delete
+                    self._last_shipped = raw
+                    self._last_object = name
+                elif action == _core.MIRROR_STORED:
+                    status.update(state='shipped', chunks=chunks,
+                                  watermark=size, object=name)
+                    if stored is not None:
+                        stored(name, size)
+                elif action == _core.MIRROR_DELETE:
+                    self.remote.delete(name)
+                elif action == _core.MIRROR_ASSEMBLE_LOCAL:
+                    t0 = time.monotonic()
+                    finalize(self.name, self.local)
+                    status['local_s'] = time.monotonic() - t0
+                elif action == _core.MIRROR_ASSEMBLE_REMOTE:
+                    t0 = time.monotonic()
+                    self._assemble_remote(flag, keep_checkpoints)
+                    status['remote_s'] = time.monotonic() - t0
+                m.did()
+        except _core.CoreError as e:
+            m.failed()
+            raise CheckpointError(f"{self.name}: {e}") from None
+        except BaseException:
+            m.failed()                  # the pass is over; the next goes on
+            raise
+
+    def _assemble_remote(self, from_shipped, keep):
+        """Finalize the REMOTE copy from its own artifacts (server-side
+        assembly; byte-identical to the local final file)."""
+        if from_shipped:
+            # The newest remote version is the one this shipper put
+            # there: finalize from the bytes in hand, no read-back.
+            ckpt, obj = self._mirror.shipped()
+            return finalize(self.name, self.remote, ckpt_bytes=ckpt,
+                            ckpt_object=obj, keep_checkpoints=keep)
+        if ckpt_versions(self.remote, self.name):
+            return finalize(self.name, self.remote, keep_checkpoints=keep)
+        if self.remote.exists(self.name):
+            return ('done', self.name)
+        raise CheckpointError(
+            f"shipper.close({self.name!r}): nothing shipped -- "
+            f"poll() until synced before closing")
+
+    def poll(self):
+        """One mirror pass of a file its writer still has open. Returns
+        the status dict of run(). Raises on any sink failure -- the host
+        retries next poll."""
+        return self.run(live=True)
 
     @property
     def synced(self):
@@ -116,24 +184,11 @@ class Shipper:
         to have shipped (poll until synced before closing the writer).
         `keep_checkpoints`: leave the remote chunks and versions for
         readers that were told of them; discard_checkpoints() later."""
-        self.doing = f"assembling {self.name} on the store"
-        try:
-            return self._close(keep_checkpoints)
-        finally:
-            self.doing = None
-
-    def _close(self, keep):
-        if self._last_shipped is not None:
-            # The newest remote version is the one this shipper put
-            # there: finalize from the bytes in hand, no read-back.
-            return finalize(self.name, self.remote,
-                            ckpt_bytes=self._last_shipped,
-                            ckpt_object=self._last_object,
-                            keep_checkpoints=keep)
-        if ckpt_versions(self.remote, self.name):
-            return finalize(self.name, self.remote, keep_checkpoints=keep)
-        if self.remote.exists(self.name):
+        if self.done:
             return ('done', self.name)
-        raise CheckpointError(
-            f"shipper.close({self.name!r}): nothing shipped -- "
-            f"poll() until synced before closing")
+        if self._newest_local() is not None:
+            raise CheckpointError(
+                f"shipper.close({self.name!r}): the local copy still has a "
+                f"checkpoint -- close the writer first")
+        self.run(live=False, keep_checkpoints=keep_checkpoints)
+        return ('recovered', self.name)

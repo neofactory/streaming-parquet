@@ -188,25 +188,28 @@ class ParquetWriter:
         process writes here and every checkpoint is a leftover. A file
         whose final copy exists beside its checkpoints finished before
         the crash; its checkpoints were kept for readers."""
+        from parquet_checkpoint import _core as pqc
         for final, versions in sorted(
                 parquet_checkpoint.unfinished_files(self._sink).items()):
-            if self._sink.exists(final):
-                if self._remote is None and self._keeps_checkpoints():
-                    self._await_catalog(final, self._sink, versions[-1][1])
-                else:                   # a spool copy: no reader is told of it
-                    parquet_checkpoint.discard_checkpoints(final, self._sink)
-                continue
-            if self._remote is not None:
+            # what to do with it is the core's rule (pqc.h: THE SWEEP AT START)
+            todo = pqc.sweep_local(self._sink.exists(final),
+                                   self._remote is not None,
+                                   self._keeps_checkpoints())
+            if todo == pqc.SWEEP_AWAIT_CATALOG:
+                self._await_catalog(final, self._sink, versions[-1][1])
+            elif todo == pqc.SWEEP_DISCARD:  # a spool copy: no reader is told of it
+                parquet_checkpoint.discard_checkpoints(final, self._sink)
+            elif todo == pqc.SWEEP_MIRROR:
                 # pending: finalizes once its checkpoint is shipped
                 self._ships[final] = parquet_checkpoint.Shipper(
                     final, self._sink, self._remote)
                 _diag.info(f"[{self._stream_name}] boot sweep: "
                            f"{self._where(final)} pending "
                            f"its remote copy")
-                continue
-            status, where = parquet_checkpoint.finalize(final, self._sink)
-            _diag.info(f"[{self._stream_name}] boot sweep: {status} "
-                       f"{self._where(where)}")
+            else:
+                status, where = parquet_checkpoint.finalize(final, self._sink)
+                _diag.info(f"[{self._stream_name}] boot sweep: {status} "
+                           f"{self._where(where)}")
 
     def get_opened_tw(self):
         """TW epoch s the current file was opened, or None when none is open."""
@@ -549,27 +552,28 @@ class ParquetWriter:
             parts.append(f"sweep {time.monotonic() - t0:.2f}s")
         live = self._writer.name if self._writer is not None else None
         for name, ship in list(self._ships.items()):
+            # One pass of the file's mirror, as the core orders it
+            # (pqc.h: THE MIRROR): the newest version to the remote, and
+            # for a file the writer ended, the local assembly and then
+            # the remote one. The ticket's row moves at the moment the
+            # remote holds a version, also in a pass that fails after.
             t0 = time.monotonic()
-            status = ship.poll()
+            keep = self._keeps_checkpoints()
+            status = ship.run(
+                live=(name == live), keep_checkpoints=keep,
+                stored=lambda obj, rows, name=name: self._stored(name, rows, obj))
             state = status['state']
             detail = f"{name} poll {time.monotonic() - t0:.2f}s({state}"
             if status.get('chunks'):
                 detail += f", {status['chunks']} chunk(s)"
             detail += ")"
-            if state == 'shipped':
-                self._stored(name, status['watermark'], status['object'])
-            if name == live:
-                parts.append(detail)
+            if 'local_s' in status:
+                detail += f" local-finalize {status['local_s']:.2f}s"
+            if 'remote_s' in status:
+                detail += f" remote-finalize {status['remote_s']:.2f}s"
+            parts.append(detail)
+            if not status['done']:
                 continue
-            keep = self._keeps_checkpoints()
-            if state in ('shipped', 'synced'):
-                t0 = time.monotonic()
-                parquet_checkpoint.finalize(name, self._sink)
-                detail += f" local-finalize {time.monotonic() - t0:.2f}s"
-            # 'local-finalized', or 'idle' (nothing local; remote only)
-            t0 = time.monotonic()
-            ship.close(keep_checkpoints=keep)
-            detail += f" remote-finalize {time.monotonic() - t0:.2f}s"
             del self._ships[name]
             if keep:
                 last = ship._last_object or (
@@ -578,7 +582,6 @@ class ParquetWriter:
                 self._await_catalog(name, self._remote, last)
             else:
                 self._finished(name)
-            parts.append(detail)
             _diag.info(f"[{self._stream_name}] remote finalized {name}")
         self.discard_due()              # the upload step deletes what is superseded
         elapsed = time.monotonic() - t_pass
@@ -593,16 +596,18 @@ class ParquetWriter:
         a checkpoint left on the remote whose local file already
         finalized (crash between the two assemblies) gets a Shipper that
         finishes it from the remote's own artifacts."""
+        from parquet_checkpoint import _core as pqc
         for final, versions in sorted(
                 parquet_checkpoint.unfinished_files(self._remote).items()):
-            if self._remote.exists(final):
+            todo = pqc.sweep_remote(self._remote.exists(final),
+                                    self._keeps_checkpoints(),
+                                    final in self._ships)
+            if todo == pqc.SWEEP_AWAIT_CATALOG:
                 # finished before the crash; checkpoints kept for readers
-                if self._keeps_checkpoints():
-                    self._await_catalog(final, self._remote, versions[-1][1])
-                else:
-                    parquet_checkpoint.discard_checkpoints(final, self._remote)
-                continue
-            if final not in self._ships:
+                self._await_catalog(final, self._remote, versions[-1][1])
+            elif todo == pqc.SWEEP_DISCARD:
+                parquet_checkpoint.discard_checkpoints(final, self._remote)
+            elif todo == pqc.SWEEP_MIRROR:
                 self._ships[final] = parquet_checkpoint.Shipper(
                     final, self._sink, self._remote)
                 # its checkpoint is already in the store

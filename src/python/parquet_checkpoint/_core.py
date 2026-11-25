@@ -68,6 +68,42 @@ uint32_t pqc_chunks_cut(const PqcWriter *w);
 uint64_t pqc_logical_end(const PqcWriter *w);
 double pqc_dead_after(double beat_seconds);
 void pqc_free(void *p);
+
+typedef struct PqcVersions PqcVersions;
+int pqc_ckpt_object(const char *name, int64_t seq, char out[320],
+                    Report *report);
+int pqc_ckpt_object_parse(const char *object, char name[320], int64_t *seq);
+int pqc_versions_new(double keep_seconds, PqcVersions **out, Report *report);
+void pqc_versions_free(PqcVersions *v);
+int pqc_versions_stored(PqcVersions *v, const char *object,
+                        const uint8_t *ckpt, size_t len, Report *report);
+const char *pqc_versions_due(const PqcVersions *v, int32_t index);
+int pqc_versions_deleted(PqcVersions *v, const char *object, Report *report);
+int pqc_versions_names(const PqcVersions *v, const char *object);
+
+typedef struct PqcMirror PqcMirror;
+typedef struct {
+    int32_t action;
+    int32_t flag;
+    uint64_t size;
+    char name[320];
+} PqcMirrorStep;
+int pqc_mirror_new(const char *name, double keep_seconds, PqcMirror **out,
+                   Report *report);
+void pqc_mirror_free(PqcMirror *m);
+int pqc_mirror_local(PqcMirror *m, const char *object, const uint8_t *ckpt,
+                     size_t len, int final_exists, int live, Report *report);
+int pqc_mirror_next(PqcMirror *m, PqcMirrorStep *step, Report *report);
+int pqc_mirror_remote_has(PqcMirror *m, int exists, uint64_t size,
+                          Report *report);
+int pqc_mirror_did(PqcMirror *m, Report *report);
+void pqc_mirror_failed(PqcMirror *m);
+int pqc_mirror_shipped(const PqcMirror *m, const uint8_t **ckpt, size_t *len,
+                       const char **object);
+const char *pqc_mirror_doing(const PqcMirror *m);
+int pqc_sweep_local(int final_exists, int has_remote, int keeps_checkpoints);
+int pqc_sweep_remote(int final_exists, int keeps_checkpoints, int in_flight);
+void pqc_test_set_clock(int fixed, double wall, double mono);
 """
 ffi.cdef(_CDEF)
 
@@ -101,7 +137,8 @@ for _name in sorted(set(re.findall(r"\b(pqc_\w+)\s*\(", _CDEF))):
     getattr(lib, _name)
 for _type in ('Report *', 'PqcWriter **', f'char[{NAME_MAX}]',
               'const uint8_t **', 'uint8_t **', 'uint64_t *', 'int64_t *',
-              'uint32_t *', 'int *'):
+              'uint32_t *', 'int *', 'PqcVersions **', 'PqcMirror **',
+              'PqcMirrorStep *', 'char[320]', 'size_t *', 'const char **'):
     ffi.new(_type)
 
 
@@ -237,3 +274,187 @@ class Writer:
             self.free()
         except Exception:
             pass
+
+
+# ---- checkpoint versions, the mirror, the sweep (src/core/pqc.h) -----------
+
+OBJECT_MAX = 320                # PQC_OBJECT_MAX
+_NO_MEMORY = 4
+
+_thread = __import__('threading').local()
+
+
+def _report():
+    """This thread's Report (src/core/report.h)."""
+    r = getattr(_thread, 'report', None)
+    if r is None:
+        r = _thread.report = ffi.new('Report *')
+    return r
+
+
+def _check(rc, r):
+    if rc == 0:
+        return
+    text = ffi.string(r.error).decode('utf-8', 'replace')
+    if rc == _NO_MEMORY:
+        raise MemoryError(text)
+    raise CoreError(text)
+
+
+def ckpt_object(name, seq):
+    """The object name of version `seq` of file `name`'s checkpoint."""
+    out = ffi.new(f'char[{OBJECT_MAX}]')
+    r = _report()
+    _check(lib.pqc_ckpt_object(name.encode('utf-8'), int(seq), out, r), r)
+    return ffi.string(out).decode('utf-8')
+
+
+def ckpt_object_parse(obj):
+    """(name, seq) for a checkpoint version's object name, else None."""
+    name = ffi.new(f'char[{OBJECT_MAX}]')
+    seq = ffi.new('int64_t *')
+    if not lib.pqc_ckpt_object_parse(obj.encode('utf-8'), name, seq):
+        return None
+    return ffi.string(name).decode('utf-8'), int(seq[0])
+
+
+class Versions:
+    """The checkpoint versions of one file in one place (PqcVersions):
+    which replaced versions, and which objects, are due for deletion.
+    The host stores and deletes."""
+
+    def __init__(self, keep_seconds):
+        self._v = ffi.NULL
+        out = ffi.new('PqcVersions **')
+        r = _report()
+        _check(lib.pqc_versions_new(float(keep_seconds), out, r), r)
+        self._v = out[0]
+
+    def stored(self, obj, ckpt):
+        """The version `obj` with the bytes `ckpt` is stored."""
+        r = _report()
+        _check(lib.pqc_versions_stored(self._v, obj.encode('utf-8'), ckpt,
+                                       len(ckpt), r), r)
+
+    def due(self):
+        """The objects to delete now, in order."""
+        out, i = [], 0
+        while True:
+            p = lib.pqc_versions_due(self._v, i)
+            if p == ffi.NULL:
+                return out
+            out.append(ffi.string(p).decode('utf-8'))
+            i += 1
+
+    def deleted(self, obj):
+        r = _report()
+        _check(lib.pqc_versions_deleted(self._v, obj.encode('utf-8'), r), r)
+
+    def free(self):
+        if self._v != ffi.NULL:
+            lib.pqc_versions_free(self._v)
+            self._v = ffi.NULL
+
+    def __del__(self):
+        self.free()
+
+
+# PqcMirrorAction
+MIRROR_NOTHING, MIRROR_STAT, MIRROR_UPLOAD, MIRROR_UPLOAD_VERSION = 0, 1, 2, 3
+MIRROR_STORED, MIRROR_DELETE, MIRROR_ASSEMBLE_LOCAL = 4, 5, 6
+MIRROR_ASSEMBLE_REMOTE, MIRROR_DONE = 7, 8
+
+
+class Mirror:
+    """The mirror of one file from a local copy to a remote one
+    (PqcMirror): the rules of what is sent, in which order, what is
+    deleted, and how a file ends. The host does each step."""
+
+    def __init__(self, name, keep_seconds):
+        self._m = ffi.NULL
+        out = ffi.new('PqcMirror **')
+        r = _report()
+        _check(lib.pqc_mirror_new(name.encode('utf-8'), float(keep_seconds),
+                                  out, r), r)
+        self._m = out[0]
+        self._step = ffi.new('PqcMirrorStep *')
+
+    def local(self, obj, ckpt, final_exists, live):
+        """A pass begins: the newest local version and its bytes (None,
+        None for none), whether the finished file is there, whether the
+        writer still has the file open."""
+        r = _report()
+        _check(lib.pqc_mirror_local(
+            self._m, obj.encode('utf-8') if obj is not None else ffi.NULL,
+            ckpt if ckpt is not None else ffi.NULL,
+            len(ckpt) if ckpt is not None else 0,
+            1 if final_exists else 0, 1 if live else 0, r), r)
+
+    def next(self):
+        """(action, name, size, flag) of the next step."""
+        r = _report()
+        _check(lib.pqc_mirror_next(self._m, self._step, r), r)
+        st = self._step
+        return (st.action, ffi.string(st.name).decode('utf-8'), int(st.size),
+                int(st.flag))
+
+    def remote_has(self, exists, size):
+        r = _report()
+        _check(lib.pqc_mirror_remote_has(self._m, 1 if exists else 0,
+                                         int(size), r), r)
+
+    def did(self):
+        r = _report()
+        _check(lib.pqc_mirror_did(self._m, r), r)
+
+    def failed(self):
+        lib.pqc_mirror_failed(self._m)
+
+    def shipped(self):
+        """(bytes, object) of the newest version stored on the remote,
+        or (None, None)."""
+        ck = ffi.new('const uint8_t **')
+        n = ffi.new('size_t *')
+        obj = ffi.new('const char **')
+        if not lib.pqc_mirror_shipped(self._m, ck, n, obj):
+            return None, None
+        return bytes(ffi.buffer(ck[0], n[0])), ffi.string(obj[0]).decode('utf-8')
+
+    @property
+    def doing(self):
+        """What the mirror is doing on the remote now, or None."""
+        text = ffi.string(lib.pqc_mirror_doing(self._m)).decode('utf-8')
+        return text or None
+
+    def free(self):
+        if self._m != ffi.NULL:
+            lib.pqc_mirror_free(self._m)
+            self._m = ffi.NULL
+
+    def __del__(self):
+        self.free()
+
+
+# PqcSweep
+SWEEP_NOTHING, SWEEP_FINISH, SWEEP_MIRROR = 0, 1, 2
+SWEEP_AWAIT_CATALOG, SWEEP_DISCARD = 3, 4
+
+
+def sweep_local(final_exists, has_remote, keeps_checkpoints):
+    return lib.pqc_sweep_local(int(bool(final_exists)), int(bool(has_remote)),
+                               int(bool(keeps_checkpoints)))
+
+
+def sweep_remote(final_exists, keeps_checkpoints, in_flight):
+    return lib.pqc_sweep_remote(int(bool(final_exists)),
+                                int(bool(keeps_checkpoints)),
+                                int(bool(in_flight)))
+
+
+def test_set_clock(wall, mono):
+    """For tests: the time the core sees."""
+    lib.pqc_test_set_clock(1, float(wall), float(mono))
+
+
+def test_system_clock():
+    lib.pqc_test_set_clock(0, 0.0, 0.0)

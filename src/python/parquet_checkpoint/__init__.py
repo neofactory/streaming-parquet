@@ -103,49 +103,40 @@ def _encode_mini(table, schema=None, **writer_options):
 #: file's checkpoints (superseded when the ticket drops the file).
 SUPERSEDED_KEEP_S = 600.0
 
-_CKPT_RE = re.compile(r'^(?P<name>.+\.parquet)(?:\.(?P<seq>\d{6,}))?\.ckpt$')
+def _versions(keep_s):
+    """The rule for a file's checkpoint versions in one place (the C
+    core's, src/core/pqc.h: CHECKPOINT VERSIONS)."""
+    from . import _core
+    return _core.Versions(keep_s)
 
 
-def _supersede(sink, versions, new, keep_s, names=()):
-    """`new` (just stored; it names the objects `names`) supersedes the
-    newest of `versions`; delete every version superseded at least
-    keep_s ago, and with it each object that no kept version names. A
-    version is [object, when superseded or None, the objects it names].
-    Returns the list."""
-    now = time.monotonic()
-    if versions:
-        versions[-1][1] = now
-    kept, gone = [], []
-    for v in versions:
-        (gone if v[1] is not None and now - v[1] >= keep_s else kept).append(v)
-    kept.append([new, None, frozenset(names)])
-    named = set().union(*(v[2] for v in kept))
-    for obj, _at, its in gone:
-        sink.delete(obj)                # the claim first, then its objects
-        for name in sorted(its - named):
-            sink.delete(name)
-            named.add(name)             # once
-    return kept
-
-
-def _named_by(ckpt):
-    """The object names a checkpoint object's manifest lists."""
-    return [m[0] for m in CheckpointReader(ckpt).manifest]
+def _stored_version(versions, sink, obj, ckpt):
+    """The version `obj` (bytes `ckpt`) is stored on `sink`: it replaces
+    the newest, and what the rule says is due is deleted, a version
+    first and then the objects only it named."""
+    versions.stored(obj, ckpt)
+    for name in versions.due():
+        sink.delete(name)
+        versions.deleted(name)
 
 
 def ckpt_object(name, seq):
     """The object name of version `seq` of file `name`'s checkpoint."""
-    return f"{name}.{seq:06d}.ckpt"
+    from . import _core
+    return _core.ckpt_object(name, seq)
 
 
 def parse_ckpt_object(obj):
     """(name, seq) for a checkpoint object's name, else None. A
     checkpoint named without a version (x.parquet.ckpt, as written
-    before versions) is version 0."""
-    m = _CKPT_RE.match(obj)
-    if m is None:
+    before versions) is version 0. The rule is the C core's; a
+    directory in front of the name stays in front."""
+    from . import _core
+    head, slash, tail = obj.rpartition('/')
+    got = _core.ckpt_object_parse(tail)
+    if got is None:
         return None
-    return m.group('name'), int(m.group('seq') or 0)
+    return head + slash + got[0], got[1]
 
 
 def ckpt_versions(sink, name):
@@ -222,9 +213,9 @@ class CheckpointWriter:
         self._rows_checkpointed = 0
         self._seq = 0                # the newest checkpoint version's number
         self._keep_s = superseded_keep_s
-        # [object, when superseded (monotonic) or None, the objects it
-        # names], oldest first
-        self._versions = []
+        # the versions stored, and which are due for deletion
+        self._versions = _versions(superseded_keep_s)
+        self._ckpt_name = None      # the newest version's object name
         # what the newest version claims: (final rows, unfinished rows).
         # The same count of rows is not the same claim: a final row
         # group that replaces the unfinished objects is a new one.
@@ -311,9 +302,8 @@ class CheckpointWriter:
         self._seq += 1
         obj = ckpt_object(self.name, self._seq)
         self.sink.put(obj, ckpt)
-        self._versions = _supersede(self.sink, self._versions, obj,
-                                    self._keep_s,   # stored whole first
-                                    _named_by(ckpt))
+        _stored_version(self._versions, self.sink, obj, ckpt)  # stored whole first
+        self._ckpt_name = obj
         self._rows_checkpointed = total_rows
         self._claimed = (w.rows_final, w.rows_unfinished)
         return total_rows
@@ -322,7 +312,7 @@ class CheckpointWriter:
     def ckpt_name(self):
         """The newest checkpoint version's object name; None before the
         first checkpoint."""
-        return self._versions[-1][0] if self._versions else None
+        return self._ckpt_name
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -340,9 +330,9 @@ class CheckpointWriter:
             w.close()
             self.sink.put(self.name, buf.getvalue())
             if not keep_checkpoints:
-                for version in self._versions:
-                    self.sink.delete(version[0])
-                self._versions = []
+                for _seq, version in ckpt_versions(self.sink, self.name):
+                    self.sink.delete(version)
+                self._ckpt_name = None
         else:
             finalize(self.name, self.sink, keep_checkpoints=keep_checkpoints)
         self._closed = True
