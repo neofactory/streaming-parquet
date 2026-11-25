@@ -158,6 +158,59 @@ static void hit(const uint8_t *buf, size_t n) {
       }
       pqc_mirror_free(m);
     }
+    /* the assembly of a file from the same bytes: read as a version,
+     * or given in hand; any answers */
+    PqcFinish *f = NULL;
+    char vobj[PQC_OBJECT_MAX];
+    if (pqc_ckpt_object(file, 1, vobj, &rep) == REPORT_OK &&
+        pqc_finish_new(file, (int)(xr() % 8 == 0), (int)(xr() & 1), &f,
+                       &rep) == REPORT_OK) {
+      (void)pqc_finish_version(f, vobj, &rep);
+      if (xr() & 1) (void)pqc_finish_given(f, vobj, buf, n, &rep);
+      PqcFinishStep st;
+      for (int k = 0; k < 4096; k++) {
+        if (pqc_finish_next(f, &st, &rep) != REPORT_OK) break;
+        if (st.action == PQC_FINISH_DONE) break;
+        int rc = REPORT_OK;
+        if (st.action == PQC_FINISH_STAT)
+          rc = pqc_finish_has(f, (int)(xr() % 8 != 0),
+                              xr() % 8 ? st.size : st.size + 1, &rep);
+        else if (st.action == PQC_FINISH_READ)
+          rc = pqc_finish_read(f, buf, n, &rep);
+        else {
+          if (st.action == PQC_FINISH_ASSEMBLE) {
+            const char *sn;
+            int64_t off, len;
+            for (uint32_t i = 0; pqc_finish_source(f, i, &sn, &off, &len); i++)
+              if (off >= 0 && (uint64_t)(off + len) > n) __builtin_trap();
+          }
+          if (st.action == PQC_FINISH_LIST && (xr() & 1))
+            (void)pqc_finish_listed(f, "v.parquet.chunks/000009", &rep);
+          rc = pqc_finish_did(f, &rep);
+        }
+        if (rc != REPORT_OK) break;
+      }
+      pqc_finish_free(f);
+    }
+    /* the parts of an assembly, with sizes from the bytes */
+    {
+      uint64_t sizes[64];
+      uint32_t ns = (uint32_t)(n < 64 ? n : 64), np = 0;
+      for (uint32_t i = 0; i < ns; i++) sizes[i] = (uint64_t)buf[i] * 97;
+      PqcPart *parts = NULL;
+      uint64_t part_min = xr() % 4096;
+      if (pqc_plan_parts(sizes, ns, part_min, &parts, &np, &rep) == REPORT_OK) {
+        uint32_t next = 0;
+        for (uint32_t i = 0; i < np; i++) {
+          uint64_t bytes = 0;
+          if (parts[i].first != next || !parts[i].count) __builtin_trap();
+          for (uint32_t c = 0; c < parts[i].count; c++) bytes += sizes[next++];
+          if (i + 1 < np && bytes < part_min) __builtin_trap();
+        }
+        if (next != ns) __builtin_trap();
+        pqc_free(parts);
+      }
+    }
   }
   size_t ol = 0;
   uint8_t *o = t_pqc_shift_footer(buf, n, (int64_t)xr() - 1000, &ol,

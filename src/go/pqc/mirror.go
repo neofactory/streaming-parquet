@@ -123,12 +123,6 @@ func (m *Mirror) Run(live, keepCheckpoints bool, stored func(object string, rows
 		co = C.CString(object)
 		defer C.free(unsafe.Pointer(co))
 	}
-	cbool := func(b bool) C.int {
-		if b {
-			return 1
-		}
-		return 0
-	}
 	if C.pqc_mirror_local(m.m, co, bytesPtr(raw), C.size_t(len(raw)),
 		cbool(final), cbool(live), &r) != 0 {
 		return MirrorStatus{}, cerr(&r)

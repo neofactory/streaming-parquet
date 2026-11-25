@@ -73,6 +73,8 @@ func newProcess(cfg processConfig) (*process, error) {
 		t.log = slog.New(slog.NewTextHandler(os.Stderr,
 			&slog.HandlerOptions{Level: slog.LevelWarn}))
 	}
+	log := t.log
+	pqc.SetWarn(func(text string) { log.Warn(text) })
 	return t, nil
 }
 

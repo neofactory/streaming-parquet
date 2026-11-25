@@ -206,7 +206,7 @@ Three cores in C11 hold the rules, and each header is its specification:
 | Core | Header | What it decides |
 |---|---|---|
 | The ring | `src/core/arrow_ring.h` | Rows in memory: slots, commits, pins, record sets as Arrow. |
-| The checkpoint format | `src/core/pqc.h` | The bytes of a checkpoint and of the objects of an open file; checkpoint versions; the mirror of a file from a local copy to a remote one. |
+| The checkpoint format | `src/core/pqc.h` | The bytes of a checkpoint and of the objects of an open file; checkpoint versions; the mirror of a file from a local copy to a remote one; the assembly of a finished file from its checkpoint (which version, the checks, the order of the deletes); the parts of a multipart assembly in a bucket. |
 | The stream's rules | `src/core/sp.h` | The ticket, ownership, when a write is due, what the store holds, a reader's and a view's rules, the catalog. |
 
 A core does no input and no output, calls no function of its host, and never waits. A call returns a status; the reason for a failure and the lines for the host's log come back in a `Report` the caller passed ([`src/core/report.h`](src/core/report.h)). The host (Python, Go, the DuckDB extension) does the files, the network, the waiting and the logging. A test reads the three headers and holds them to this rule (`tests/core/run_header_tests.py`).

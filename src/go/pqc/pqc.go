@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
@@ -96,6 +97,13 @@ func CkptVersions(sink Sink, name string) ([]Version, error) {
 // the call's report (report.h).
 func cerr(r *C.Report) error {
 	return fmt.Errorf("%s", C.GoString(&r.error[0]))
+}
+
+func cbool(b bool) C.int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func bytesPtr(b []byte) *C.uint8_t {
@@ -496,22 +504,13 @@ func (r *Reader) Compose() ([]byte, error) {
 	return append(out, r.raw[r.dataOff:r.dataOff+r.dataLen]...), nil
 }
 
-// AssemblyPlan lists (name, offset, length) sources for Sink.Assemble:
-// the chunks whole, then the checkpoint object's own data region.
-func (r *Reader) AssemblyPlan(ckptName string) []Source {
-	var plan []Source
-	for _, m := range r.Manifest {
-		plan = append(plan, Source{m.Name, 0, -1})
-	}
-	plan = append(plan, Source{ckptName, int64(r.dataOff), int64(r.dataLen)})
-	return plan
-}
-
-// Finalize turns a checkpoint into the ordinary .parquet file —
-// idempotent, assembled from the newest checkpoint version whose CRC
-// holds, versions deleted last, crash-orphaned chunks swept. Same
-// refusals as the Python finalize (both-exist, mispaired,
-// missing/wrong-size chunk).
+// Finalize turns a checkpoint into the ordinary .parquet file: it can
+// be run again, it assembles from the newest checkpoint version whose
+// CRC holds, and it deletes the versions last. "done": the file was
+// there already; "recovered": it was assembled now. The rules are the
+// core's (pqc.h: THE ASSEMBLY OF A FILE), the same ones the Python
+// finalize follows: which version, the checks, the sources, and the
+// order of the deletes.
 func Finalize(name string, sink Sink) (string, error) { return finalize(name, sink, false) }
 
 // FinalizeKeep is Finalize, but the chunks and checkpoint versions stay
@@ -521,46 +520,11 @@ func FinalizeKeep(name string, sink Sink) (string, error) { return finalize(name
 
 // DiscardCheckpoints deletes a finished file's chunks and checkpoint
 // versions, kept while readers were told of them. It refuses unless the
-// finished file exists: the checkpoints would be its only copy.
+// finished file exists: the checkpoints would be its only copy. The
+// order of the deletes is the core's, the same as Finalize's.
 func DiscardCheckpoints(name string, sink Sink) error {
-	if !sink.Exists(name) {
-		return fmt.Errorf("DiscardCheckpoints(%q): the final file does not "+
-			"exist -- the checkpoints are its only copy", name)
-	}
-	versions, err := CkptVersions(sink, name)
-	if err != nil {
-		return err
-	}
-	used := ""
-	if len(versions) > 0 {
-		used = versions[len(versions)-1].Object
-	}
-	return deleteCheckpoints(name, sink, versions, used)
-}
-
-// deleteCheckpoints: every chunk under the file's prefix, then every
-// version, the one named `used` last.
-func deleteCheckpoints(name string, sink Sink, versions []Version, used string) error {
-	chunks, err := sink.List(name + ".chunks/")
-	if err != nil {
-		return err
-	}
-	for _, c := range chunks {
-		if err := sink.Delete(c); err != nil {
-			return err
-		}
-	}
-	for _, v := range versions {
-		if v.Object != used {
-			if err := sink.Delete(v.Object); err != nil {
-				return err
-			}
-		}
-	}
-	if used != "" {
-		return sink.Delete(used) // last act
-	}
-	return nil
+	_, err := finish(name, sink, C.PQC_FINISH_DISCARD, false, nil, "")
+	return err
 }
 
 func finalize(name string, sink Sink, keep bool) (string, error) {
@@ -571,70 +535,131 @@ func finalize(name string, sink Sink, keep bool) (string, error) {
 // (object used) when the caller just put it there (a mirror): the
 // read-back is then skipped.
 func finalizeFrom(name string, sink Sink, ckpt []byte, object string, keep bool) (string, error) {
-	versions, err := CkptVersions(sink, name)
+	assembled, err := finish(name, sink, C.PQC_FINISH_ASSEMBLE_FILE, keep, ckpt, object)
 	if err != nil {
 		return "", err
 	}
-	if ckpt != nil {
-		r, err := readerOf(ckpt, sink)
-		if err != nil {
-			return "", fmt.Errorf("%s: %w", object, err)
-		}
-		return assemble(name, sink, r, object, versions, keep)
-	}
-	if len(versions) == 0 {
-		if sink.Exists(name) {
-			return "done", nil
-		}
-		return "", fmt.Errorf("finalize(%q): nothing there", name)
-	}
-	if sink.Exists(name) {
-		return "", fmt.Errorf("%s: BOTH final and checkpoint exist -- refusing to guess", name)
-	}
-	var r *Reader
-	var used string
-	var refused []string
-	for i := len(versions) - 1; i >= 0; i-- {
-		rr, err := OpenReader(versions[i].Object, sink)
-		if err != nil {
-			refused = append(refused, fmt.Sprintf("%s: %v", versions[i].Object, err))
-			continue
-		}
-		r, used = rr, versions[i].Object
-		break
-	}
-	if r == nil {
-		return "", fmt.Errorf("finalize(%q): no checkpoint version holds -- %s", name, strings.Join(refused, "; "))
-	}
-	return assemble(name, sink, r, used, versions, keep)
-}
-
-// assemble makes the file from the version r (object used), and deletes
-// the versions and their objects unless keep.
-func assemble(name string, sink Sink, r *Reader, used string, versions []Version, keep bool) (string, error) {
-	base := name
-	if i := strings.LastIndexByte(name, '/'); i >= 0 {
-		base = name[i+1:]
-	}
-	if r.Name != base {
-		return "", fmt.Errorf("%s: checkpoint names %q, paired with %q -- mispaired, refusing", used, r.Name, name)
-	}
-	for _, m := range r.Manifest {
-		sz, err := sink.Size(m.Name)
-		if err != nil || uint64(sz) != m.Length {
-			return "", fmt.Errorf("%s: missing or wrong size -- cannot finalize", m.Name)
-		}
-	}
-	if err := sink.Assemble(name, r.AssemblyPlan(used)); err != nil {
-		return "", err
-	}
-	if keep {
+	if assembled {
 		return "recovered", nil
 	}
-	if err := deleteCheckpoints(name, sink, versions, used); err != nil {
-		return "", err
+	return "done", nil
+}
+
+// warn, when set, gets each line the core has for the log about an
+// assembly (a newer checkpoint version that was passed over). The
+// stream package sets it to its logger.
+var warn atomic.Pointer[func(text string)]
+
+// SetWarn says where those lines go.
+func SetWarn(f func(text string)) { warn.Store(&f) }
+
+// finish does the steps of one assembly (a PqcFinish) on sink: true
+// when the file was assembled now. An error of the sink ends it; what
+// was done stays done.
+func finish(name string, sink Sink, mode C.int, keep bool, given []byte, object string) (bool, error) {
+	versions, err := CkptVersions(sink, name)
+	if err != nil {
+		return false, err
 	}
-	return "recovered", nil
+	var r C.Report
+	var f *C.PqcFinish
+	cn := C.CString(name)
+	defer C.free(unsafe.Pointer(cn))
+	if C.pqc_finish_new(cn, mode, cbool(keep), &f, &r) != 0 {
+		return false, cerr(&r)
+	}
+	defer C.pqc_finish_free(f)
+	for _, v := range versions {
+		co := C.CString(v.Object)
+		rc := C.pqc_finish_version(f, co, &r)
+		C.free(unsafe.Pointer(co))
+		if rc != 0 {
+			return false, cerr(&r)
+		}
+	}
+	if given != nil {
+		co := C.CString(object)
+		rc := C.pqc_finish_given(f, co, bytesPtr(given), C.size_t(len(given)), &r)
+		C.free(unsafe.Pointer(co))
+		if rc != 0 {
+			return false, cerr(&r)
+		}
+	}
+	for {
+		var step C.PqcFinishStep
+		if C.pqc_finish_next(f, &step, &r) != 0 {
+			return false, cerr(&r)
+		}
+		obj := C.GoString(&step.name[0])
+		switch step.action {
+		case C.PQC_FINISH_DONE:
+			return step.flag != 0, nil
+		case C.PQC_FINISH_STAT:
+			var size int64
+			exists := sink.Exists(obj)
+			if exists && step.flag == 0 {
+				if size, err = sink.Size(obj); err != nil {
+					return false, err
+				}
+			}
+			if C.pqc_finish_has(f, cbool(exists), C.uint64_t(size), &r) != 0 {
+				return false, cerr(&r)
+			}
+			continue
+		case C.PQC_FINISH_READ:
+			raw, err := sink.Get(obj, 0, -1)
+			if err != nil {
+				// not read is not "not a checkpoint": an older version
+				// has fewer rows. The caller tries again later.
+				return false, fmt.Errorf("finalize(%q): reading %s: %w", name, obj, err)
+			}
+			if C.pqc_finish_read(f, bytesPtr(raw), C.size_t(len(raw)), &r) != 0 {
+				return false, cerr(&r)
+			}
+			if w := warn.Load(); w != nil {
+				for i := 0; i < int(r.lines); i++ {
+					(*w)(C.GoString(&r.line[i].text[0]))
+				}
+			}
+			continue
+		case C.PQC_FINISH_ASSEMBLE:
+			sources := make([]Source, 0, int(step.size))
+			for i := C.uint32_t(0); i < C.uint32_t(step.size); i++ {
+				var sn *C.char
+				var off, length C.int64_t
+				if C.pqc_finish_source(f, i, &sn, &off, &length) == 0 {
+					return false, fmt.Errorf("finalize(%q): the core has no source %d", name, int(i))
+				}
+				sources = append(sources, Source{C.GoString(sn), int64(off), int64(length)})
+			}
+			if err := sink.Assemble(obj, sources); err != nil {
+				return false, err
+			}
+		case C.PQC_FINISH_LIST:
+			listed, err := sink.List(obj)
+			if err != nil {
+				return false, err
+			}
+			for _, l := range listed {
+				cl := C.CString(l)
+				rc := C.pqc_finish_listed(f, cl, &r)
+				C.free(unsafe.Pointer(cl))
+				if rc != 0 {
+					return false, cerr(&r)
+				}
+			}
+		case C.PQC_FINISH_DELETE:
+			if err := sink.Delete(obj); err != nil {
+				return false, err
+			}
+		default:
+			return false, fmt.Errorf("finalize(%q): the core asked for step %d, "+
+				"which this host does not have", name, int(step.action))
+		}
+		if C.pqc_finish_did(f, &r) != 0 {
+			return false, cerr(&r)
+		}
+	}
 }
 
 // DeadAfter is how long a writer with this beat must be silent before

@@ -31,7 +31,7 @@ import threading
 import time
 import zlib
 
-from . import _s3
+from . import _core, _s3
 
 #: S3Sink's assemble line (each call's own line is _s3's). The same
 #: logger as _s3's: streaming_parquet attaches its diag file handler.
@@ -207,21 +207,16 @@ def plan_parts(sources, sizes, part_min):
     as one part; such a run takes in sources until it reaches part_min
     or the file ends. A file is its chunks, each at least part_min,
     then its smaller objects and its footer: so the chunks are copied
-    and what follows them travels once, as the last part."""
-    parts, run, run_bytes = [], [], 0
-    for source, size in zip(sources, sizes):
-        if not run and size >= part_min:
-            parts.append(('copy', [source]))
-            continue
-        run.append(source)
-        run_bytes += size
-        if run_bytes >= part_min:
-            parts.append(('upload', run))
-            run, run_bytes = [], 0
-    if run:
-        parts.append(('upload', run))
-    return parts
-MAX_PARTS = 10_000
+    and what follows them travels once, as the last part.
+
+    The rule is the C core's (pqc.h, THE PARTS OF AN ASSEMBLY), and so
+    is S3's limit on the number of parts: SinkError for more."""
+    try:
+        plan = _core.plan_parts(sizes, part_min)
+    except _core.CoreError as e:
+        raise SinkError(str(e)) from None
+    return [('copy' if copy else 'upload', list(sources[first:first + count]))
+            for first, count, copy in plan]
 
 
 class FakeS3:
@@ -320,9 +315,6 @@ class FakeS3:
             sizes = [len(self._objects[name]) if off < 0 else length
                      for name, off, length in sources]
         plan = plan_parts(sources, sizes, self.part_min)
-        if len(plan) > MAX_PARTS:
-            raise SinkError(f"assemble: {len(plan)} parts exceeds "
-                            f"{MAX_PARTS}")
         parts = []
         for i, (kind, group) in enumerate(plan):
             self._op(f"upload_part_copy:{dest}:{i + 1}" if kind == 'copy'
@@ -423,9 +415,6 @@ class S3Sink:
         sizes = [self.size(name) if off < 0 else length
                  for name, off, length in sources]
         plan = plan_parts(sources, sizes, MIN_PART)
-        if len(plan) > MAX_PARTS:
-            raise SinkError(f"assemble: {len(plan)} parts exceeds "
-                            f"{MAX_PARTS}")
         mpu = _s3.timed('create-mpu', key, lambda: self._quick.create_multipart_upload(
             Bucket=self.bucket, Key=key))
         uid = mpu['UploadId']

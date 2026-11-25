@@ -104,6 +104,29 @@ const char *pqc_mirror_doing(const PqcMirror *m);
 int pqc_sweep_local(int final_exists, int has_remote, int keeps_checkpoints);
 int pqc_sweep_remote(int final_exists, int keeps_checkpoints, int in_flight);
 void pqc_test_set_clock(int fixed, double wall, double mono);
+
+typedef struct PqcFinish PqcFinish;
+int pqc_finish_new(const char *name, int mode, int keep_checkpoints,
+                   PqcFinish **out, Report *report);
+void pqc_finish_free(PqcFinish *f);
+int pqc_finish_version(PqcFinish *f, const char *object, Report *report);
+int pqc_finish_given(PqcFinish *f, const char *object, const uint8_t *ckpt,
+                     size_t len, Report *report);
+int pqc_finish_next(PqcFinish *f, PqcMirrorStep *step, Report *report);
+int pqc_finish_has(PqcFinish *f, int exists, uint64_t size, Report *report);
+int pqc_finish_read(PqcFinish *f, const uint8_t *ckpt, size_t len,
+                    Report *report);
+int pqc_finish_listed(PqcFinish *f, const char *object, Report *report);
+int pqc_finish_did(PqcFinish *f, Report *report);
+int pqc_finish_source(const PqcFinish *f, uint32_t index, const char **name,
+                      int64_t *offset, int64_t *length);
+
+typedef struct {
+    uint32_t first, count;
+    int32_t copy;
+} PqcPart;
+int pqc_plan_parts(const uint64_t *sizes, uint32_t n, uint64_t part_min,
+                   PqcPart **out, uint32_t *n_out, Report *report);
 """
 ffi.cdef(_CDEF)
 
@@ -138,8 +161,9 @@ for _name in sorted(set(re.findall(r"\b(pqc_\w+)\s*\(", _CDEF))):
 for _type in ('Report *', 'PqcWriter **', f'char[{NAME_MAX}]',
               'const uint8_t **', 'uint8_t **', 'uint64_t *', 'int64_t *',
               'uint32_t *', 'int *', 'PqcVersions **', 'PqcMirror **',
-              'PqcMirrorStep *', 'char[320]', 'size_t *', 'const char **'):
-    ffi.new(_type)
+              'PqcMirrorStep *', 'char[320]', 'size_t *', 'const char **',
+              'PqcFinish **', 'PqcPart **', 'uint64_t[]'):
+    ffi.new(_type, 1) if _type.endswith('[]') else ffi.new(_type)
 
 
 def dead_after(beat_seconds=0.0):
@@ -449,6 +473,105 @@ def sweep_remote(final_exists, keeps_checkpoints, in_flight):
     return lib.pqc_sweep_remote(int(bool(final_exists)),
                                 int(bool(keeps_checkpoints)),
                                 int(bool(in_flight)))
+
+
+# pqc_finish_new's mode, and PqcFinishAction
+FINISH_ASSEMBLE_FILE, FINISH_DISCARD = 0, 1
+FINISH_READ, FINISH_STAT, FINISH_ASSEMBLE = 1, 2, 3
+FINISH_LIST, FINISH_DELETE, FINISH_DONE = 4, 5, 6
+
+
+class Finish:
+    """The assembly of one file from its checkpoint in one place
+    (PqcFinish): which version, the checks, the sources, and the
+    deletes in their order. The host does each step."""
+
+    def __init__(self, name, mode, keep_checkpoints):
+        self._f = ffi.NULL
+        out = ffi.new('PqcFinish **')
+        r = _report()
+        _check(lib.pqc_finish_new(name.encode('utf-8'), int(mode),
+                                  1 if keep_checkpoints else 0, out, r), r)
+        self._f = out[0]
+        self._step = ffi.new('PqcMirrorStep *')
+
+    def version(self, obj):
+        """The place holds the checkpoint version `obj`."""
+        r = _report()
+        _check(lib.pqc_finish_version(self._f, obj.encode('utf-8'), r), r)
+
+    def given(self, obj, ckpt):
+        """The caller has the newest version's bytes in hand."""
+        r = _report()
+        _check(lib.pqc_finish_given(self._f, obj.encode('utf-8'), ckpt,
+                                    len(ckpt), r), r)
+
+    def next(self):
+        """(action, name, size, flag) of the next step."""
+        r = _report()
+        _check(lib.pqc_finish_next(self._f, self._step, r), r)
+        st = self._step
+        return (st.action, ffi.string(st.name).decode('utf-8'), int(st.size),
+                int(st.flag))
+
+    def has(self, exists, size):
+        r = _report()
+        _check(lib.pqc_finish_has(self._f, 1 if exists else 0, int(size), r), r)
+
+    def read(self, ckpt):
+        """The bytes of the version asked for. Returns the lines for
+        the log, each (level, text)."""
+        r = _report()
+        _check(lib.pqc_finish_read(self._f, ckpt, len(ckpt), r), r)
+        return [(int(r.line[i].level),
+                 ffi.string(r.line[i].text).decode('utf-8', 'replace'))
+                for i in range(r.lines)]
+
+    def listed(self, obj):
+        r = _report()
+        _check(lib.pqc_finish_listed(self._f, obj.encode('utf-8'), r), r)
+
+    def did(self):
+        r = _report()
+        _check(lib.pqc_finish_did(self._f, r), r)
+
+    def sources(self, count):
+        """The sources of the ASSEMBLE step: [(name, offset, length)],
+        offset and length -1 for a whole object."""
+        name = ffi.new('const char **')
+        off = ffi.new('int64_t *')
+        length = ffi.new('int64_t *')
+        out = []
+        for i in range(count):
+            if not lib.pqc_finish_source(self._f, i, name, off, length):
+                raise CoreError(f"the assembly has no source {i}")
+            out.append((ffi.string(name[0]).decode('utf-8'), int(off[0]),
+                        int(length[0])))
+        return out
+
+    def free(self):
+        if self._f != ffi.NULL:
+            lib.pqc_finish_free(self._f)
+            self._f = ffi.NULL
+
+    def __del__(self):
+        self.free()
+
+
+def plan_parts(sizes, part_min):
+    """The parts of a multipart assembly of sources of these sizes
+    (pqc_plan_parts): [(first, count, copy)]."""
+    n = len(sizes)
+    arr = ffi.new('uint64_t[]', [int(x) for x in sizes] or 1)
+    out = ffi.new('PqcPart **')
+    n_out = ffi.new('uint32_t *')
+    r = _report()
+    _check(lib.pqc_plan_parts(arr, n, int(part_min), out, n_out, r), r)
+    try:
+        return [(int(out[0][i].first), int(out[0][i].count),
+                 bool(out[0][i].copy)) for i in range(n_out[0])]
+    finally:
+        lib.pqc_free(out[0])
 
 
 def test_set_clock(wall, mono):

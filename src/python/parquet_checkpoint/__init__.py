@@ -63,6 +63,7 @@ import zlib
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from . import _core
 from ._sinks import DirSink, FakeS3, S3Sink, SubSink, SinkError  # noqa: F401
 
 __all__ = ['CheckpointWriter', 'CheckpointReader', 'finalize',
@@ -600,86 +601,88 @@ def finalize(name, sink, ckpt_bytes=None, ckpt_object=None,
     `ckpt_bytes`, `ckpt_object`: the newest version's bytes and object
     name when the caller just put them there (a Shipper); the read-back
     is then skipped. `keep_checkpoints`: leave the chunks and versions
-    for readers that were told of them; discard_checkpoints() later."""
+    for readers that were told of them; discard_checkpoints() later.
+
+    The rules are the C core's (src/core/pqc.h, THE ASSEMBLY OF A
+    FILE): which version, the checks, the sources and the order of the
+    deletes. This does each step the core asks, on `sink`."""
+    given = None if ckpt_bytes is None else (ckpt_object, bytes(ckpt_bytes))
+    assembled = _finish(name, sink, _core.FINISH_ASSEMBLE_FILE,
+                        keep_checkpoints, given)
+    return ('recovered' if assembled else 'done', name)
+
+
+def _finish(name, sink, mode, keep_checkpoints=False, given=None):
+    """The steps of one PqcFinish on `sink`. True when the file was
+    assembled now. CheckpointError for what the core refuses; a failure
+    of the sink is raised as it is: what was done stays done."""
     import logging as _logging
-    versions = ckpt_versions(sink, name)
-    if ckpt_bytes is None:
-        if not versions:
-            if sink.exists(name):
-                return ('done', name)
-            raise CheckpointError(f"finalize({name!r}): nothing there")
-        if sink.exists(name):
-            raise CheckpointError(
-                f"{name}: BOTH final and checkpoint exist -- refusing to guess")
-        r, refused = None, []
-        for _seq, obj in reversed(versions):
-            try:
-                r = CheckpointReader(obj, sink)
-                break
-            except CheckpointError as e:
-                refused.append(f"{obj}: {e}")
-        if r is None:
-            raise CheckpointError(
-                f"finalize({name!r}): no checkpoint version holds -- "
-                + "; ".join(refused))
-        if refused:
-            _logging.getLogger('parquet_checkpoint').warning(
-                f"finalize {name}: newer version(s) refused, assembling "
-                f"from {r._ckpt_name}: " + "; ".join(refused))
-    else:
-        r = CheckpointReader(bytes(ckpt_bytes), sink, ckpt_name=ckpt_object)
-    used = r._ckpt_name
-    if r.name != name.split('/')[-1]:
-        raise CheckpointError(
-            f"{used}: checkpoint names {r.name!r}, paired with "
-            f"{name!r} -- mispaired, refusing")
     import time as _time
-    t0 = _time.monotonic()
-    for cname, length, crc in r.manifest:
-        if not sink.exists(cname) or sink.size(cname) != length:
-            raise CheckpointError(f"{cname}: missing or wrong size -- "
-                                  f"cannot finalize")
-    t_verify = _time.monotonic() - t0
-    t0 = _time.monotonic()
-    sink.assemble(name, r.assembly_plan())
-    t_assemble = _time.monotonic() - t0
-    # Delete every chunk under the prefix, including any newer chunk a
-    # crash left unreferenced by this checkpoint (dead bytes).
-    t0 = _time.monotonic()
-    if not keep_checkpoints:
-        _delete_checkpoints(name, sink, versions, used)
-    t_cleanup = _time.monotonic() - t0
-    total = t_verify + t_assemble + t_cleanup
-    if total >= FINALIZE_SLOW_S or getattr(sink, 'trace', False):
-        _logging.getLogger('parquet_checkpoint').info(
+    log = _logging.getLogger('parquet_checkpoint')
+    spent = {'verify': 0.0, 'assemble': 0.0, 'cleanup': 0.0}
+    chunks = 0
+    try:
+        f = _core.Finish(name, mode, keep_checkpoints)
+    except _core.CoreError as e:
+        raise CheckpointError(str(e)) from None
+    try:
+        for _seq, obj in ckpt_versions(sink, name):
+            f.version(obj)
+        if given is not None:
+            f.given(*given)
+        while True:
+            action, obj, size, flag = f.next()
+            if action == _core.FINISH_DONE:
+                break
+            t0 = _time.monotonic()
+            if action == _core.FINISH_STAT:
+                exists = sink.exists(obj)
+                if flag:                # the finished file
+                    f.has(exists, 0)
+                    continue
+                chunks += 1
+                try:
+                    f.has(exists, sink.size(obj) if exists else 0)
+                finally:
+                    spent['verify'] += _time.monotonic() - t0
+                continue
+            if action == _core.FINISH_READ:
+                for level, text in f.read(sink.get(obj)):
+                    log.log(_logging.WARNING if level >= 2 else _logging.INFO,
+                            text)
+                continue
+            if action == _core.FINISH_ASSEMBLE:
+                sink.assemble(obj, f.sources(size))
+                spent['assemble'] += _time.monotonic() - t0
+            elif action == _core.FINISH_LIST:
+                for cname in sink.list(obj):
+                    f.listed(cname)
+                spent['cleanup'] += _time.monotonic() - t0
+            elif action == _core.FINISH_DELETE:
+                sink.delete(obj)
+                spent['cleanup'] += _time.monotonic() - t0
+            f.did()
+    except _core.CoreError as e:
+        raise CheckpointError(str(e)) from None
+    finally:
+        f.free()
+    total = sum(spent.values())
+    if flag and (total >= FINALIZE_SLOW_S or getattr(sink, 'trace', False)):
+        log.info(
             f"finalize {name} on {getattr(sink, 'uri', type(sink).__name__)}: "
-            f"{total:.3f}s (verify {t_verify:.3f}s, {len(r.manifest)} chunk(s); "
-            f"assemble {t_assemble:.3f}s; cleanup {t_cleanup:.3f}s)"
+            f"{total:.3f}s (verify {spent['verify']:.3f}s, {chunks} chunk(s); "
+            f"assemble {spent['assemble']:.3f}s; cleanup "
+            f"{spent['cleanup']:.3f}s)"
             f"{' SLOW' if total >= FINALIZE_SLOW_S else ''}")
-    return ('recovered', name)
-
-
-def _delete_checkpoints(name, sink, versions, last):
-    for cname in sink.list(name + '.chunks/'):
-        sink.delete(cname)
-    for _seq, obj in versions:
-        if obj != last:
-            sink.delete(obj)
-    if last is not None:
-        sink.delete(last)                # last act
+    return bool(flag)
 
 
 def discard_checkpoints(name, sink):
     """Delete a finished file's chunks and checkpoint versions, kept by
     finalize(keep_checkpoints=True) while readers were told of them.
-    Refuses unless the final file exists."""
-    if not sink.exists(name):
-        raise CheckpointError(
-            f"discard_checkpoints({name!r}): the final file does not "
-            f"exist -- the checkpoints are its only copy")
-    versions = ckpt_versions(sink, name)
-    _delete_checkpoints(name, sink, versions,
-                        versions[-1][1] if versions else None)
+    Refuses unless the final file exists. The order of the deletes is
+    the C core's, the same as finalize's."""
+    _finish(name, sink, _core.FINISH_DISCARD)
 
 
 #: A finalize at or over this many seconds logs its phase breakdown.

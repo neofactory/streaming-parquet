@@ -1,8 +1,10 @@
-/* pqc_mirror.c -- the checkpoint core's rules for checkpoint versions
- * and for the mirror of a file from a local copy to a remote one.
- * pqc.h is the spec (CHECKPOINT VERSIONS, THE MIRROR, THE SWEEP AT
- * START). No input, no output, no waiting: the host stores, copies and
- * deletes; this says what, and in which order.
+/* pqc_mirror.c -- the checkpoint core's rules for checkpoint versions,
+ * for the mirror of a file from a local copy to a remote one, for the
+ * assembly of a file from its checkpoint, and for the parts of a
+ * multipart assembly. pqc.h is the spec (CHECKPOINT VERSIONS, THE
+ * MIRROR, THE SWEEP AT START, THE ASSEMBLY OF A FILE, THE PARTS OF AN
+ * ASSEMBLY). No input, no output, no waiting: the host stores, copies
+ * and deletes; this says what, and in which order.
  */
 #include "pqc.h"
 
@@ -43,9 +45,16 @@ static int names_find(const Names *a, const char *name) {
     return -1;
 }
 
+static int names_push(Names *a, const char *name);
+
 /* 0, or -1 when memory is out. A name already there is not added again. */
 static int names_add(Names *a, const char *name) {
     if (names_find(a, name) >= 0) return 0;
+    return names_push(a, name);
+}
+
+/* 0, or -1 when memory is out. The name is added at the end. */
+static int names_push(Names *a, const char *name) {
     if (a->n == a->cap) {
         int32_t cap = a->cap ? a->cap * 2 : 8;
         char **s = realloc(a->s, (size_t)cap * sizeof *s);
@@ -693,4 +702,422 @@ int pqc_sweep_remote(int final_exists, int keeps_checkpoints, int in_flight) {
     /* its local file was assembled and the crash came before the
      * remote one: a mirror finishes it from the remote's own objects */
     return in_flight ? PQC_SWEEP_NOTHING : PQC_SWEEP_MIRROR;
+}
+
+/* ---- the assembly of a file ---------------------------------------------- */
+
+enum {
+    FIN_START = 0,
+    FIN_FINAL,          /* is the finished file there? */
+    FIN_READ,           /* the versions, the newest first */
+    FIN_OBJECTS,        /* each object the version names: there, whole? */
+    FIN_ASSEMBLE,
+    FIN_LIST,           /* the objects under the file's prefix */
+    FIN_DELETE,
+    FIN_DONE
+};
+
+typedef struct {
+    int64_t seq;
+    char object[PQC_OBJECT_MAX];
+} FinVersion;
+
+struct PqcFinish {
+    char name[PQC_NAME_MAX];
+    int mode, keep;
+    FinVersion *version;          /* the versions the place holds, oldest first */
+    int32_t n_versions, cap_versions;
+    int sorted;
+    uint8_t *raw;                 /* the bytes of the version in use */
+    PqcReader *reader;            /* over raw */
+    char used[PQC_OBJECT_MAX];    /* its object name */
+    int given;                    /* the caller gave it: no read */
+    int32_t at;                   /* the version to read */
+    char refused[REPORT_LINE_TEXT - 192];
+    uint32_t idx;                 /* the object to ask about */
+    Names todo;                   /* the deletes, in order */
+    int32_t del;
+    int phase;
+    int asked;                    /* the action of the step not yet answered */
+    int assembled;
+};
+
+static int version_order(const void *a, const void *b) {
+    const FinVersion *x = a, *y = b;
+    if (x->seq != y->seq) return x->seq < y->seq ? -1 : 1;
+    return strcmp(x->object, y->object);
+}
+
+int pqc_finish_new(const char *name, int mode, int keep_checkpoints,
+                   PqcFinish **out, Report *report) {
+    if (!report_begin(report)) return REPORT_INVALID;
+    if (out) *out = NULL;
+    if (!name || !out)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_finish_new: a NULL argument");
+    if (mode != PQC_FINISH_ASSEMBLE_FILE && mode != PQC_FINISH_DISCARD)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_finish_new: mode %d is not one", mode);
+    if (strlen(name) >= PQC_NAME_MAX)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_finish_new: the file's name is longer than "
+                           "%d bytes", PQC_NAME_MAX - 1);
+    PqcFinish *f = calloc(1, sizeof *f);
+    if (!f) return no_memory(report);
+    snprintf(f->name, sizeof f->name, "%s", name);
+    f->mode = mode;
+    f->keep = keep_checkpoints != 0;
+    *out = f;
+    return REPORT_OK;
+}
+
+void pqc_finish_free(PqcFinish *f) {
+    if (!f) return;
+    free(f->version);
+    free(f->raw);
+    pqc_reader_free(f->reader);
+    names_free(&f->todo);
+    free(f);
+}
+
+int pqc_finish_version(PqcFinish *f, const char *object, Report *report) {
+    if (!report_begin(report)) return REPORT_INVALID;
+    if (!f || !object)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_finish_version: a NULL argument");
+    if (f->phase != FIN_START)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_finish_version: the steps have begun");
+    char of[PQC_OBJECT_MAX];
+    int64_t seq;
+    if (!pqc_ckpt_object_parse(object, of, &seq) || strcmp(of, f->name) != 0)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_finish_version: %.200s is not a checkpoint "
+                           "version of %.200s", object, f->name);
+    if (f->n_versions == f->cap_versions) {
+        int32_t cap = f->cap_versions ? f->cap_versions * 2 : 4;
+        FinVersion *v = realloc(f->version, (size_t)cap * sizeof *v);
+        if (!v) return no_memory(report);
+        f->version = v;
+        f->cap_versions = cap;
+    }
+    FinVersion *v = &f->version[f->n_versions++];
+    v->seq = seq;
+    snprintf(v->object, sizeof v->object, "%s", object);
+    return REPORT_OK;
+}
+
+/* The bytes are the version in use from now: they must be a checkpoint
+ * of this file. */
+static int fin_use(PqcFinish *f, const char *object, const uint8_t *ckpt,
+                   size_t len, Report *report) {
+    PqcReader *r = NULL;
+    Report inner;
+    if (pqc_reader_open(ckpt, len, &r, &inner) != REPORT_OK)
+        return report_fail(report, inner.status, "%s", inner.error);
+    uint8_t *raw = malloc(len ? len : 1);
+    if (!raw) {
+        pqc_reader_free(r);
+        return no_memory(report);
+    }
+    memcpy(raw, ckpt, len);
+    pqc_reader_free(f->reader);
+    free(f->raw);
+    f->reader = r;
+    f->raw = raw;
+    snprintf(f->used, sizeof f->used, "%s", object);
+    return REPORT_OK;
+}
+
+int pqc_finish_given(PqcFinish *f, const char *object, const uint8_t *ckpt,
+                     size_t len, Report *report) {
+    if (!report_begin(report)) return REPORT_INVALID;
+    if (!f || !object || !ckpt)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_finish_given: a NULL argument");
+    if (f->phase != FIN_START || f->mode != PQC_FINISH_ASSEMBLE_FILE)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_finish_given: not before the first step of "
+                           "an assembly");
+    if (strlen(object) >= PQC_OBJECT_MAX)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_finish_given: the version's name is longer "
+                           "than %d bytes", PQC_OBJECT_MAX - 1);
+    Report inner;
+    if (fin_use(f, object, ckpt, len, &inner) != REPORT_OK)
+        return report_fail(report, inner.status, "%.200s: %s", object,
+                           inner.error);
+    f->given = 1;
+    return REPORT_OK;
+}
+
+/* The version in use names this file, or the report says it does not. */
+static int fin_paired(const PqcFinish *f, Report *report) {
+    const char *named = pqc_reader_name(f->reader);
+    if (strcmp(named, base_name(f->name)) == 0) return REPORT_OK;
+    return report_fail(report, REPORT_REFUSED,
+                       "%.200s: checkpoint names '%.100s', paired with "
+                       "'%.100s' -- mispaired, refusing",
+                       f->used, named, f->name);
+}
+
+/* The deletes, in their order: the objects the host listed are in todo
+ * already; then every version but the one in use; then that one. */
+static int fin_plan_deletes(PqcFinish *f) {
+    for (int32_t i = 0; i < f->n_versions; i++)
+        if (strcmp(f->version[i].object, f->used) != 0 &&
+            names_push(&f->todo, f->version[i].object))
+            return -1;
+    if (f->used[0] && names_push(&f->todo, f->used)) return -1;
+    return 0;
+}
+
+int pqc_finish_next(PqcFinish *f, PqcFinishStep *step, Report *report) {
+    if (!report_begin(report)) return REPORT_INVALID;
+    if (!f || !step)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_finish_next: a NULL argument");
+    step_set(step, PQC_FINISH_DONE, NULL, 0, 0);
+    f->asked = 0;
+    for (;;) {
+        switch (f->phase) {
+        case FIN_START:
+            if (!f->sorted) {
+                if (f->n_versions)
+                    qsort(f->version, (size_t)f->n_versions,
+                          sizeof *f->version, version_order);
+                f->sorted = 1;
+            }
+            if (f->given) {
+                if (fin_paired(f, report) != REPORT_OK) return report->status;
+                f->phase = FIN_OBJECTS;
+                continue;
+            }
+            f->phase = FIN_FINAL;
+            continue;
+        case FIN_FINAL:
+            step_set(step, PQC_FINISH_STAT, f->name, 0, 1);
+            break;
+        case FIN_READ:
+            step_set(step, PQC_FINISH_READ, f->version[f->at].object, 0, 0);
+            break;
+        case FIN_OBJECTS: {
+            if (f->idx >= pqc_reader_n_chunks(f->reader)) {
+                f->phase = FIN_ASSEMBLE;
+                continue;
+            }
+            const char *name;
+            uint64_t length;
+            uint32_t crc;
+            pqc_reader_chunk(f->reader, f->idx, &name, &length, &crc);
+            step_set(step, PQC_FINISH_STAT, name, length, 0);
+            break;
+        }
+        case FIN_ASSEMBLE:
+            step_set(step, PQC_FINISH_ASSEMBLE, f->name,
+                     (uint64_t)pqc_reader_n_chunks(f->reader) + 1, 0);
+            break;
+        case FIN_LIST: {
+            char prefix[PQC_OBJECT_MAX];
+            snprintf(prefix, sizeof prefix, "%s.chunks/", f->name);
+            step_set(step, PQC_FINISH_LIST, prefix, 0, 0);
+            break;
+        }
+        case FIN_DELETE:
+            if (f->del >= f->todo.n) {
+                f->phase = FIN_DONE;
+                continue;
+            }
+            step_set(step, PQC_FINISH_DELETE, f->todo.s[f->del], 0, 0);
+            break;
+        default:
+            step_set(step, PQC_FINISH_DONE, f->name, 0, f->assembled);
+            return REPORT_OK;
+        }
+        f->asked = step->action;
+        return REPORT_OK;
+    }
+}
+
+int pqc_finish_has(PqcFinish *f, int exists, uint64_t size, Report *report) {
+    if (!report_begin(report)) return REPORT_INVALID;
+    if (!f)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_finish_has: a NULL argument");
+    if (f->asked != PQC_FINISH_STAT)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_finish_has: no object was asked about");
+    f->asked = 0;
+    if (f->phase == FIN_OBJECTS) {
+        const char *name;
+        uint64_t length;
+        uint32_t crc;
+        pqc_reader_chunk(f->reader, f->idx, &name, &length, &crc);
+        if (!exists || size != length)
+            return report_fail(report, REPORT_REFUSED,
+                               "%.300s: missing or wrong size -- cannot "
+                               "finalize", name);
+        f->idx++;
+        return REPORT_OK;
+    }
+    /* the finished file */
+    if (f->mode == PQC_FINISH_DISCARD) {
+        if (!exists)
+            return report_fail(report, REPORT_REFUSED,
+                               "discard_checkpoints('%.200s'): the final "
+                               "file does not exist -- the checkpoints are "
+                               "its only copy", f->name);
+        if (f->n_versions)
+            snprintf(f->used, sizeof f->used, "%s",
+                     f->version[f->n_versions - 1].object);
+        f->phase = FIN_LIST;
+        return REPORT_OK;
+    }
+    if (!f->n_versions) {
+        if (!exists)
+            return report_fail(report, REPORT_REFUSED,
+                               "finalize('%.200s'): nothing there", f->name);
+        f->phase = FIN_DONE;            /* it was finished before */
+        return REPORT_OK;
+    }
+    if (exists)
+        return report_fail(report, REPORT_REFUSED,
+                           "%.200s: BOTH final and checkpoint exist -- "
+                           "refusing to guess", f->name);
+    f->at = f->n_versions - 1;
+    f->phase = FIN_READ;
+    return REPORT_OK;
+}
+
+int pqc_finish_read(PqcFinish *f, const uint8_t *ckpt, size_t len,
+                    Report *report) {
+    if (!report_begin(report)) return REPORT_INVALID;
+    if (!f || (!ckpt && len))
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_finish_read: a NULL argument");
+    if (!ckpt) ckpt = (const uint8_t *)"";      /* an empty object */
+    if (f->asked != PQC_FINISH_READ)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_finish_read: no version was asked for");
+    f->asked = 0;
+    const char *object = f->version[f->at].object;
+    Report inner;
+    int rc = fin_use(f, object, ckpt, len, &inner);
+    if (rc == REPORT_NO_MEMORY) return no_memory(report);
+    if (rc != REPORT_OK) {
+        /* not a checkpoint: say so, and go to the version before it */
+        size_t n = strlen(f->refused);
+        snprintf(f->refused + n, sizeof f->refused - n, "%s%.200s: %s",
+                 n ? "; " : "", object, inner.error);
+        if (f->at == 0)
+            return report_fail(report, REPORT_REFUSED,
+                               "finalize('%.100s'): no checkpoint version "
+                               "holds -- %.300s", f->name, f->refused);
+        f->at--;
+        return REPORT_OK;
+    }
+    if (fin_paired(f, report) != REPORT_OK) return report->status;
+    if (f->refused[0])
+        report_line(report, &g_clock, REPORT_WARNING,
+                    "finalize %.200s: newer version(s) refused, assembling "
+                    "from %.200s: %s", f->name, f->used, f->refused);
+    f->phase = FIN_OBJECTS;
+    return REPORT_OK;
+}
+
+int pqc_finish_source(const PqcFinish *f, uint32_t index, const char **name,
+                      int64_t *offset, int64_t *length) {
+    if (!f || !f->reader || !name || !offset || !length) return 0;
+    uint32_t n = pqc_reader_n_chunks(f->reader);
+    if (index < n) {
+        uint64_t len;
+        uint32_t crc;
+        pqc_reader_chunk(f->reader, index, name, &len, &crc);
+        *offset = -1;                   /* the object, whole */
+        *length = -1;
+        return 1;
+    }
+    if (index > n) return 0;
+    uint64_t off, len;
+    pqc_reader_data(f->reader, &off, &len);
+    *name = f->used;
+    *offset = (int64_t)off;
+    *length = (int64_t)len;
+    return 1;
+}
+
+int pqc_finish_listed(PqcFinish *f, const char *object, Report *report) {
+    if (!report_begin(report)) return REPORT_INVALID;
+    if (!f || !object)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_finish_listed: a NULL argument");
+    if (f->asked != PQC_FINISH_LIST)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_finish_listed: no list was asked for");
+    if (names_push(&f->todo, object)) return no_memory(report);
+    return REPORT_OK;
+}
+
+int pqc_finish_did(PqcFinish *f, Report *report) {
+    if (!report_begin(report)) return REPORT_INVALID;
+    if (!f)
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_finish_did: a NULL argument");
+    switch (f->asked) {
+    case PQC_FINISH_ASSEMBLE:
+        f->assembled = 1;
+        f->phase = f->keep ? FIN_DONE : FIN_LIST;
+        break;
+    case PQC_FINISH_LIST:
+        if (fin_plan_deletes(f)) return no_memory(report);
+        f->phase = FIN_DELETE;
+        break;
+    case PQC_FINISH_DELETE:
+        f->del++;
+        break;
+    default:
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_finish_did: no step to do was given");
+    }
+    f->asked = 0;
+    return REPORT_OK;
+}
+
+/* ---- the parts of an assembly -------------------------------------------- */
+
+int pqc_plan_parts(const uint64_t *sizes, uint32_t n, uint64_t part_min,
+                   PqcPart **out, uint32_t *n_out, Report *report) {
+    if (!report_begin(report)) return REPORT_INVALID;
+    if (out) *out = NULL;
+    if (n_out) *n_out = 0;
+    if (!out || !n_out || (n && !sizes))
+        return report_fail(report, REPORT_INVALID,
+                           "pqc_plan_parts: a NULL argument");
+    PqcPart *part = malloc((n ? n : 1) * sizeof *part);
+    if (!part) return no_memory(report);
+    uint32_t parts = 0, run = 0;        /* run: the sources of the open part */
+    uint64_t run_bytes = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!run && sizes[i] >= part_min) {
+            part[parts++] = (PqcPart){.first = i, .count = 1, .copy = 1};
+            continue;
+        }
+        run++;
+        run_bytes += sizes[i];
+        if (run_bytes >= part_min) {
+            part[parts++] = (PqcPart){.first = i + 1 - run, .count = run};
+            run = 0;
+            run_bytes = 0;
+        }
+    }
+    if (run) part[parts++] = (PqcPart){.first = n - run, .count = run};
+    if (parts > PQC_MAX_PARTS) {
+        free(part);
+        return report_fail(report, REPORT_REFUSED,
+                           "assemble: %u parts exceeds %d", parts,
+                           PQC_MAX_PARTS);
+    }
+    *out = part;
+    *n_out = parts;
+    return REPORT_OK;
 }

@@ -1,5 +1,11 @@
 package pqc
 
+/*
+#include <stdlib.h>
+#include "pqc.h"
+*/
+import "C"
+
 import (
 	"bytes"
 	"context"
@@ -9,6 +15,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"unsafe"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -18,9 +25,10 @@ import (
 
 const (
 	// S3's multipart rules: every part but the last is at least MinPart,
-	// and an assembly has at most MaxParts parts.
-	MinPart  = 5 << 20
-	MaxParts = 10_000
+	// and an assembly has at most MaxParts parts (the core's
+	// PQC_PART_MIN and PQC_MAX_PARTS).
+	MinPart  = C.PQC_PART_MIN
+	MaxParts = C.PQC_MAX_PARTS
 )
 
 // S3Sink is the real thing, the same contract as the Python S3Sink: put,
@@ -138,34 +146,29 @@ type part struct {
 }
 
 // planParts groups the sources of an assembly into parts under S3's
-// rule: every part but the last is at least partMin. S3 copies a part
-// server-side from one object, and it cannot join small objects. A
-// source of at least partMin is copied as a part of its own. Smaller
-// sources that follow one another are fetched and uploaded together as
-// one part; such a run takes in sources until it reaches partMin or
-// the file ends. A file is its chunks, each at least partMin, then its
-// smaller objects and its footer: so the chunks are copied and what
-// follows them travels once, as the last part. (The Python plan_parts.)
-func planParts(sources []Source, sizes []int64, partMin int64) []part {
-	var parts []part
-	var run []Source
-	var runBytes int64
-	for i, src := range sources {
-		if len(run) == 0 && sizes[i] >= partMin {
-			parts = append(parts, part{copy: true, sources: []Source{src}})
-			continue
-		}
-		run = append(run, src)
-		runBytes += sizes[i]
-		if runBytes >= partMin {
-			parts = append(parts, part{sources: run})
-			run, runBytes = nil, 0
-		}
+// rules. The grouping is the core's (pqc.h: THE PARTS OF AN ASSEMBLY),
+// the same one the Python plan_parts uses: a source of at least
+// partMin is copied on the server as a part of its own, and a run of
+// smaller sources is fetched and uploaded as one part. An error for
+// more parts than S3 takes.
+func planParts(sources []Source, sizes []int64, partMin int64) ([]part, error) {
+	var r C.Report
+	var out *C.PqcPart
+	var n C.uint32_t
+	var first *C.uint64_t
+	if len(sizes) > 0 {
+		first = (*C.uint64_t)(unsafe.Pointer(&sizes[0]))
 	}
-	if len(run) > 0 {
-		parts = append(parts, part{sources: run})
+	if C.pqc_plan_parts(first, C.uint32_t(len(sizes)), C.uint64_t(partMin), &out, &n, &r) != 0 {
+		return nil, cerr(&r)
 	}
-	return parts
+	defer C.pqc_free(unsafe.Pointer(out))
+	parts := make([]part, 0, int(n))
+	for _, p := range unsafe.Slice(out, int(n)) {
+		parts = append(parts, part{copy: p.copy != 0,
+			sources: sources[int(p.first) : int(p.first)+int(p.count)]})
+	}
+	return parts, nil
 }
 
 // Assemble builds dest from the sources as one multipart upload. The
@@ -186,9 +189,9 @@ func (s *S3Sink) Assemble(dest string, sources []Source) (err error) {
 			sizes[i] = src.Length
 		}
 	}
-	plan := planParts(sources, sizes, MinPart)
-	if len(plan) > MaxParts {
-		return fmt.Errorf("assemble %s: %d parts exceeds %d", dest, len(plan), MaxParts)
+	plan, err := planParts(sources, sizes, MinPart)
+	if err != nil {
+		return fmt.Errorf("assemble %s: %w", dest, err)
 	}
 	key := s.key(dest)
 	mpu, err := s.client.CreateMultipartUpload(s.ctx, &s3.CreateMultipartUploadInput{Bucket: aws.String(s.Bucket), Key: aws.String(key)})

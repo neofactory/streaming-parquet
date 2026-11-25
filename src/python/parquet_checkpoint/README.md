@@ -98,6 +98,10 @@ r.open() -> CheckpointFile            # the live file as a read-only
                                       #   read by exact ranges (page
                                       #   checksums are the guard).
 
+# The assembly's rules (which version, the checks, the sources, the
+# order of the deletes) are the C core's: src/core/pqc.h, THE ASSEMBLY
+# OF A FILE; so are the parts of a multipart assembly in a bucket (THE
+# PARTS OF AN ASSEMBLY). The Go host's pqc.Finalize follows the same.
 finalize(name, sink) -> (status, name)   # checkpoint -> ordinary .parquet;
                                          # idempotent; ckpt deleted last
 recover_directory(sink_or_dir)           # the boot sweep

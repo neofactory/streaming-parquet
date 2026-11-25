@@ -40,6 +40,7 @@ INT_WITHOUT_REPORT = {
     "pqc_ckpt_object_parse": "a yes or no, with the parts of the name",
     "pqc_versions_names": "a yes or no",
     "pqc_mirror_shipped": "1 and the values, or 0 for none",
+    "pqc_finish_source": "1 and the values, or 0 past the last",
     "pqc_sweep_local": "what to do with a file",
     "pqc_sweep_remote": "what to do with a file",
     # sp.h: reads of a ticket, a plan, a store, a reader, a view

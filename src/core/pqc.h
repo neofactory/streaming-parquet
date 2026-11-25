@@ -388,6 +388,142 @@ int pqc_sweep_local(int final_exists, int has_remote, int keeps_checkpoints);
  * mirror (the local sweep found it). */
 int pqc_sweep_remote(int final_exists, int keeps_checkpoints, int in_flight);
 
+/* ---- the assembly of a file ---------------------------------------------- */
+
+/* THE ASSEMBLY OF A FILE. A file's checkpoint becomes the ordinary
+ * .parquet file in one place (a directory, a bucket), from the objects
+ * that place holds. Anyone can do it, at any time, any number of
+ * times: the writer at its close, a mirror, the sweep at start. One
+ * PqcFinish for one assembly. The host lists, reads, assembles and
+ * deletes; the rules are here:
+ *
+ *   WHICH VERSION. The newest version the place holds whose bytes are
+ *   a checkpoint (the magic, the format's version, the CRC). A newer
+ *   version that is not one is passed over, with a line for the log. A
+ *   version the host could not READ is not passed over: the host ends
+ *   the assembly, and tries again later. (An older version has fewer
+ *   rows, and the deletes below would take the newer one away.)
+ *
+ *   THE CHECKS, each a refusal:
+ *     - no version, and no finished file: nothing is there
+ *     - a version and the finished file, both: someone must look
+ *     - the version names another file
+ *     - an object the version names is not there, or not whole
+ *
+ *   THE DELETES, after the file is assembled, in this order: every
+ *   object under <name>.chunks/ (also one that no version names: a
+ *   crash left it); every version but the one in use; the version in
+ *   use, last. So while any of them is left, a version that can make
+ *   the file again is left. With keep_checkpoints nothing is deleted:
+ *   readers were told of the versions; PQC_FINISH_DISCARD deletes them
+ *   later, in the same order, and refuses when the finished file is
+ *   not there.
+ *
+ * The calls, in order: pqc_finish_new; pqc_finish_version for each
+ * checkpoint version the place holds (any order); pqc_finish_given
+ * when the caller has the newest version's bytes (it stored them
+ * there); then pqc_finish_next and the answer to each step, until
+ * DONE. A step that fails in the host, or an answer that is refused,
+ * ends the assembly: free it. What was done stays done. */
+typedef struct PqcFinish PqcFinish;
+
+enum { PQC_FINISH_ASSEMBLE_FILE = 0, PQC_FINISH_DISCARD = 1 };  /* mode */
+
+typedef enum {
+    PQC_FINISH_READ = 1,          /* read the version `name`; give its
+                                     bytes to pqc_finish_read */
+    PQC_FINISH_STAT = 2,          /* does the place hold `name`, and how
+                                     many bytes? Answer with
+                                     pqc_finish_has. flag 1: the finished
+                                     file; only whether it is there
+                                     matters. flag 0: an object, `size`
+                                     the bytes it must have. */
+    PQC_FINISH_ASSEMBLE = 3,      /* make the file `name` from `size`
+                                     sources, in order
+                                     (pqc_finish_source); it appears
+                                     whole or not at all */
+    PQC_FINISH_LIST = 4,          /* list the objects whose names begin
+                                     with `name`: pqc_finish_listed for
+                                     each, then pqc_finish_did */
+    PQC_FINISH_DELETE = 5,        /* delete the object `name` */
+    PQC_FINISH_DONE = 6           /* over. flag 1: the file was assembled
+                                     now; flag 0: it was not (it was
+                                     there already, or this was a
+                                     discard) */
+} PqcFinishAction;
+
+typedef PqcMirrorStep PqcFinishStep;
+
+/* name: the file's name in the place. REPORT_INVALID for a mode that
+ * is not one, or a name that does not fit. */
+int pqc_finish_new(const char *name, int mode, int keep_checkpoints,
+                   PqcFinish **out, Report *report);
+void pqc_finish_free(PqcFinish *f);
+
+/* The place holds the checkpoint version `object`. REPORT_INVALID
+ * when it is not a version of this file, or after the first step. */
+int pqc_finish_version(PqcFinish *f, const char *object, Report *report);
+
+/* The newest version, `object`, has the bytes ckpt: the caller stored
+ * it. The assembly uses it, reads no version, and does not ask
+ * whether the finished file is there. REPORT_REFUSED when the bytes
+ * are not a checkpoint. */
+int pqc_finish_given(PqcFinish *f, const char *object, const uint8_t *ckpt,
+                     size_t len, Report *report);
+
+/* The next step. The same step is given again until the host answers
+ * it: pqc_finish_read for READ, pqc_finish_has for STAT, pqc_finish_did
+ * for the others. DONE needs no answer. REPORT_REFUSED when a check
+ * fails. */
+int pqc_finish_next(PqcFinish *f, PqcFinishStep *step, Report *report);
+
+/* The answer to STAT. REPORT_REFUSED when a check fails on it. */
+int pqc_finish_has(PqcFinish *f, int exists, uint64_t size, Report *report);
+/* The answer to READ: the version's bytes. Bytes that are not a
+ * checkpoint are no failure while an older version is left: the next
+ * step reads that one. REPORT_REFUSED when no version holds, or the
+ * version names another file. */
+int pqc_finish_read(PqcFinish *f, const uint8_t *ckpt, size_t len,
+                    Report *report);
+/* During LIST: one object of the list. */
+int pqc_finish_listed(PqcFinish *f, const char *object, Report *report);
+/* The step was done. */
+int pqc_finish_did(PqcFinish *f, Report *report);
+
+/* The index-th source (from 0) of the ASSEMBLE step: the object, and
+ * the bytes of it to take. offset -1: the whole object. 1 and the
+ * values, or 0 past the last. The name holds until the assembly is
+ * freed. */
+int pqc_finish_source(const PqcFinish *f, uint32_t index, const char **name,
+                      int64_t *offset, int64_t *length);
+
+/* ---- the parts of an assembly -------------------------------------------- */
+
+/* THE PARTS OF AN ASSEMBLY. A bucket makes one object from others as a
+ * multipart upload, under two rules of S3: every part but the last is
+ * at least part_min bytes, and a part copied on the server comes from
+ * ONE object (S3 cannot join small objects). So: a source of at least
+ * part_min is copied as a part of its own, and no byte of it travels.
+ * Smaller sources that follow one another are fetched and uploaded
+ * together as one part; such a run takes in sources until it reaches
+ * part_min or the sources end. A file is its chunks, each at least
+ * part_min, then its smaller objects and its footer: the chunks are
+ * copied, and what follows them travels once, as the last part. */
+#define PQC_PART_MIN (5u * 1024u * 1024u)   /* S3's */
+#define PQC_MAX_PARTS 10000                 /* S3's */
+
+typedef struct {
+    uint32_t first, count;        /* the sources first .. first+count-1 */
+    int32_t copy;                 /* 1: one source, copied on the server;
+                                     0: fetched, and uploaded as one part */
+} PqcPart;
+
+/* The parts for n sources of these sizes, in order. *out: malloc'd,
+ * *n_out entries; free it with pqc_free. REPORT_REFUSED for more than
+ * PQC_MAX_PARTS parts. */
+int pqc_plan_parts(const uint64_t *sizes, uint32_t n, uint64_t part_min,
+                   PqcPart **out, uint32_t *n_out, Report *report);
+
 /* ---- a dead writer ------------------------------------------------------ */
 
 /* A writer is dead when nothing has come from it for

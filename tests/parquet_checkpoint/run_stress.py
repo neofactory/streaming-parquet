@@ -204,7 +204,13 @@ def pipeline(seconds, rate, group_rows):
                                     f"{seen}->{r.watermark}")
                     return
                 seen = r.watermark
-                t = r.table()
+                try:
+                    t = r.table()
+                except SinkError:
+                    # the file ended between the open and the read: the
+                    # close deleted the version's objects
+                    time.sleep(0.02)
+                    continue
                 if (t.num_rows != r.watermark
                         or (t.num_rows and
                             t.column('n').to_pylist()[-1] != t.num_rows - 1)):

@@ -640,6 +640,354 @@ static void sweep_tests(void) {
     assert(pqc_sweep_remote(0, 0, 0) == PQC_SWEEP_MIRROR);
 }
 
+/* ---- the assembly of a file ---------------------------------------------- */
+
+typedef struct { char object[PQC_OBJECT_MAX]; const uint8_t *ck; uint64_t len; } Held;
+
+/* One assembly in a pretend copy. held: the bytes of the versions
+ * there. given: the version the caller has in hand, or NULL. ops: what
+ * the host did, in order ("S name ", "R ", "A ", "L ", "D name ").
+ * fail_delete: the number (from 1) of the delete that fails, 0 for
+ * none. Answers the status that ended it, the flag of DONE in *flag. */
+static int run_finish(Sink *s, const char *file, int mode, int keep,
+                      const Held *held, int n_held, const Held *given,
+                      int fail_delete, char *ops, size_t cap, int *flag) {
+    PqcFinish *f = NULL;
+    PqcFinishStep st, again;
+    char of[PQC_OBJECT_MAX];
+    int64_t seq;
+    int rc, deletes = 0;
+    ops[0] = 0;
+    *flag = -1;
+    assert(pqc_finish_new(file, mode, keep, &f, &R) == REPORT_OK && f);
+    for (int i = s->n - 1; i >= 0; i--)         /* any order */
+        if (pqc_ckpt_object_parse(s->o[i].name, of, &seq) && !strcmp(of, file))
+            assert(pqc_finish_version(f, s->o[i].name, &R) == REPORT_OK);
+    if (given &&
+        (rc = pqc_finish_given(f, given->object, given->ck, given->len, &R))) {
+        pqc_finish_free(f);
+        return rc;
+    }
+#define OP(...) snprintf(ops + strlen(ops), cap - strlen(ops), __VA_ARGS__)
+    for (;;) {
+        if ((rc = pqc_finish_next(f, &st, &R)) != REPORT_OK) break;
+        assert(pqc_finish_next(f, &again, &R) == REPORT_OK);  /* the same again */
+        assert(again.action == st.action && !strcmp(again.name, st.name));
+        if (st.action == PQC_FINISH_DONE) { *flag = st.flag; break; }
+        if (st.action == PQC_FINISH_STAT) {
+            int i = sink_find(s, st.name);
+            OP("S %s ", st.name);
+            assert(pqc_finish_did(f, &R) == REPORT_INVALID);
+            assert(pqc_finish_next(f, &again, &R) == REPORT_OK);
+            if ((rc = pqc_finish_has(f, i >= 0, i >= 0 ? s->o[i].size : 0, &R)))
+                break;
+            continue;
+        }
+        if (st.action == PQC_FINISH_READ) {
+            int k = -1;
+            for (int i = 0; i < n_held; i++)
+                if (!strcmp(held[i].object, st.name)) k = i;
+            assert(k >= 0 && sink_find(s, st.name) >= 0);
+            OP("R %s ", st.name);
+            if ((rc = pqc_finish_read(f, held[k].ck, held[k].len, &R))) break;
+            continue;
+        }
+        if (st.action == PQC_FINISH_ASSEMBLE) {
+            const char *name;
+            int64_t off, len;
+            uint64_t total = 0;
+            for (uint32_t i = 0; i < st.size; i++) {
+                assert(pqc_finish_source(f, i, &name, &off, &len));
+                int at = sink_find(s, name);
+                assert(at >= 0);
+                if (i + 1 < st.size) assert(off == -1 && len == -1);
+                else assert(off > 0 && len > 0 &&
+                            (uint64_t)(off + len) <= s->o[at].size);
+                total += off < 0 ? s->o[at].size : (uint64_t)len;
+            }
+            assert(!pqc_finish_source(f, (uint32_t)st.size, &name, &off, &len));
+            OP("A ");
+            sink_put(s, st.name, total);
+        } else if (st.action == PQC_FINISH_LIST) {
+            OP("L ");
+            size_t n = strlen(st.name);
+            for (int i = 0; i < s->n; i++)
+                if (!strncmp(s->o[i].name, st.name, n))
+                    assert(pqc_finish_listed(f, s->o[i].name, &R) == REPORT_OK);
+        } else {
+            assert(st.action == PQC_FINISH_DELETE);
+            if (++deletes == fail_delete) { rc = -1; break; }
+            OP("D %s ", st.name);
+            sink_delete(s, st.name);
+        }
+        assert(pqc_finish_did(f, &R) == REPORT_OK);
+    }
+#undef OP
+    pqc_finish_free(f);
+    return rc;
+}
+
+static void finish_tests(void) {
+    char err[512], ops[1 << 16], want[1 << 16];
+    Sink s = {0};
+    Source src = {t_pqc_writer_new("f.parquet", 4096, err, 512), &s, 0};
+    Held h[3];
+    uint64_t rows;
+    int flag;
+    PqcFinish *f = NULL;
+    PqcFinishStep st;
+
+    /* nothing there */
+    assert(run_finish(&s, "f.parquet", 0, 0, NULL, 0, NULL, 0, ops, sizeof ops,
+                      &flag) == REPORT_REFUSED);
+    assert(strstr(R.error, "nothing there") && !strcmp(ops, "S f.parquet "));
+
+    h[0].ck = next_version(&src, 3, h[0].object, &h[0].len, &rows);
+    h[1].ck = next_version(&src, 3, h[1].object, &h[1].len, &rows);
+    PqcReader *rd = t_pqc_reader_open(h[1].ck, h[1].len, err, 512);
+    uint32_t n = pqc_reader_n_chunks(rd);
+    assert(n >= 2);
+    Sink start = s;
+
+    /* an object of the newest version is not there, or not whole: refused,
+     * and nothing was changed */
+    const char *cname;
+    uint64_t clen;
+    uint32_t crc;
+    pqc_reader_chunk(rd, n - 1, &cname, &clen, &crc);
+    sink_delete(&s, cname);
+    assert(run_finish(&s, "f.parquet", 0, 0, h, 2, NULL, 0, ops, sizeof ops,
+                      &flag) == REPORT_REFUSED);
+    assert(strstr(R.error, "missing or wrong size") && strstr(R.error, cname));
+    assert(!strstr(ops, "A ") && !strstr(ops, "D "));
+    s = start;
+    sink_put(&s, cname, clen + 1);
+    assert(run_finish(&s, "f.parquet", 0, 0, h, 2, NULL, 0, ops, sizeof ops,
+                      &flag) == REPORT_REFUSED);
+    assert(strstr(R.error, "missing or wrong size") && !strstr(ops, "A "));
+    s = start;
+
+    /* an object that no version names: a crash left it */
+    sink_put(&s, "f.parquet.chunks/999999", 77);
+    Sink before = s;
+
+    /* the assembly: the finished file asked about, the newest version
+     * read, each object asked about, the file made, and the deletes in
+     * their order, the version in use last */
+    assert(run_finish(&s, "f.parquet", 0, 0, h, 2, NULL, 0, ops, sizeof ops,
+                      &flag) == REPORT_OK && flag == 1);
+    snprintf(want, sizeof want, "S f.parquet R %s ", h[1].object);
+    for (uint32_t i = 0; i < n; i++) {
+        pqc_reader_chunk(rd, i, &cname, &clen, &crc);
+        snprintf(want + strlen(want), sizeof want - strlen(want), "S %s ", cname);
+    }
+    strcat(want, "A L ");
+    assert(!strncmp(ops, want, strlen(want)));
+    char tail[2 * PQC_OBJECT_MAX + 16];
+    snprintf(tail, sizeof tail, "D %s D %s ", h[0].object, h[1].object);
+    assert(strlen(ops) > strlen(tail) &&
+           !strcmp(ops + strlen(ops) - strlen(tail), tail));
+    assert(strstr(ops, "D f.parquet.chunks/999999 "));
+    assert(s.n == 1 && !strcmp(s.o[0].name, "f.parquet"));
+
+    /* again: it was finished before */
+    assert(run_finish(&s, "f.parquet", 0, 0, h, 2, NULL, 0, ops, sizeof ops,
+                      &flag) == REPORT_OK && flag == 0);
+    assert(!strcmp(ops, "S f.parquet "));
+
+    /* a delete fails: the file is there, and so is the version in use.
+     * The next assembly refuses (both are there); a discard ends it. */
+    s = before;
+    assert(run_finish(&s, "f.parquet", 0, 0, h, 2, NULL, 2, ops, sizeof ops,
+                      &flag) == -1);
+    assert(sink_find(&s, "f.parquet") >= 0 && sink_find(&s, h[1].object) >= 0);
+    assert(run_finish(&s, "f.parquet", 0, 0, h, 2, NULL, 0, ops, sizeof ops,
+                      &flag) == REPORT_REFUSED);
+    assert(strstr(R.error, "BOTH final and checkpoint exist"));
+    assert(run_finish(&s, "f.parquet", PQC_FINISH_DISCARD, 0, h, 2, NULL, 0,
+                      ops, sizeof ops, &flag) == REPORT_OK && flag == 0);
+    assert(s.n == 1 && !strstr(ops, "A ") && !strstr(ops, "R "));
+
+    /* keep_checkpoints: nothing is deleted; the discard deletes later,
+     * in the same order; with no finished file it refuses */
+    s = before;
+    assert(run_finish(&s, "f.parquet", PQC_FINISH_DISCARD, 0, h, 2, NULL, 0,
+                      ops, sizeof ops, &flag) == REPORT_REFUSED);
+    assert(strstr(R.error, "only copy") && s.n == before.n);
+    assert(run_finish(&s, "f.parquet", 0, 1, h, 2, NULL, 0, ops, sizeof ops,
+                      &flag) == REPORT_OK && flag == 1);
+    assert(s.n == before.n + 1 && !strstr(ops, "L ") && !strstr(ops, "D "));
+    assert(run_finish(&s, "f.parquet", PQC_FINISH_DISCARD, 0, h, 2, NULL, 0,
+                      ops, sizeof ops, &flag) == REPORT_OK && flag == 0);
+    assert(!strncmp(ops, "S f.parquet L D ", 16) &&
+           !strcmp(ops + strlen(ops) - strlen(tail), tail));
+    assert(s.n == 1);
+
+    /* the newest version is not a checkpoint: the one before it is used,
+     * with a line for the log, and the bad one is deleted before it */
+    s = before;
+    Held bad[2] = {h[0], h[1]};
+    bad[1].ck = (const uint8_t *)"garbage";
+    bad[1].len = 7;
+    assert(run_finish(&s, "f.parquet", 0, 0, bad, 2, NULL, 0, ops, sizeof ops,
+                      &flag) == REPORT_OK && flag == 1);
+    snprintf(want, sizeof want, "S f.parquet R %s R %s ", h[1].object,
+             h[0].object);
+    assert(!strncmp(ops, want, strlen(want)));
+    snprintf(tail, sizeof tail, "D %s D %s ", h[1].object, h[0].object);
+    assert(!strcmp(ops + strlen(ops) - strlen(tail), tail));
+    /* no version is one: refused, nothing changed */
+    s = before;
+    bad[0] = bad[1];
+    snprintf(bad[0].object, sizeof bad[0].object, "%s", h[0].object);
+    assert(run_finish(&s, "f.parquet", 0, 0, bad, 2, NULL, 0, ops, sizeof ops,
+                      &flag) == REPORT_REFUSED);
+    assert(strstr(R.error, "no checkpoint version holds") &&
+           strstr(R.error, h[0].object) && strstr(R.error, h[1].object));
+    assert(s.n == before.n);
+
+    /* the line for the log */
+    assert(pqc_finish_new("f.parquet", 0, 0, &f, &R) == REPORT_OK);
+    assert(pqc_finish_version(f, h[0].object, &R) == REPORT_OK);
+    assert(pqc_finish_version(f, h[1].object, &R) == REPORT_OK);
+    assert(pqc_finish_next(f, &st, &R) == REPORT_OK && st.action == PQC_FINISH_STAT
+           && st.flag == 1);
+    assert(pqc_finish_read(f, h[1].ck, h[1].len, &R) == REPORT_INVALID);
+    assert(pqc_finish_next(f, &st, &R) == REPORT_OK);
+    assert(pqc_finish_has(f, 0, 0, &R) == REPORT_OK);
+    assert(pqc_finish_version(f, h[0].object, &R) == REPORT_INVALID);  /* begun */
+    assert(pqc_finish_next(f, &st, &R) == REPORT_OK && st.action == PQC_FINISH_READ);
+    assert(pqc_finish_has(f, 1, 1, &R) == REPORT_INVALID);
+    assert(pqc_finish_next(f, &st, &R) == REPORT_OK);
+    assert(pqc_finish_read(f, NULL, 0, &R) == REPORT_OK && R.lines == 0);  /* empty */
+    assert(pqc_finish_next(f, &st, &R) == REPORT_OK && !strcmp(st.name, h[0].object));
+    assert(pqc_finish_read(f, h[0].ck, h[0].len, &R) == REPORT_OK);
+    assert(R.lines == 1 && R.line[0].level == REPORT_WARNING &&
+           strstr(R.line[0].text, "refused, assembling from") &&
+           strstr(R.line[0].text, h[1].object));
+    pqc_finish_free(f);
+
+    /* the caller has the newest version in hand: no question about the
+     * finished file, no read; the last source is that version's own bytes */
+    s = before;
+    assert(run_finish(&s, "f.parquet", 0, 0, h, 2, &h[1], 0, ops, sizeof ops,
+                      &flag) == REPORT_OK && flag == 1);
+    assert(strncmp(ops, "S f.parquet ", 12) && !strstr(ops, "R ") && s.n == 1);
+    s = before;
+    assert(run_finish(&s, "f.parquet", 0, 0, h, 2, &bad[1], 0, ops, sizeof ops,
+                      &flag) == REPORT_REFUSED && s.n == before.n);
+
+    /* a version that names another file */
+    Sink g = {0};
+    Held hg = h[0];
+    snprintf(hg.object, sizeof hg.object, "g.parquet.000001.ckpt");
+    sink_put(&g, hg.object, hg.len);
+    assert(run_finish(&g, "g.parquet", 0, 0, &hg, 1, NULL, 0, ops, sizeof ops,
+                      &flag) == REPORT_REFUSED);
+    assert(strstr(R.error, "mispaired") && g.n == 1);
+    assert(run_finish(&g, "g.parquet", 0, 0, &hg, 1, &hg, 0, ops, sizeof ops,
+                      &flag) == REPORT_REFUSED && strstr(R.error, "mispaired"));
+    /* a file in a directory of the place: the checkpoint names the base */
+    Sink d = {0};
+    Held hd = h[0];
+    snprintf(hd.object, sizeof hd.object, "a/b/f.parquet.000001.ckpt");
+    sink_put(&d, hd.object, hd.len);
+    assert(run_finish(&d, "a/b/f.parquet", 0, 0, &hd, 1, NULL, 0, ops,
+                      sizeof ops, &flag) == REPORT_REFUSED);
+    assert(strstr(R.error, "missing or wrong size"));    /* paired; no objects */
+
+    /* arguments */
+    assert(pqc_finish_new(NULL, 0, 0, &f, &R) == REPORT_INVALID);
+    assert(pqc_finish_new("f.parquet", 7, 0, &f, &R) == REPORT_INVALID && !f);
+    assert(pqc_finish_new("f.parquet", 0, 0, &f, NULL) == REPORT_INVALID);
+    assert(pqc_finish_new("f.parquet", 0, 0, &f, &R) == REPORT_OK);
+    assert(pqc_finish_version(f, "g.parquet.000001.ckpt", &R) == REPORT_INVALID);
+    assert(pqc_finish_version(f, "f.parquet", &R) == REPORT_INVALID);
+    assert(pqc_finish_did(f, &R) == REPORT_INVALID);
+    assert(pqc_finish_listed(f, "x", &R) == REPORT_INVALID);
+    assert(pqc_finish_next(f, NULL, &R) == REPORT_INVALID);
+    assert(!pqc_finish_source(f, 0, &cname, (int64_t *)&clen, (int64_t *)&clen));
+    pqc_finish_free(f);
+    pqc_finish_free(NULL);
+    assert(pqc_finish_new("f.parquet", PQC_FINISH_DISCARD, 0, &f, &R) == REPORT_OK);
+    assert(pqc_finish_given(f, h[0].object, h[0].ck, h[0].len, &R) == REPORT_INVALID);
+    pqc_finish_free(f);
+
+    pqc_reader_free(rd);
+    pqc_free((void *)h[0].ck);
+    pqc_free((void *)h[1].ck);
+    pqc_writer_free(src.w);
+}
+
+/* ---- the parts of an assembly -------------------------------------------- */
+
+static void parts_are(const uint64_t *sizes, uint32_t n, uint64_t part_min,
+                      const char *want) {
+    PqcPart *p = NULL;
+    uint32_t np = 0;
+    char got[256] = "";
+    assert(pqc_plan_parts(sizes, n, part_min, &p, &np, &R) == REPORT_OK);
+    uint32_t next = 0;
+    for (uint32_t i = 0; i < np; i++) {
+        assert(p[i].first == next && p[i].count >= 1);     /* each source once */
+        assert(!p[i].copy || p[i].count == 1);
+        uint64_t bytes = 0;
+        for (uint32_t k = 0; k < p[i].count; k++) bytes += sizes[p[i].first + k];
+        assert(i + 1 == np || bytes >= part_min);          /* S3's rule */
+        snprintf(got + strlen(got), sizeof got - strlen(got), "%c%u ",
+                 p[i].copy ? 'c' : 'u', p[i].count);
+        next += p[i].count;
+    }
+    assert(next == n);
+    assert(!strcmp(got, want));
+    pqc_free(p);
+}
+
+static void parts_tests(void) {
+    const uint64_t big = 5000, small = 100;
+    parts_are((uint64_t[]){big, big, small, small}, 4, 4096, "c1 c1 u2 ");
+    parts_are((uint64_t[]){big}, 1, 4096, "c1 ");
+    parts_are((uint64_t[]){small, small}, 2, 4096, "u2 ");
+    /* a small object before a large one: the run takes the large one
+     * in, so that no part before the last is under the minimum */
+    parts_are((uint64_t[]){small, big, small}, 3, 4096, "u2 u1 ");
+    parts_are(NULL, 0, 4096, "");
+    parts_are((uint64_t[]){small, small, small}, 3, 0, "c1 c1 c1 ");
+    /* any sizes: each source once, in order, and S3's rule holds */
+    for (int round = 0; round < 2000; round++) {
+        uint64_t sizes[40];
+        uint32_t n = rnd() % 40;
+        for (uint32_t i = 0; i < n; i++)
+            sizes[i] = rnd() % 3 ? rnd() % 300 : 1000 + rnd() % 9000;
+        PqcPart *p = NULL;
+        uint32_t np = 0, next = 0;
+        assert(pqc_plan_parts(sizes, n, 1000, &p, &np, &R) == REPORT_OK);
+        for (uint32_t i = 0; i < np; i++) {
+            uint64_t bytes = 0;
+            assert(p[i].first == next);
+            for (uint32_t k = 0; k < p[i].count; k++) bytes += sizes[next++];
+            assert(i + 1 == np || bytes >= 1000);
+            assert(!p[i].copy || (p[i].count == 1 && bytes >= 1000));
+        }
+        assert(next == n);
+        pqc_free(p);
+    }
+    /* more parts than S3 takes */
+    uint32_t many = PQC_MAX_PARTS + 1, np;
+    uint64_t *sizes = malloc(many * sizeof *sizes);
+    PqcPart *p;
+    for (uint32_t i = 0; i < many; i++) sizes[i] = 10;
+    assert(pqc_plan_parts(sizes, many, 10, &p, &np, &R) == REPORT_REFUSED && !p);
+    assert(strstr(R.error, "exceeds"));
+    assert(pqc_plan_parts(sizes, many - 1, 10, &p, &np, &R) == REPORT_OK &&
+           np == PQC_MAX_PARTS);
+    pqc_free(p);
+    assert(pqc_plan_parts(sizes, 3, 10, NULL, &np, &R) == REPORT_INVALID);
+    assert(pqc_plan_parts(NULL, 3, 10, &p, &np, &R) == REPORT_INVALID);
+    assert(pqc_plan_parts(sizes, 3, 10, &p, &np, NULL) == REPORT_INVALID);
+    free(sizes);
+}
+
 int main(void) {
     char err[512];
     uint8_t mini[1 << 16];
@@ -797,6 +1145,8 @@ int main(void) {
     mirror_tests();
     mirror_soak();
     sweep_tests();
+    finish_tests();
+    parts_tests();
     printf("san_test: OK\n");
     return 0;
 }
