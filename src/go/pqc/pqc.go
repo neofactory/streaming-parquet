@@ -22,9 +22,7 @@ import "C"
 
 import (
 	"fmt"
-	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 	"unsafe"
@@ -36,27 +34,39 @@ import (
 // ago still finds it.
 const SupersededKeep = 10 * time.Minute
 
-var ckptRe = regexp.MustCompile(`^(.+\.parquet)(?:\.(\d{6,}))?\.ckpt$`)
-
 // CkptObject is the object name of version seq of file name's
 // checkpoint: name.000017.ckpt. Each checkpoint is a new object,
-// written once and never changed.
+// written once and never changed. The name is the core's rule
+// (pqc.h: CHECKPOINT VERSIONS).
 func CkptObject(name string, seq int) string {
-	return fmt.Sprintf("%s.%06d.ckpt", name, seq)
+	cn := C.CString(name)
+	defer C.free(unsafe.Pointer(cn))
+	var out [C.PQC_OBJECT_MAX]C.char
+	var r C.Report
+	if C.pqc_ckpt_object(cn, C.int64_t(seq), &out[0], &r) != 0 {
+		// a name the core has no room for: no object of it is ever stored
+		return fmt.Sprintf("%s.%06d.ckpt", name, seq)
+	}
+	return C.GoString(&out[0])
 }
 
 // ParseCkptObject returns the file name and version of a checkpoint
 // object's name. A checkpoint named without a version (x.parquet.ckpt,
-// as written before versions) is version 0.
+// as written before versions) is version 0. The rule is the core's; a
+// directory in front of the name stays in front.
 func ParseCkptObject(obj string) (name string, seq int, ok bool) {
-	m := ckptRe.FindStringSubmatch(obj)
-	if m == nil {
+	head, tail := "", obj
+	if i := strings.LastIndexByte(obj, '/'); i >= 0 {
+		head, tail = obj[:i+1], obj[i+1:]
+	}
+	ct := C.CString(tail)
+	defer C.free(unsafe.Pointer(ct))
+	var out [C.PQC_OBJECT_MAX]C.char
+	var n C.int64_t
+	if C.pqc_ckpt_object_parse(ct, &out[0], &n) == 0 {
 		return "", 0, false
 	}
-	if m[2] != "" {
-		seq, _ = strconv.Atoi(m[2])
-	}
-	return m[1], seq, true
+	return head + C.GoString(&out[0]), int(n), true
 }
 
 // Version is one checkpoint version of a file.
@@ -103,22 +113,17 @@ func bytesPtr(b []byte) *C.uint8_t {
 // rows no object holds yet; Close finalizes into an ordinary .parquet.
 // One owner at a time, like a file handle.
 type Writer struct {
-	name     string
-	sink     Sink
-	w        *C.PqcWriter
-	auto     bool
-	rowsCk   uint64
-	minLeft  uint64    // sink part minimum, enforced at construction
-	seq      int       // the newest checkpoint version's number
-	versions []version // checkpoint objects stored, oldest first
-}
-
-// version is a stored checkpoint object, when a later one superseded
-// it (zero while it is the newest), and the objects it names.
-type version struct {
-	object     string
-	superseded time.Time
-	names      map[string]bool
+	name    string
+	sink    Sink
+	w       *C.PqcWriter
+	auto    bool
+	rowsCk  uint64
+	minLeft uint64 // sink part minimum, enforced at construction
+	seq     int    // the newest checkpoint version's number
+	// The versions stored, and which are due for deletion: the core's
+	// rule (pqc.h: CHECKPOINT VERSIONS).
+	versions *C.PqcVersions
+	ckptName string // the newest version's object name
 }
 
 // NewWriter refuses an existing final file or checkpoint (finalize
@@ -148,7 +153,13 @@ func NewWriter(name string, sink Sink, chunkBytes uint64, checkpointEveryWrite b
 	if C.pqc_writer_new(cname, C.uint64_t(chunkBytes), &w, &r) != 0 {
 		return nil, cerr(&r)
 	}
-	return &Writer{name: name, sink: sink, w: w, auto: checkpointEveryWrite}, nil
+	var versions *C.PqcVersions
+	if C.pqc_versions_new(C.double(SupersededKeep.Seconds()), &versions, &r) != 0 {
+		C.pqc_writer_free(w)
+		return nil, cerr(&r)
+	}
+	return &Writer{name: name, sink: sink, w: w, auto: checkpointEveryWrite,
+		versions: versions}, nil
 }
 
 // AddGroupMini appends the row group(s) of a complete mini parquet
@@ -281,53 +292,19 @@ func (w *Writer) checkpoint(emptyMini []byte) (watermark uint64, err error) {
 	}
 	ck := C.GoBytes(unsafe.Pointer(p), C.int(n))
 	C.pqc_free(unsafe.Pointer(p))
-	names, err := manifestNames(ck)
-	if err != nil {
-		return 0, err
-	}
 	w.seq++
 	obj := CkptObject(w.name, w.seq)
 	if err := w.sink.Put(obj, ck); err != nil {
 		w.seq--
 		return 0, err
 	}
-	// stored whole first: obj supersedes the newest; delete every
-	// version superseded at least SupersededKeep ago, and with it each
-	// object that no kept version names
-	now := time.Now()
-	if n := len(w.versions); n > 0 {
-		w.versions[n-1].superseded = now
+	// stored whole first: obj replaces the newest version; what the
+	// rule says is due is deleted, a version first and then the objects
+	// only it named
+	if err := storedVersion(w.versions, w.sink, obj, ck); err != nil {
+		return 0, err
 	}
-	var kept, gone []version
-	for _, v := range w.versions {
-		if !v.superseded.IsZero() && now.Sub(v.superseded) >= SupersededKeep {
-			gone = append(gone, v)
-		} else {
-			kept = append(kept, v)
-		}
-	}
-	kept = append(kept, version{object: obj, names: names})
-	named := map[string]bool{}
-	for _, v := range kept {
-		for name := range v.names {
-			named[name] = true
-		}
-	}
-	w.versions = kept
-	for _, v := range gone {
-		if err := w.sink.Delete(v.object); err != nil { // the claim first
-			return 0, err
-		}
-		for name := range v.names {
-			if named[name] {
-				continue
-			}
-			if err := w.sink.Delete(name); err != nil {
-				return 0, err
-			}
-			named[name] = true // once
-		}
-	}
+	w.ckptName = obj
 	w.rowsCk = uint64(wm)
 	return uint64(wm), nil
 }
@@ -354,12 +331,7 @@ func manifestNames(ck []byte) (map[string]bool, error) {
 
 // CkptName is the newest checkpoint version's object name; "" before
 // the first checkpoint.
-func (w *Writer) CkptName() string {
-	if len(w.versions) == 0 {
-		return ""
-	}
-	return w.versions[len(w.versions)-1].object
-}
+func (w *Writer) CkptName() string { return w.ckptName }
 
 // RowsFinal is the count of rows in added groups; RowsUnfinished the
 // rows CheckpointTail stored after them; RowsCheckpointed the
@@ -403,6 +375,35 @@ func (w *Writer) Free() {
 		C.pqc_writer_free(w.w)
 		w.w = nil
 	}
+	if w.versions != nil {
+		C.pqc_versions_free(w.versions)
+		w.versions = nil
+	}
+}
+
+// storedVersion: the version obj (bytes ck) is stored on sink. It
+// replaces the newest version v holds, and what the rule says is due is
+// deleted. A delete that fails stays due, and is tried at the next call.
+func storedVersion(v *C.PqcVersions, sink Sink, obj string, ck []byte) error {
+	co := C.CString(obj)
+	defer C.free(unsafe.Pointer(co))
+	var r C.Report
+	if C.pqc_versions_stored(v, co, bytesPtr(ck), C.size_t(len(ck)), &r) != 0 {
+		return cerr(&r)
+	}
+	for {
+		due := C.pqc_versions_due(v, 0)
+		if due == nil {
+			return nil
+		}
+		name := C.GoString(due)
+		if err := sink.Delete(name); err != nil {
+			return err
+		}
+		if C.pqc_versions_deleted(v, due, &r) != 0 {
+			return cerr(&r)
+		}
+	}
 }
 
 // Reader parses a checkpoint object and composes the live file.
@@ -428,6 +429,11 @@ func OpenReader(ckptName string, sink Sink) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
+	return readerOf(raw, sink)
+}
+
+// readerOf is the Reader of a checkpoint object's bytes.
+func readerOf(raw []byte, sink Sink) (*Reader, error) {
 	var rep C.Report
 	var r *C.PqcReader
 	if C.pqc_reader_open(bytesPtr(raw), C.size_t(len(raw)), &r, &rep) != 0 {
@@ -542,9 +548,23 @@ func deleteCheckpoints(name string, sink Sink, versions []Version, used string) 
 }
 
 func finalize(name string, sink Sink, keep bool) (string, error) {
+	return finalizeFrom(name, sink, nil, "", keep)
+}
+
+// finalizeFrom is finalize; with ckpt, the bytes of the newest version
+// (object used) when the caller just put it there (a mirror): the
+// read-back is then skipped.
+func finalizeFrom(name string, sink Sink, ckpt []byte, object string, keep bool) (string, error) {
 	versions, err := CkptVersions(sink, name)
 	if err != nil {
 		return "", err
+	}
+	if ckpt != nil {
+		r, err := readerOf(ckpt, sink)
+		if err != nil {
+			return "", fmt.Errorf("%s: %w", object, err)
+		}
+		return assemble(name, sink, r, object, versions, keep)
 	}
 	if len(versions) == 0 {
 		if sink.Exists(name) {
@@ -570,6 +590,12 @@ func finalize(name string, sink Sink, keep bool) (string, error) {
 	if r == nil {
 		return "", fmt.Errorf("finalize(%q): no checkpoint version holds -- %s", name, strings.Join(refused, "; "))
 	}
+	return assemble(name, sink, r, used, versions, keep)
+}
+
+// assemble makes the file from the version r (object used), and deletes
+// the versions and their objects unless keep.
+func assemble(name string, sink Sink, r *Reader, used string, versions []Version, keep bool) (string, error) {
 	base := name
 	if i := strings.LastIndexByte(name, '/'); i >= 0 {
 		base = name[i+1:]
