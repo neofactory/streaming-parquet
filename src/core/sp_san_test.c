@@ -1022,6 +1022,17 @@ int main(void) {
         CHECK(strstr(r.error, "pid 7") && r.lines == 0);
     }
 
+    {   /* dated copies of the catalog */
+        sp_test_set_clock(1, 100000.0, 0.0);
+        CHECK(sp_catalog_copy_due(86400, 0, 0, 1) == 1);          /* none yet */
+        CHECK(sp_catalog_copy_due(86400, 0, 0, 0) == 0);          /* nothing changed */
+        CHECK(sp_catalog_copy_due(86400, 1, 100000.0 - 86399, 1) == 0);
+        CHECK(sp_catalog_copy_due(86400, 1, 100000.0 - 86400, 1) == 1);
+        CHECK(sp_catalog_copy_due(86400, 1, 100000.0 - 90000, 0) == 0);
+        CHECK(sp_catalog_copy_due(0, 1, 100000.0, 1) == 1);
+        CHECK(sp_catalog_copy_due(-1, 0, 0, 1) == 0);             /* no copies */
+        sp_test_set_clock(0, 0, 0);
+    }
     if (failures == 0) printf("san_test: all checks passed\n");
     return failures ? 1 : 0;
 }

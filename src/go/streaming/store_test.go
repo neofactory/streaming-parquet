@@ -104,8 +104,9 @@ func TestFilesGoToTheStore(t *testing.T) {
 			t.Fatalf("%s: %v, want it refused with %q", what, err, part)
 		}
 	}
-	_, err = tel.CreateStream("t/nostore", testSchema(), StreamOptions{Parquet: &ParquetOptions{}})
-	refused("parquet with no store", err, "the stream has no store")
+	_, err = tel.CreateStream("t/nostore", testSchema(), StreamOptions{NoSpool: true,
+		Parquet: &ParquetOptions{}})
+	refused("parquet with no store and no spool", err, "no store and no spool")
 	_, err = tel.CreateStream("t/prefix", testSchema(), StreamOptions{Store: "s3://bucket/some/prefix"})
 	refused("a prefix inside a bucket", err, "a store is a whole bucket")
 

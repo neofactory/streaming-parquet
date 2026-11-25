@@ -370,6 +370,22 @@ func (w *Writer) close(emptyMini []byte, keep bool) error {
 
 // Free releases the C writer without finalizing (a crash leaves the
 // checkpoint + objects for Finalize, from anywhere).
+// CheckpointFinal is the writer's last checkpoint of a file that a
+// mirror ends: every final row claimed, no unfinished rows, and the
+// file left as its versions and objects. The mirror assembles it, in
+// its order (THE END OF A FILE in the core's pqc.h). emptyMini is for a
+// file with no rows. The writer is not used after it.
+func (w *Writer) CheckpointFinal(emptyMini []byte) error {
+	defer w.Free()
+	w.DropUnfinished()
+	var empty []byte
+	if w.RowsFinal() == 0 && C.pqc_chunks_cut(w.w) == 0 {
+		empty = emptyMini
+	}
+	_, err := w.checkpoint(empty)
+	return err
+}
+
 func (w *Writer) Free() {
 	if w.w != nil {
 		C.pqc_writer_free(w.w)

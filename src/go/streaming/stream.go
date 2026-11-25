@@ -50,6 +50,17 @@ type Stream struct {
 	stopWork chan struct{}
 	workDone sync.WaitGroup
 
+	// The spool and its mirror. A bucket store is written through a
+	// local spool, and the ship goroutine copies the spool to the bucket:
+	// the one caller of the archiver's ship, so no two passes overlap.
+	// mirrorFailing and mirrorError are under mu.
+	spool         string // "" = the default spool
+	noSpool       bool
+	shipKick      chan chan struct{} // a pass now; the channel given is closed after it
+	shipStop      chan struct{}
+	mirrorFailing bool
+	mirrorError   string
+
 	// Published or internal. pubMu orders Publish, Unpublish and Close.
 	pubMu     sync.Mutex
 	published bool
@@ -85,7 +96,12 @@ func (s *Stream) own() error {
 	if s.owner != nil {
 		return nil
 	}
-	o, err := s.proc.claim(fmt.Sprintf("CreateStream(%q)", s.Name), lockDir(s.root),
+	// the lock file: in a directory store, else in the stream's spool
+	dir := lockDir(s.root)
+	if s.spool != "" && (s.root == "" || strings.Contains(strings.TrimPrefix(s.root, "file://"), "://")) {
+		dir = s.spool
+	}
+	o, err := s.proc.claim(fmt.Sprintf("CreateStream(%q)", s.Name), dir,
 		s.Name, s.run, s.root, s.tickets)
 	if err != nil {
 		return err
@@ -113,6 +129,12 @@ func (m *MemoryOptions) rows() int64 {
 // stream writes no ticket: this process reads it, and a reader that
 // has its Ticket.
 //
+// Spool is the local write-behind copy a bucket store is written
+// through: on disk, surviving a reboot, copied to the bucket every
+// ParquetOptions.ShipSeconds, growing while the bucket cannot be
+// reached. A directory store is written straight into, and the spool is
+// not used. A stream with no store writes its files to the spool alone.
+//
 // Memory says how many rows the stream keeps in memory.
 //
 // Parquet says how the stream's rows are written to parquet; the files
@@ -125,6 +147,8 @@ func (m *MemoryOptions) rows() int64 {
 // ticket, not served. Publish and Unpublish change it later.
 type StreamOptions struct {
 	Store    string         // the store; "" = $STREAMING_PARQUET_STORE, and with that not set none
+	Spool    string         // the local copy a bucket store is written through; "" = /var/tmp/streaming-parquet/<user>
+	NoSpool  bool           // no local copy: the bucket is the first copy
 	Memory   *MemoryOptions // nil = the default: two row groups
 	Parquet  *ParquetOptions
 	Internal bool
@@ -158,6 +182,8 @@ func (t *process) CreateStream(name string, schema *arrow.Schema,
 		return nil, err
 	}
 	s := &Stream{Name: name, proc: t, root: root, tickets: tickets, ring: r, ringRows: ringRows,
+		spool: o.Spool, noSpool: o.NoSpool,
+		shipKick: make(chan chan struct{}), shipStop: make(chan struct{}),
 		run: runStart(), wake: make(chan struct{}, 1),
 		store: newStoreState(pqc.SupersededKeep), ticketNow: make(chan struct{}, 1),
 		stopWork: make(chan struct{})}
@@ -189,6 +215,7 @@ func (t *process) CreateStream(name string, schema *arrow.Schema,
 	t.mu.Unlock()
 	s.workDone.Add(1)
 	go s.work()
+	go s.shipLoop()
 	if !o.Internal {
 		if err := s.Publish(); err != nil {
 			s.Close()
@@ -388,6 +415,119 @@ func (s *Stream) ArchiveState() ArchiveState {
 	return st
 }
 
+// MirrorState is the standing of the copy of a spool to its bucket.
+// Pending names the files ended locally whose copy in the bucket is not
+// finished yet. A failing mirror loses no rows: they are in the spool,
+// and the passes go on.
+type MirrorState struct {
+	Failing bool
+	Error   string
+	Pending []string
+}
+
+// MirrorState answers the mirror's standing; nil for a stream whose
+// first copy is its store (no spool in use).
+func (s *Stream) MirrorState() *MirrorState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.arch == nil || s.arch.remote == nil {
+		return nil
+	}
+	return &MirrorState{Failing: s.mirrorFailing, Error: s.mirrorError,
+		Pending: s.arch.pending()}
+}
+
+// shipLoop is the stream's ship goroutine: a mirror pass every
+// ShipSeconds, and one when Close asks. It holds none of the stream's
+// locks during a pass: a bucket that is slow or away never holds up a
+// commit or a write.
+func (s *Stream) shipLoop() {
+	for {
+		var reply chan struct{}
+		s.mu.Lock()
+		every := defaultShipSeconds
+		if s.arch != nil {
+			every = s.arch.shipSeconds
+		}
+		s.mu.Unlock()
+		select {
+		case <-s.shipStop:
+			return
+		case reply = <-s.shipKick:
+		case <-time.After(time.Duration(every * float64(time.Second))):
+		}
+		s.shipOnce()
+		if reply != nil {
+			close(reply)
+		}
+	}
+}
+
+func (s *Stream) shipOnce() {
+	s.mu.Lock()
+	arch := s.arch
+	s.mu.Unlock()
+	if arch == nil || arch.remote == nil {
+		return
+	}
+	err := arch.ship()
+	s.mu.Lock()
+	switch {
+	case err != nil:
+		if !s.mirrorFailing {
+			s.proc.log.Warn(fmt.Sprintf("[%s] remote mirror failing: %v", s.Name, err))
+		}
+		s.mirrorFailing, s.mirrorError = true, err.Error()
+	case s.mirrorFailing:
+		s.proc.log.Info(fmt.Sprintf("[%s] remote mirror recovered", s.Name))
+		s.mirrorFailing, s.mirrorError = false, ""
+	}
+	s.mu.Unlock()
+	select { // the ticket says what the store holds: write it now
+	case s.ticketNow <- struct{}{}:
+	default:
+	}
+}
+
+// closingShip is the mirror pass of a stream that closes: with the
+// bucket in reach, the last file's copy there is finished before Close
+// returns. Without, the file stays in the spool, and the next start's
+// sweep finishes it.
+func (s *Stream) closingShip() {
+	s.mu.Lock()
+	arch := s.arch
+	s.mu.Unlock()
+	if arch == nil || arch.remote == nil {
+		return
+	}
+	t0 := time.Now()
+	reply := make(chan struct{})
+	deadline := time.After(3 * time.Second)
+	select {
+	case s.shipKick <- reply:
+	case <-deadline:
+		reply = nil // a pass is running, and did not end
+	}
+	for tick := 0; reply != nil && tick < 3; tick++ {
+		select {
+		case <-reply:
+			return
+		case <-time.After(time.Second):
+			if doing := arch.shipping(); doing != "" {
+				s.proc.log.Info(fmt.Sprintf("[%s] close: %s, %.0f s so far",
+					s.Name, doing, time.Since(t0).Seconds()))
+			}
+		}
+	}
+	doing := arch.shipping()
+	if doing == "" {
+		doing = "the mirror pass"
+	}
+	s.proc.log.Warn(fmt.Sprintf("[%s] close: still %s after %.0f s; the file is "+
+		"complete in the local spool (%s) and the next start finishes the upload",
+		s.Name, doing, time.Since(t0).Seconds(), arch.location))
+}
+
 // ---- published or internal ------------------------------------------------
 
 // Published reports whether other processes can find and read the stream.
@@ -509,9 +649,13 @@ func (s *Stream) heartbeat(stop chan struct{}) {
 		s.mu.Lock()
 		where := ""
 		if s.arch != nil {
-			where = strings.TrimSuffix(s.arch.location, "/") + "/"
+			where = strings.TrimSuffix(s.arch.storeLocation, "/") + "/"
+			t.Archive = s.arch.storeLocation
 			if s.arch.recording() {
 				t.CheckpointSeconds = s.arch.ckptSeconds
+			}
+			if s.arch.remote != nil {
+				t.ShipSeconds = s.arch.shipSeconds
 			}
 		}
 		s.mu.Unlock()
@@ -590,16 +734,15 @@ func (s *Stream) StartParquet(label string, o *ParquetOptions) error {
 		}
 		lost = s.arch.lost()
 	}
-	if s.root == "" {
-		return fmt.Errorf("stream %s: StartParquet: the stream has no store, "+
-			"so there is no place for its files. Give StreamOptions.Store "+
-			"at CreateStream, or set $STREAMING_PARQUET_STORE", s.Name)
-	}
-	files, err := s.proc.files(s.root)
+	first, remote, err := s.proc.places(s.root, s.spool, s.noSpool, s.Name)
 	if err != nil {
 		return err
 	}
-	arch, err := newArchiver(s.ring, s.Name, s.run, opts, files, s.store, s.catalogFor, s.proc.log)
+	catFor := s.catalogFor
+	if s.root == "" {
+		catFor = nil // no store: no reader of one, and no catalog
+	}
+	arch, err := newArchiver(s.ring, s.Name, s.run, opts, first, remote, s.store, catFor, s.proc.log)
 	if err != nil {
 		return err
 	}
@@ -721,6 +864,9 @@ func (s *Stream) Close() error {
 	}
 	s.mu.Unlock()
 	s.io.Unlock()
+
+	s.closingShip()
+	close(s.shipStop)
 
 	// The catalog lists the last file before the stream goes, when it
 	// can in a few seconds; the ticket must still be there for it.

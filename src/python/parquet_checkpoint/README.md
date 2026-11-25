@@ -102,6 +102,9 @@ finalize(name, sink) -> (status, name)   # checkpoint -> ordinary .parquet;
                                          # idempotent; ckpt deleted last
 recover_directory(sink_or_dir)           # the boot sweep
 
+# The mirror's rules (what is sent, the order, what is deleted, how a
+# file ends) are the C core's: src/core/pqc.h, THE MIRROR. The Shipper
+# does what the core asks; the Go host's pqc.Mirror does the same.
 Shipper(name, local, remote)             # mirror local -> S3; pollable,
 ship.poll() -> {'state': ...}            #   no threads; raises on sink
 ship.synced                              #   failure (host logs + retries).

@@ -185,6 +185,8 @@ int sp_catalog_add(SpCatalog *c, const char *path, int64_t file_size,
                    const uint8_t *footer, size_t footer_len,
                    Report *report);
 int64_t sp_catalog_staged(const SpCatalog *c);
+int sp_catalog_copy_due(double copy_seconds, int has_copy, double copy_wall,
+                        int changed);
 int sp_catalog_bytes(SpCatalog *c, uint8_t **out, size_t *out_len,
                      Report *report);
 void sp_test_set_clock(int fixed, double wall, double mono);
@@ -826,6 +828,15 @@ class View:
 
 class CatalogError(ValueError):
     """The core refused a catalog's bytes or a file."""
+
+
+def catalog_copy_due(copy_seconds, copy_wall, changed):
+    """True when a dated copy of the catalog is due (sp.h: DATED
+    COPIES OF THE CATALOG). copy_wall: the newest copy's time, None
+    for no copy."""
+    return bool(lib.sp_catalog_copy_due(
+        float(copy_seconds), 0 if copy_wall is None else 1,
+        0.0 if copy_wall is None else float(copy_wall), 1 if changed else 0))
 
 
 def footer_length(tail):

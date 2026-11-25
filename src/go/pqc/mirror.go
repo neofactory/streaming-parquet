@@ -8,6 +8,7 @@ import "C"
 
 import (
 	"fmt"
+	"runtime"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -61,6 +62,8 @@ func NewMirror(name string, local, remote Sink, keep time.Duration) (*Mirror, er
 	}
 	out := &Mirror{name: name, local: local, remote: remote, m: m}
 	out.doing.Store("")
+	// a mirror its owner dropped without Free
+	runtime.SetFinalizer(out, (*Mirror).Free)
 	return out, nil
 }
 

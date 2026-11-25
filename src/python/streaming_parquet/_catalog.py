@@ -327,10 +327,9 @@ class Catalog:
         changed since the last copy or check (a cheap test, no I/O)."""
         if self._copy_s is None or self.etag is None:
             return False
-        if self.etag == self._copy_seen:
-            return False
-        return (self._copy_tw is None or
-                _clock_now() - self._copy_tw >= self._copy_s)
+        # the rule is the stream core's (sp.h: DATED COPIES OF THE CATALOG)
+        return _core.catalog_copy_due(self._copy_s, self._copy_tw,
+                                      self.etag != self._copy_seen)
 
     def _copy_pass(self):
         """A dated copy of the published catalog, when due and it differs

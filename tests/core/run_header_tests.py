@@ -56,6 +56,7 @@ INT_WITHOUT_REPORT = {
     "sp_store_stored_at": "1 and the value, or 0 for none",
     "sp_reader_state": "the state",
     "sp_catalog_lists": "a yes or no",
+    "sp_catalog_copy_due": "a yes or no",
 }
 
 #: What a function may return.

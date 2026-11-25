@@ -108,6 +108,47 @@ func (t *process) resolve(store string) (string, ticketStore, error) {
 	return store, tickets, nil
 }
 
+// spoolDir is the default spool: the local directory a bucket store is
+// written through (the Python DEFAULT_SPOOL).
+func spoolDir() string { return lockDir("") }
+
+// places answers where a stream's files go: the first copy, and the
+// store it is mirrored to (nil when the first copy is the store).
+//
+//	a directory store            written straight into; the spool is not used
+//	a bucket store, a spool      the first copy in the spool, mirrored to the bucket
+//	a bucket store, no spool     the bucket is the first copy
+//	no store                     the spool is the only copy
+func (t *process) places(store, spool string, noSpool bool, name string) (first, remote pqc.Sink, err error) {
+	local := func() (pqc.Sink, error) {
+		if spool == "" {
+			spool = spoolDir()
+		}
+		ds, err := pqc.NewDirSink(spool)
+		if err != nil {
+			return nil, fmt.Errorf("stream %s: the spool %s: %w", name, spool, err)
+		}
+		return ds, nil
+	}
+	if store == "" {
+		if noSpool {
+			return nil, nil, fmt.Errorf("stream %s has no store and no spool: "+
+				"nowhere to write parquet", name)
+		}
+		first, err = local()
+		return first, nil, err
+	}
+	root, err := t.files(store)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, _, bucket := parseS3Root(store); !bucket || noSpool {
+		return root, nil, nil
+	}
+	first, err = local()
+	return first, root, err
+}
+
 // files answers where the files of a store go: the store itself, a
 // directory or a bucket. The store is one resolve answered.
 func (t *process) files(store string) (pqc.Sink, error) {

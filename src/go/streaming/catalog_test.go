@@ -138,3 +138,64 @@ func itoa(n int64) string {
 	}
 	return string(b)
 }
+
+// The dated copies of the catalog: one when the catalog first exists,
+// another when it changed and the interval passed, none while it is
+// the same; and none at all when the options say so.
+func TestCatalogDatedCopies(t *testing.T) {
+	copies := func(dir, name string) []string {
+		found, _ := filepath.Glob(filepath.Join(dir, "streams", filepath.FromSlash(name), "catalog.2*.sqlite"))
+		return found
+	}
+	dir := t.TempDir()
+	tel, err := newProcess(processConfig{Store: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tel.Close()
+	s, err := tel.CreateStream("t/copies", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400},
+		Parquet: &ParquetOptions{CheckpointSeconds: 0.05, CatalogCopySeconds: 1.2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRows(t, s, 0, 10)
+	s.Cut()
+	waitCatalog(t, s, 1)
+	waitUntil(t, "the first dated copy", func() bool { return len(copies(dir, "t/copies")) == 1 })
+	// the catalog changes, the interval has not passed: no copy yet
+	writeRows(t, s, 10, 10)
+	s.Cut()
+	waitCatalog(t, s, 2)
+	if n := len(copies(dir, "t/copies")); n != 1 {
+		t.Fatalf("%d copies before the interval passed", n)
+	}
+	// the interval passes; a write pokes the catalog: the second copy
+	time.Sleep(1300 * time.Millisecond)
+	writeRows(t, s, 20, 10)
+	waitUntil(t, "the second dated copy", func() bool { return len(copies(dir, "t/copies")) == 2 })
+	// nothing changes: no third copy, however long
+	time.Sleep(1300 * time.Millisecond)
+	writeRows(t, s, 30, 10)
+	time.Sleep(300 * time.Millisecond)
+	if n := len(copies(dir, "t/copies")); n != 2 {
+		t.Fatalf("%d copies of a catalog that changed twice", n)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	none, err := tel.CreateStream("t/nocopies", testSchema(), StreamOptions{Memory: &MemoryOptions{Rows: 400},
+		Parquet: &ParquetOptions{CatalogCopySeconds: -1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRows(t, none, 0, 10)
+	none.Cut()
+	waitCatalog(t, none, 1)
+	if err := none.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(copies(dir, "t/nocopies")); n != 0 {
+		t.Fatalf("%d copies with the copies off", n)
+	}
+}

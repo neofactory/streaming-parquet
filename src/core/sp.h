@@ -816,6 +816,20 @@ int64_t sp_catalog_staged(const SpCatalog *c);
 int sp_catalog_bytes(SpCatalog *c, uint8_t **out, size_t *out_len,
                      Report *report);
 
+/* DATED COPIES OF THE CATALOG. Beside the published catalog a writer
+ * keeps copies of it, catalog.<YYYYMMDD-HHMMSS>.sqlite, the history a
+ * mistake can be undone from. A copy is due when the catalog changed
+ * since the last copy or check, and copy_seconds have passed since the
+ * newest copy (always, when there is none). The interval counts from
+ * the time in the newest copy's own name, so a writer that starts
+ * again makes no extra copy. has_copy: there is a copy; copy_wall: the
+ * time its name says, as wall-clock seconds. changed: the published
+ * catalog is not the version of the last copy or check. Returns 1 when
+ * a copy is due. The host then makes it only if the catalog's bytes
+ * differ from the newest copy's. Reads the wall clock. */
+int sp_catalog_copy_due(double copy_seconds, int has_copy, double copy_wall,
+                        int changed);
+
 void sp_free(void *p);
 
 /* FOR TESTS ONLY (report.h: TIME). fixed 1: from now on the core's wall

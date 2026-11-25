@@ -33,6 +33,7 @@ package streaming
 import "C"
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -79,6 +80,15 @@ type catalog struct {
 	awaiting   map[string]bool
 	dropOwed   bool // files left the record; the ticket is not yet written without them
 
+	// The dated copies of the catalog, catalog.<YYYYMMDD-HHMMSS>.sqlite
+	// beside it. When one is due is the core's rule (sp.h: DATED COPIES OF
+	// THE CATALOG). Under mu, but for the pass goroutine's own steps.
+	copySeconds float64 // the interval; negative = no copies
+	copyScanned bool    // the folder was looked at for the newest copy
+	newestCopy  string  // its name, "" for none
+	copyWall    float64 // the time its name says
+	copySeen    string  // the catalog's version at the last copy or check
+
 	cat *C.SpCatalog // the pass goroutine's alone
 }
 
@@ -88,7 +98,108 @@ func newCatalog(name, folder string, sink pqc.Sink, store *storeState, writeTick
 		return nil // a sink that cannot publish by version: no catalog
 	}
 	return &catalog{name: name, folder: folder, sink: sink, vs: vs, store: store,
-		writeTicket: writeTicket, awaiting: map[string]bool{}, wanted: true, log: log}
+		writeTicket: writeTicket, awaiting: map[string]bool{}, wanted: true, log: log,
+		copySeconds: defaultCatalogCopySeconds}
+}
+
+// defaultCatalogCopySeconds: a dated copy a day (the Python
+// ParquetOptions.catalog_copy_seconds default).
+const defaultCatalogCopySeconds = 86400.0
+
+// setCopySeconds sets the interval of the dated copies: 0 = a day,
+// negative = no copies.
+func (c *catalog) setCopySeconds(seconds float64) {
+	if seconds == 0 {
+		seconds = defaultCatalogCopySeconds
+	}
+	c.mu.Lock()
+	c.copySeconds = seconds
+	c.mu.Unlock()
+}
+
+// copyDue: a dated copy is due, by the core's rule. Caller holds mu. No
+// I/O.
+func (c *catalog) copyDue() bool {
+	if c.copySeconds < 0 || c.etag == "" {
+		return false
+	}
+	has, changed := C.int(0), C.int(0)
+	if c.newestCopy != "" {
+		has = 1
+	}
+	if c.etag != c.copySeen {
+		changed = 1
+	}
+	return C.sp_catalog_copy_due(C.double(c.copySeconds), has, C.double(c.copyWall), changed) != 0
+}
+
+const copyStamp = "20060102-150405"
+
+// copyPass makes a dated copy of the published catalog when one is due
+// and the catalog differs from the newest copy. The pass goroutine's.
+func (c *catalog) copyPass() error {
+	c.mu.Lock()
+	off, scanned := c.copySeconds < 0, c.copyScanned
+	c.mu.Unlock()
+	if off {
+		return nil
+	}
+	if !scanned {
+		names, err := c.sink.List("catalog.")
+		if err != nil {
+			return err
+		}
+		newest, wall := "", 0.0
+		for _, n := range names {
+			stamp, ok := strings.CutPrefix(n, "catalog.")
+			stamp, ok2 := strings.CutSuffix(stamp, ".sqlite")
+			if !ok || !ok2 {
+				continue
+			}
+			when, err := time.ParseInLocation(copyStamp, stamp, time.Local)
+			if err != nil {
+				continue // catalog.sqlite itself, or another file
+			}
+			if w := float64(when.Unix()); newest == "" || w > wall {
+				newest, wall = n, w
+			}
+		}
+		c.mu.Lock()
+		c.copyScanned, c.newestCopy, c.copyWall = true, newest, wall
+		c.mu.Unlock()
+	}
+	c.mu.Lock()
+	due, etag, newest := c.copyDue(), c.etag, c.newestCopy
+	c.mu.Unlock()
+	if !due {
+		return nil
+	}
+	now, _, err := c.vs.GetVersion(catalogObject)
+	if err != nil {
+		return err
+	}
+	if newest != "" {
+		was, _, err := c.vs.GetVersion(newest)
+		if err != nil {
+			return err
+		}
+		if bytes.Equal(now, was) {
+			c.mu.Lock()
+			c.copySeen = etag // unchanged since that copy
+			c.mu.Unlock()
+			return nil
+		}
+	}
+	when := time.Now()
+	name := "catalog." + when.Format(copyStamp) + ".sqlite"
+	if err := c.sink.Put(name, now); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.newestCopy, c.copyWall, c.copySeen = name, float64(when.Unix()), etag
+	c.mu.Unlock()
+	c.log.Info(fmt.Sprintf("[%s] catalog: dated copy %s%s", c.name, c.folder, name))
+	return nil
 }
 
 func (c *catalog) state() (files int, errText string) {
@@ -111,7 +222,7 @@ func (c *catalog) await(file string) {
 // poke starts a pass if one is owed and none runs.
 func (c *catalog) poke() {
 	c.mu.Lock()
-	if c.running || c.stopped || !c.wanted {
+	if c.running || c.stopped || !(c.wanted || c.copyDue()) {
 		c.mu.Unlock()
 		return
 	}
@@ -129,6 +240,7 @@ func (c *catalog) run() {
 		names, err := c.pass()
 		if err == nil {
 			c.listed(names)
+			err = c.copyPass()
 		}
 		c.mu.Lock()
 		switch {

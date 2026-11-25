@@ -314,7 +314,7 @@ func (a *Attached) beginFile(mark int64) error {
 			}
 			a.owner = own
 		}
-		arch, err := newArchiver(a.ring, a.Name, a.run, opts, a.files, nil, nil, a.log)
+		arch, err := newArchiver(a.ring, a.Name, a.run, opts, a.files, nil, nil, nil, a.log)
 		if err != nil {
 			return err
 		}

@@ -440,8 +440,9 @@ prefix) or a whole directory, whose contents are the layout. A bucket
 store is written through the spool, the local write-behind copy at
 `/var/tmp/streaming-parquet/<user>/` unless `spool=` says where, or
 `spool=None` for the bucket as the only copy; a directory store is
-written straight into. The Go host writes straight into its store, a
-directory or a bucket: it has no spool yet. Severity follows the shape: the first copy failing
+written straight into. The Go host has the same spool and the same
+mirror: the mirror's rules are the C core's (`src/core/pqc.h`, THE
+MIRROR), and each host does what the core asks. Severity follows the shape: the first copy failing
 means rows are durable nowhere but the ring, and `archive_state()`
 says so (`failing`, the last error, `lost_rows` for rows recycled
 before their flush, the location, the open `file`); the mirror failing
@@ -688,7 +689,11 @@ s, _ := streaming.CreateStream("press/fieldbus", schema,
                 CheckpointSeconds: 2}})   // nil = no files until a StartParquet
 // The files go to the store, at <store>/streams/<name>/. A store is a
 // directory or a whole bucket ("s3://my-bucket", on the standard AWS
-// credential chain); a stream with no store is refused parquet.
+// credential chain). A bucket is written through a spool on the local
+// disk (StreamOptions.Spool, default /var/tmp/streaming-parquet/<user>;
+// NoSpool: the bucket is the first copy) and mirrored every
+// ParquetOptions.ShipSeconds; s.MirrorState() says how that goes. A
+// stream with no store writes its files to the spool alone.
 // Memory holds two row groups: MemoryOptions.Rows and
 // ParquetOptions.RowGroupRows default to 245,760 and DuckDB's 122,880;
 // give one and the other follows; memory under two row groups is refused.

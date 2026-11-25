@@ -16,6 +16,13 @@
 /* The core's clock (report.h: TIME): the system's, or a test's. */
 static ReportClock g_clock;
 
+int sp_catalog_copy_due(double copy_seconds, int has_copy, double copy_wall,
+                        int changed) {
+    if (!changed || !(copy_seconds >= 0)) return 0;
+    if (!has_copy) return 1;
+    return report_wall(&g_clock) - copy_wall >= copy_seconds;
+}
+
 void sp_test_set_clock(int fixed, double wall, double mono) {
     g_clock.fixed = fixed;
     g_clock.wall = wall;

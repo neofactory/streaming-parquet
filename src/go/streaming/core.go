@@ -469,6 +469,33 @@ func (st *storeState) stored(file string, version int, checkpoint string, finalR
 	st.took(&r)
 }
 
+// covers: a checkpoint version is written in the first copy, which is
+// not the store (a spool): it holds finalRows in finished row groups,
+// and rows in all. The store has it when the mirror sends it (inStore).
+func (st *storeState) covers(file string, version int, checkpoint string, finalRows, rows int64) {
+	cf, cc := C.CString(file), C.CString(checkpoint)
+	defer C.free(unsafe.Pointer(cf))
+	defer C.free(unsafe.Pointer(cc))
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	var r report
+	C.sp_store_covers(st.p, cf, C.int64_t(version), cc, C.int64_t(finalRows), C.int64_t(rows), &r.c)
+	st.took(&r)
+}
+
+// inStore: the mirror put the checkpoint version in the store; it holds
+// rows of the file.
+func (st *storeState) inStore(file string, version int, checkpoint string, rows int64) {
+	cf, cc := C.CString(file), C.CString(checkpoint)
+	defer C.free(unsafe.Pointer(cf))
+	defer C.free(unsafe.Pointer(cc))
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	var r report
+	C.sp_store_stored(st.p, cf, C.int64_t(version), cc, C.int64_t(rows), &r.c)
+	st.took(&r)
+}
+
 // finished: the file is finished in the store; it leaves the ticket.
 func (st *storeState) finished(file string) {
 	cf := C.CString(file)
