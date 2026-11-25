@@ -46,14 +46,14 @@ class Ownership:
             self._fd = None
 
 
-def claim(name, lock_dir, store, host, port, run):
+def claim(name, lock_dir, store, host, port, run, who=None):
     """Own the stream `name`, or raise naming who does.
 
     lock_dir: the local directory the lock file lives under.
     store:    the stream's store, for the ticket check; None = no ticket.
     host, port, run: this writer's identity, written into the lock file.
     """
-    who = f"create_stream({name!r})"
+    who = who or f"create_stream({name!r})"
     path = os.path.join(lock_dir, "streams", name, "writer.lock")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)

@@ -35,6 +35,19 @@ func (o *ownership) release() {
 	}
 }
 
+// copyLockDir is the local directory the lock of a reader's own files
+// is under. A directory store holds its own lock. For a bucket it is
+// not the directory of lockDir: a writer of the same name on this
+// machine has its lock there.
+func copyLockDir(store string) string {
+	root := strings.TrimPrefix(store, "file://")
+	if !strings.Contains(root, "://") {
+		return root
+	}
+	bucket, _, _ := parseS3Root(store)
+	return filepath.Join(lockDir(""), "copies", bucket)
+}
+
 // lockDir is the local directory lock files live under.
 func lockDir(store string) string {
 	root := strings.TrimPrefix(store, "file://")
@@ -51,9 +64,10 @@ func lockDir(store string) string {
 // claim owns the stream name, or returns an error that names who does.
 // store and tickets are the stream's: "" and nil for a stream with no
 // store.
-func (t *process) claim(name, run, store string, tickets ticketStore) (*ownership, error) {
-	who := fmt.Sprintf("CreateStream(%q)", name)
-	path := filepath.Join(lockDir(store), "streams", filepath.FromSlash(name), "writer.lock")
+// who names the caller in a refusal; dir is the local directory the
+// lock file is under.
+func (t *process) claim(who, dir, name, run, store string, tickets ticketStore) (*ownership, error) {
+	path := filepath.Join(dir, "streams", filepath.FromSlash(name), "writer.lock")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("%s: the lock file's directory: %w", who, err)
 	}

@@ -323,10 +323,6 @@ func TestStartParquetOnAStreamCreatedWithNone(t *testing.T) {
 		t.Fatal("a stream created with none has parquet options")
 	}
 	writeRows(t, s, 0, 25)
-	if err := s.StartParquet("X", nil); err == nil ||
-		!strings.Contains(err.Error(), "needs ParquetOptions") {
-		t.Fatalf("StartParquet with no options: %v, want it refused", err)
-	}
 	if err := s.StartParquet("X", &ParquetOptions{RowGroupRows: 300}); err == nil ||
 		!strings.Contains(err.Error(), "less than two row groups") {
 		t.Fatalf("a row group of 300 in a ring of 400: %v, want it refused", err)

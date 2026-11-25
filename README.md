@@ -109,7 +109,7 @@ These are the Python names. Go has the same concepts: see [Python and Go: the sa
 
 **Module**
 - `create_stream(name, schema, store, spool, memory, parquet, publish)` — create and own a stream (one writer per stream). `parquet=None` writes no files until a `start_parquet`; `publish=False` makes an internal stream.
-- `connect(name, store, memory, columns)` — attach to a stream for reading (zero-copy in-process; Arrow Flight over the network). A reader that starts before its writer waits for it; a path whose folder does not exist is an error at once.
+- `connect(name, store, memory, columns, parquet_store, parquet)` — attach to a stream for reading (zero-copy in-process; Arrow Flight over the network). A reader that starts before its writer waits for it; a path whose folder does not exist is an error at once. With `parquet_store`, a store of the reader's own, the reader can write the rows it receives to files.
 - `list_streams(store)` — list stream names with a ticket in the store.
 - `create_playback_stream(name, parquet_path, ...)` — replay a recorded `.parquet` file as a live stream.
 - `cut(label)` / `start_parquet(label, options)` / `stop_parquet()` — roll, start, or pause archival across all local streams.
@@ -126,6 +126,10 @@ These are the Python names. Go has the same concepts: see [Python and Go: the sa
 - `wire_map(entries)` / `from_wire(wmap, frame)` — scatter packed binary frames directly into ring columns in one C call.
 - `cut(label)` / `start_parquet(label, options)` / `stop_parquet()` — roll to a new file (with optional filename label), or toggle archival while keeping the stream live. `start_parquet` is a mark in the stream: the new file holds the rows committed after it.
 - `publish()` / `unpublish()` — make the stream published or internal while it runs.
+
+**A reader that writes files** (connected with `parquet_store`)
+- `start_parquet(label, options)` / `stop_parquet()` / `cut(label)` — as on a stream, for the rows the reader receives. The files go to `<parquet_store>/streams/<name>/` and keep the writer's run and row numbers. No ticket and no catalog names them.
+- `archive_state()` / `get_durable_row_number()` — the state of the reader's own files.
 
 **Reading (`Stream` and connected readers)**
 - `newest_row()` — read the latest committed row in memory.
@@ -162,6 +166,7 @@ The rule: the two languages have the same concepts, the same words and the same 
 | The state of the files and of memory | `s.archive_state()`; `s.mirror_state()`; `s.memory_state()` | `s.ArchiveState()`; `s.MemoryState()` |
 | The last row committed, and the newest row safe in a file | `s.get_newest_row_number()`; `s.get_durable_row_number()` | `s.NewestRowNumber()`; `s.DurableRowNumber()` |
 | Read a stream | `a = sp.connect(name, store=...)` | `a, err := streaming.Connect(name, ConnectOptions{...})` |
+| A reader that writes files of its own | `parquet_store=`, `parquet=`; then `a.start_parquet`, `a.stop_parquet`, `a.cut`, `a.archive_state`, `a.get_durable_row_number` | `ParquetStore:`, `Parquet:`; then `a.StartParquet`, `a.StopParquet`, `a.Cut`, `a.CutLabel`, `a.ArchiveState`, `a.DurableRowNumber` |
 | Read rows (a stream and a reader alike) | `a.newest_row()`; `a.cursor()`; `a.arrow_table()` | `a.NewestRow()`; `a.Cursor()`; `a.ArrowTable()`, `a.ArrowTableNewest(rows)` |
 | One value of a row | `row.x` | `v, null, err := row.F64(x)` |
 | A reader's state, and why it is not streaming | `a.state`; `a.reason` | `a.State()`; `a.Reason()` |
@@ -186,7 +191,6 @@ Not yet the same (each of these is a difference in words or in reach, not in the
 - **Published**: Go's option is `Internal` (the reverse sense of `publish`).
 - **The spool**: Go has none, so no `ship_seconds` and no mirror state: with a bucket store, the bucket is the first copy. Python with no store writes its files to the spool; Go with no store writes none.
 - **Views**: Go has none.
-- **A reader that writes files**: Go's reader can (`ConnectOptions.Parquet`, with `ParquetStore`, a store of its own for its files); Python's cannot.
 - **A row's number**: Go's rows have `RowNumber()`; Python's rows do not show it.
 - **Rows from a value on**: Python's `cursor` and `arrow_table` take `since=(column, value)`; Go's do not.
 - **One flat row from a dict**: Python's `append` takes one; Go has no such form.

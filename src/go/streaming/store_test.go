@@ -1,9 +1,11 @@
 package streaming
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A Go writer's ticket says what the store holds: the newest stored
@@ -127,4 +129,88 @@ func TestFilesGoToTheStore(t *testing.T) {
 	_, err = tel.Connect("t/where", ConnectOptions{Store: store, Parquet: &ParquetOptions{},
 		ParquetStore: "file://" + store + "/"})
 	refused("a reader whose files would go to the writer's folder", err, "a store of its own")
+}
+
+// A reader's own files: the rows it receives, with the writer's row
+// numbers, written from a StartParquet on; a cut, the state and the
+// durable row number as a stream has them; and one reader for a folder.
+func TestAReaderWritesFilesOfItsOwn(t *testing.T) {
+	tel, err := newProcess(processConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tel.Close()
+	store, copies := t.TempDir(), t.TempDir()
+	s, err := tel.CreateStream("t/copy", testSchema(), StreamOptions{Store: store,
+		Memory: &MemoryOptions{Rows: 400}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := tel.Connect("t/copy", ConnectOptions{Store: store, ParquetStore: copies,
+		Memory: &MemoryOptions{Rows: 400}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.WaitConnected(5 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	received := func(n int64) func() bool {
+		return func() bool { row, ok := a.NewestRow(); return ok && row.RowNumber() >= n }
+	}
+	writeRows(t, s, 0, 10)
+	waitUntil(t, "10 rows received", received(9))
+	if st := a.ArchiveState(); st.File != "" || a.DurableRowNumber() != -1 {
+		t.Fatalf("before StartParquet: %+v, durable %d", st, a.DurableRowNumber())
+	}
+	// the mark: rows 10 and later, with the label, by the default options
+	if err := a.StartParquet("job", &ParquetOptions{CheckpointSeconds: 0.05}); err != nil {
+		t.Fatal(err)
+	}
+	writeRows(t, s, 10, 10)
+	waitUntil(t, "row 19 stored", func() bool { return a.DurableRowNumber() == 19 })
+	if st := a.ArchiveState(); st.Failing || st.File == "" || !strings.Contains(st.Location, copies) {
+		t.Fatalf("while it writes: %+v", st)
+	}
+	if err := a.CutLabel("next"); err != nil {
+		t.Fatal(err)
+	}
+	writeRows(t, s, 20, 5)
+	waitUntil(t, "row 24 stored", func() bool { return a.DurableRowNumber() == 24 })
+
+	// a second reader of the same folder is refused, and says who has it
+	b, err := tel.Connect("t/copy", ConnectOptions{Store: store, ParquetStore: copies,
+		Memory: &MemoryOptions{Rows: 400}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.WaitConnected(5 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.StartParquet("b", nil); err == nil || !strings.Contains(err.Error(), "writer.lock") {
+		t.Fatalf("a second reader of the folder: %v, want it refused", err)
+	}
+	if st := b.ArchiveState(); !st.Failing {
+		t.Fatalf("the refused reader's state: %+v", st)
+	}
+	b.Close()
+
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	files, _ := filepath.Glob(filepath.Join(copies, "streams", "t", "copy", "*.parquet"))
+	if len(files) != 2 || !strings.Contains(filepath.Base(files[0]), "job") ||
+		!strings.Contains(filepath.Base(files[1]), "next") {
+		t.Fatalf("the reader's files: %v", files)
+	}
+	if _, err := os.Stat(filepath.Join(copies, "tickets")); err == nil {
+		t.Fatal("a reader's files got a ticket")
+	}
+	plain, err := tel.Connect("t/copy", ConnectOptions{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := plain.StartParquet("x", nil); err == nil ||
+		!strings.Contains(err.Error(), "no store for files") {
+		t.Fatalf("a reader with no ParquetStore: %v, want it refused", err)
+	}
 }

@@ -232,7 +232,7 @@ func runSub(store, name, kind string, rate int,
 	defer a.Close()
 	session := 0
 	if archdir != "-" {
-		if err := a.StartParquet(fmt.Sprintf("a%03d", session)); err != nil {
+		if err := a.StartParquet(fmt.Sprintf("a%03d", session), nil); err != nil {
 			die(err)
 		}
 	}
@@ -293,7 +293,7 @@ func runSub(store, name, kind string, rate int,
 			}
 			st.Files++
 			session++
-			if err := a.StartParquet(fmt.Sprintf("a%03d", session)); err != nil {
+			if err := a.StartParquet(fmt.Sprintf("a%03d", session), nil); err != nil {
 				st.Errors++
 				st.Note = "start: " + err.Error()
 			}

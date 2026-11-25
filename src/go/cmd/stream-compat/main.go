@@ -346,7 +346,7 @@ func main() {
 		}
 		defer a.Close()
 		if pqdir != "" {
-			if err := a.StartParquet(label); err != nil {
+			if err := a.StartParquet(label, nil); err != nil {
 				die(err)
 			}
 		}

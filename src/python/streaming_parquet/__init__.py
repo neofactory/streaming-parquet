@@ -38,6 +38,12 @@ calls one of the reader verbs, and it all just works.
     a.duckdb_all(con)                    # memory plus the files, exact
     a.name, a.schema, a.state, a.reason, a.memory_state(), a.close()
 
+    # ---- a reader that writes files of its own ------------------------
+    a = sp.connect(name, store=STORE, parquet_store="/data/copies",
+            parquet=sp.ParquetOptions(...))      # None = no files until start_parquet
+    a.start_parquet(label, options), a.stop_parquet(), a.cut(label)
+    a.archive_state(), a.get_durable_row_number()
+
     # ---- module ---------------------------------------------------------
     sp.list_streams(store=STORE)
     sp.create_playback_stream(name, parquet_path)
@@ -66,7 +72,8 @@ from ._parquet_writer import ParquetWriter
 from ._options import (MemoryOptions, ParquetOptions, ArchiveState,  # noqa: F401
                        MirrorState, MemoryState, View)
 from ._stream import Stream, DEFAULT_ROW_GROUP_ROWS, KEEP_LABEL  # noqa: F401 -- public API
-from ._attach import Attached, Cursor, _Feeder  # noqa: F401
+from ._attach import Attached, Cursor, _Feeder, _Copy  # noqa: F401
+from ._files import _ring_sizes
 from ._flight_server import start_flight_server
 
 from arrow_ring import StaleReadError, PinStalledError  # noqa: F401 -- public
@@ -293,7 +300,8 @@ def create_playback_stream(name, parquet_path, *,
     return stream
 
 
-def connect(name=None, store=None, memory=None, columns=None, ticket=None):
+def connect(name=None, store=None, memory=None, columns=None, ticket=None,
+            parquet=None, parquet_store=None):
     """Connect to a stream for reading (non-blocking).
 
     Dispatch:
@@ -313,6 +321,17 @@ def connect(name=None, store=None, memory=None, columns=None, ticket=None):
     `name` may be a fully-qualified stream URI
     ("s3://bucket/streams/air/dfw"): the store rides in the name.
 
+    A reader that writes files: `parquet_store` names a store of the
+    reader's own, and the rows it receives are written to
+    <parquet_store>/streams/<name>/ as a stream's are, with the row
+    numbers and the run the writer gave them. `parquet` (a
+    ParquetOptions) writes them from the first row received; without it
+    no file is written until `a.start_parquet(label, options)`. The
+    files are plain parquet files: no ticket and no catalog names them,
+    and they are written straight into the store (no spool). It cannot
+    be the store the stream is in: that folder is the writer's. Such a
+    reader has memory of its own, also for a stream of this process.
+
     Returns a Stream to read. Check `.state`: "streaming" means data
     flows; "store-unreachable", "no-ticket", "waiting", "connecting",
     "reconnecting" say why not, and `.reason` says it in words.
@@ -327,10 +346,28 @@ def connect(name=None, store=None, memory=None, columns=None, ticket=None):
         store, name = _tickets.parse_stream_uri(name)
     if store is not None:
         _tickets.parse_store(store)      # refused now, not in the feeder thread
+    if parquet is not None and not isinstance(parquet, ParquetOptions):
+        raise TypeError(f"connect: parquet must be a ParquetOptions, got "
+                        f"{type(parquet).__name__}")
+    shown = name if name is not None else ticket.get("name")
+    if parquet is not None and parquet_store is None:
+        raise ValueError(
+            f"connect({shown!r}): a reader with parquet= needs "
+            f"parquet_store=: the store its files go to")
+    if parquet_store is not None:
+        _tickets.parse_store(parquet_store)
+        reads = store if store is not None else (
+            None if ticket is not None else _tickets.resolve_store())
+        if reads is not None and _same_store(parquet_store, reads):
+            raise ValueError(
+                f"connect({shown!r}): parquet_store {parquet_store!r} is "
+                f"the store the stream is in, and streams/{shown}/ there "
+                f"holds its writer's files. Give this reader a store of "
+                f"its own for its files")
 
     # Local fast path: the stream is published here, and the caller
     # names no other store.
-    if ticket is None and name is not None:
+    if ticket is None and name is not None and parquet_store is None:
         with _lock:
             local = _streams.get(name)
         if local is not None and (store is None or store == local._store):
@@ -365,19 +402,26 @@ def connect(name=None, store=None, memory=None, columns=None, ticket=None):
             s = _streams.get(name)
             in_folder = any(n.startswith(folder) for n in _streams)
         if s is not None and (s._closed or columns is not None
+                              or parquet_store is not None
                               or not (store is None or store == s._store)):
             s = None
         return s, in_folder
 
     memory = memory or MemoryOptions()
+    # the reader's ring: as a stream's, it holds two row groups of the
+    # files it writes
+    capacity = _ring_sizes(resolved_name, memory.rows,
+                           parquet.row_group_rows if parquet else None)[0]
+    copy = (None if parquet_store is None else
+            _Copy(resolved_name, parquet_store, parquet, capacity))
     feeder = _Feeder(resolved_name, ticket=ticket, store=feeder_store,
-                     capacity=(memory.rows if memory.rows is not None
-                               else 2 * DEFAULT_ROW_GROUP_ROWS),
+                     capacity=capacity, copy=copy,
                      columns=columns, segment_bytes=memory.segment_bytes,
                      local=local if ticket is None else None,
                      who=(f"connect({name!r})" if ticket is None
                           else f"connect(ticket={resolved_name!r})"))
-    a = Attached(data=None, feeder=feeder, on_close=_forget_attached)
+    a = Attached(data=None, feeder=feeder, on_close=_forget_attached,
+                 unarchived=copy.rows_unarchived if copy is not None else None)
     if feeder_store is not None:
         from ._views import TicketSource
 
@@ -390,6 +434,19 @@ def connect(name=None, store=None, memory=None, columns=None, ticket=None):
         _feeders[id(feeder)] = feeder
         _attached[id(a)] = a
     return a
+
+
+def _same_store(a, b):
+    """True when two store names are one place."""
+    def place(store):
+        kind, where = _tickets.parse_store(store)
+        if kind == "dir":
+            where = os.path.realpath(where)
+        return kind, where
+    try:
+        return place(a) == place(b)
+    except Exception:
+        return False
 
 
 def _forget_stream(stream):

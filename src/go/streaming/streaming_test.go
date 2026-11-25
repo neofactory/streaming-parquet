@@ -131,7 +131,7 @@ func TestAttachedArchivesParquet(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Close()
-	if err := a.StartParquet("SYM"); err != nil { // pre-connect: arms
+	if err := a.StartParquet("SYM", nil); err != nil { // pre-connect: arms
 		t.Fatal(err)
 	}
 	time.Sleep(300 * time.Millisecond) // let the subscriber connect

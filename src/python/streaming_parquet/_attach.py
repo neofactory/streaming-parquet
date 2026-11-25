@@ -28,6 +28,9 @@ nothing calls them back (house polling idiom).
     a.duckdb_all(con)                    memory plus the files, exact
     a.memory_state()                     rows held, rows not on disk
     a.name, a.schema, a.state, a.reason, a.close()
+    a.start_parquet(label, options), a.stop_parquet(), a.cut(label)
+    a.archive_state(), a.get_durable_row_number()
+                                    # a reader with a parquet_store
 
 Feeder states (attached.state):
     "store-unreachable" -- the store can't be read (remote)
@@ -39,6 +42,7 @@ Feeder states (attached.state):
     "closed"       -- shut down (or local publisher closed)
 """
 
+import os
 import re
 import threading
 import time
@@ -49,7 +53,8 @@ import pyarrow.flight as flight
 from arrow_ring import StaleReadError
 
 from ._diag import _diag
-from ._options import MemoryState, View
+from ._options import ArchiveState, MemoryState, ParquetOptions, View
+from ._files import Files, KEEP_LABEL, _ring_sizes
 from ._stream_data import _StreamData
 from . import _tickets
 
@@ -386,6 +391,51 @@ class Attached:
     def _ring(self):
         return self._require().ring
 
+    # ---- a reader that writes files ---------------------------------------
+
+    def _copy(self, call):
+        """The reader's own files (_Copy), or the reason it has none."""
+        copy = self._feeder.copy if self._feeder is not None else None
+        if copy is None:
+            if self._feeder is None:
+                raise ValueError(
+                    f"{call}: this reader reads a stream of this process "
+                    f"in place, and that stream writes the files; a reader "
+                    f"writes files of its own when it is connected with "
+                    f"parquet_store=")
+            raise ValueError(
+                f"{call}: this reader has no store for files: "
+                f"connect({self.name!r}, ..., parquet_store=...) names it")
+        return copy
+
+    def start_parquet(self, label=None, options=None):
+        """Start a new file of the rows this reader receives, as
+        Stream.start_parquet does for the rows a stream writes: a mark
+        in the rows, `label` in the file's name, `options` (a
+        ParquetOptions) for the files from this one on. The files go to
+        <parquet_store>/streams/<name>/. Before the first connection it
+        is noted, and the files begin with the first row received."""
+        self._copy("start_parquet").start(label, options)
+
+    def stop_parquet(self):
+        """End the open file, with every row received up to now in it."""
+        self._copy("stop_parquet").stop()
+
+    def cut(self, label=KEEP_LABEL):
+        """End the current file at the last row received; the next row
+        begins a new file. `label`: omitted keeps the current label,
+        None clears it, a string sets it."""
+        self._copy("cut").cut(label)
+
+    def archive_state(self):
+        """The standing of this reader's own files (ArchiveState)."""
+        return self._copy("archive_state").archive_state()
+
+    def get_durable_row_number(self):
+        """The number of the newest row that is in a written piece of
+        one of this reader's files or in a checkpoint; -1 for none."""
+        return self._copy("get_durable_row_number").durable_row_number()
+
     # ---- lifecycle ---------------------------------------------------------
 
     def close(self):
@@ -423,6 +473,159 @@ def _side_data(meta):
     return (seq if seq >= 0 else None), revision
 
 
+class _Copy:
+    """A reader's own files: the rows it receives, written to a store
+    of its own at <store>/streams/<name>/, with the row numbers and the
+    run the writer gave them. The files are plain parquet files: no
+    ticket and no catalog names them. Each ring the reader has (one for
+    each run of the writer) has its Files; when the writer starts again
+    the open file ends and the new run's rows begin a new one.
+
+    The reader is the one writer of that folder: it holds the folder's
+    writer lock from its first file until it closes."""
+
+    def __init__(self, name, store, options, capacity):
+        self.name = name
+        self.store = store                # where the files go
+        self.options = options            # ParquetOptions, or None for the defaults
+        self.on = options is not None     # files from the next row received
+        self.label = None
+        self.capacity = capacity
+        self.files = None                 # the Files of the ring in hand
+        self._owner = None
+        self._lock = threading.Lock()     # the Files' lock
+        self._guard = threading.RLock()   # on, label, options, files
+        self._refused = None              # why a start was refused, or None
+        self._durable_row = -1
+
+    def _own(self, run):
+        if self._owner is None:
+            from . import _owner, _tickets
+            from ._stream import _get_local_ip
+            kind, where = _tickets.parse_store(self.store)
+            if kind == "dir":
+                lock_dir = where
+            else:
+                # not the spool's own lock directory: a writer of this
+                # name on this machine has its lock there
+                lock_dir = os.path.join(_tickets.DEFAULT_SPOOL, "copies",
+                                        str(where))
+            self._owner = _owner.claim(
+                self.name, lock_dir, self.store, _get_local_ip(), 0, run,
+                who=f"connect({self.name!r}, parquet_store={self.store!r})")
+
+    def _make_writer(self, schema, run, options):
+        from . import _writer_for
+        writer = _writer_for(self.name, schema, self.store, None, options, run)
+        writer.start()
+        return writer
+
+    def ring_made(self, data, run):
+        """The reader has a ring: its rows can become files."""
+        from ._clock import run_start
+        run = run or run_start()
+        with self._guard:
+            self.files = Files(
+                self.name, data, self.capacity, self._lock,
+                options=self.options,
+                make_writer=lambda o: self._make_writer(data.schema, run, o),
+                own=lambda: self._own(run))
+
+    def before_rows(self, first_row):
+        """Rows are about to be put in the ring, the first with this
+        number: a reader whose files are on begins its file with it."""
+        with self._guard:
+            files = self.files
+            if not self.on or files is None or files.recording:
+                return
+            try:
+                files.start(self.label, self.options, mark=first_row)
+                self._refused = None
+            except Exception as e:
+                # refused (another writer has the folder, no such
+                # place): said once, and tried again at the next start
+                self.on = False
+                self._refused = str(e)
+                _diag.error(f"[{self.name}] this reader's files: {e}")
+
+    def after_rows(self):
+        """Rows were put in the ring, or a quiet second passed: a write
+        that is due is handed to the worker pool."""
+        files = self.files
+        if files is not None:
+            files.step()
+
+    def ring_dropped(self):
+        """The ring goes (the writer started again, or the reader
+        closes): the open file ends with every row received in it."""
+        with self._guard:
+            files, self.files = self.files, None
+        if files is None:
+            return
+        self._durable_row = max(self._durable_row, files.durable_row_number())
+        try:
+            files.stop()
+            if not files.finish(timeout=5.0):
+                _diag.warning(f"[{self.name}] this reader's files: the "
+                              f"last writes did not finish in 5 s")
+        except Exception as e:
+            _diag.error(f"[{self.name}] this reader's files: ending the "
+                        f"file failed: {e}")
+
+    def close(self):
+        self.ring_dropped()
+        if self._owner is not None:
+            self._owner.release()
+            self._owner = None
+
+    # ---- the reader's calls ------------------------------------------------
+
+    def start(self, label, options):
+        if options is not None and not isinstance(options, ParquetOptions):
+            raise TypeError(f"start_parquet: options must be a "
+                            f"ParquetOptions, got {type(options).__name__}")
+        with self._guard:
+            if options is not None:
+                _ring_sizes(self.name, self.capacity, options.row_group_rows)
+                self.options = options
+            self.label = label
+            self.on = True
+            self._refused = None
+            if self.files is not None:
+                self.files.start(label, options)
+
+    def stop(self):
+        with self._guard:
+            self.on = False
+            if self.files is not None:
+                self.files.stop()
+
+    def cut(self, label):
+        with self._guard:
+            if label is not KEEP_LABEL:
+                self.label = label
+            if self.files is not None:
+                self.files.cut(label)
+
+    def archive_state(self):
+        files = self.files
+        if files is not None and self._refused is None:
+            return files.archive_state()
+        return ArchiveState(failing=self._refused is not None,
+                            error=self._refused, lost_rows=0,
+                            location=None, file=None)
+
+    def durable_row_number(self):
+        files = self.files
+        if files is not None:
+            return files.durable_row_number()
+        return self._durable_row
+
+    def rows_unarchived(self):
+        files = self.files
+        return files.rows_unarchived() if files is not None else 0
+
+
 class _Feeder:
     """Owns a _StreamData and the Flight receive thread that fills it.
 
@@ -436,7 +639,8 @@ class _Feeder:
     """
 
     def __init__(self, name, ticket=None, store=None, capacity=5000,
-                 columns=None, segment_bytes=None, local=None, who=None):
+                 columns=None, segment_bytes=None, local=None, who=None,
+                 copy=None):
         from . import _core
         self.name = name
         self._capacity = capacity
@@ -458,6 +662,7 @@ class _Feeder:
         self._run = None                 # the writer's run streamed from
         self._local_stream = None        # the local stream read in place
         self.data = None                 # _StreamData, built on first connect
+        self.copy = copy                 # _Copy: this reader's own files, or None
         self._closed = False
         self._client = None
         self._reader = None
@@ -526,6 +731,8 @@ class _Feeder:
                 pass
         if threading.current_thread() is not self._lifecycle:
             self._lifecycle.join(timeout=1.0)
+        if self.copy is not None:
+            self.copy.close()            # the open file ends, before the ring goes
         if self.data is not None and self._local_stream is None:
             self.data.mark_closed()
 
@@ -578,6 +785,8 @@ class _Feeder:
         return self._took(step)
 
     def _drop_ring(self):
+        if self.copy is not None and self._local_stream is None:
+            self.copy.ring_dropped()     # the file of the run that is over
         old, self.data = self.data, None
         if old is not None and self._local_stream is None:
             old.mark_closed()            # a holder fails loudly, it does
@@ -635,6 +844,9 @@ class _Feeder:
                     self.data = _StreamData(
                         self.name, schema, capacity=self._capacity,
                         segment_bytes=self._segment_bytes)
+                    if self.copy is not None:
+                        self.copy.ring_made(
+                            self.data, self._core.run or ticket.get("run"))
 
                 self._core.connected()
                 self._state, self._reason = "streaming", None
@@ -686,6 +898,8 @@ class _Feeder:
                             self._revision_cond.notify_all()
                     batch = chunk.data
                     if batch.num_rows == 0:
+                        if self.copy is not None:
+                            self.copy.after_rows()   # a checkpoint due by time
                         continue    # a quiet stream: the revision only
                     answers += 1
                     rows += batch.num_rows
@@ -697,7 +911,12 @@ class _Feeder:
                     # publisher's origin seq: keep the local ring on the
                     # publisher's seq axis (a jump past from_seq is a
                     # gap: rows recycled before this reader asked)
+                    if self.copy is not None:
+                        self.copy.before_rows(
+                            at_seq if at_seq is not None else from_seq)
                     self.data.ring.append_batch(batch, at_seq=at_seq)
+                    if self.copy is not None:
+                        self.copy.after_rows()
                     from_seq = (at_seq if at_seq is not None else from_seq) + batch.num_rows
         except Exception as e:
             if not self._closed:

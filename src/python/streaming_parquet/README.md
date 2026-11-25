@@ -505,7 +505,16 @@ create_stream(name, schema, store=STORE, spool=DEFAULT_SPOOL, memory=MemoryOptio
     # publish: False = an internal stream: no ticket, not served to other
     #         processes; this process reads it with connect(name)
 create_playback_stream(name, parquet_path, timestamp_column, latency_s, memory)
-connect(name | ticket, store=STORE, memory=MemoryOptions(...), columns)
+connect(name | ticket, store=STORE, memory=MemoryOptions(...), columns,
+        parquet_store=..., parquet=ParquetOptions(...))
+    # parquet_store: a store of the reader's own; the rows it receives
+    #         are written to <parquet_store>/streams/<name>/ as a
+    #         stream's are, with the writer's run and row numbers. No
+    #         ticket, no catalog, no spool. Not the store the stream is in.
+    # parquet: files from the first row received; None = none until
+    #         a.start_parquet(label, options)
+    # the reader then has start_parquet, stop_parquet, cut,
+    #         archive_state and get_durable_row_number, as a stream has
 list_streams(store=STORE)
 cut(label) / start_parquet(label, options) / stop_parquet()   # the local streams
 streams ; close()
@@ -709,7 +718,7 @@ a.WaitConnected(5 * time.Second)      // the columns are known from here
 newest, ok := a.NewestRow()           // newest.F64(column)
 cursor := a.Cursor()                  // cursor.Next(): the rows not yet seen
 table, _ := a.ArrowTable()            // every row in memory, no copy; Release it
-a.StartParquet("cal-run")             // a reader with parquet options writes files too
+a.StartParquet("cal-run", nil)        // a reader with a ParquetStore writes files too
 
 streaming.Close()                     // every stream and reader of the process
 ```
@@ -725,9 +734,6 @@ standard AWS credential chain). Cross-language gate:
 Python attach() exact; Python publisher -> Go attach exact, with the
 Go side archiving to a finalized parquet file while attached, read
 back exactly by pyarrow.
-
-Python does not have attached-side archival yet; porting that verb
-onto `Attached` is the symmetry-parity item on the list.
 
 ## Migration charter (binding)
 
@@ -756,7 +762,7 @@ onto `Attached` is the symmetry-parity item on the list.
   tests/duckdb/run_extension_tests.py (S3 with CKPT_TEST_STORE).
 - In production: a machine shop's CNC and probe daemons write
   through this library.
-- Open: the Go host (above); attached-side archival in Python; DuckDB's
+- Open: the Go host (above); DuckDB's
   signing of the extension (a community extension) to end per-platform
   builds and the unsigned flag; V2B (the SQLite catalog; the core asks,
   the host does).

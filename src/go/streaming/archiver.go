@@ -530,7 +530,12 @@ func sliceRecords(recs []arrow.RecordBatch, offset, rows int64) []arrow.RecordBa
 // start is the mark of a new file: rows committed from THIS moment land
 // in a fresh file labeled `label`. A file that is open ends here, with
 // every row committed before the mark in it.
-func (a *archiver) start(label string) error {
+func (a *archiver) start(label string) error { return a.startAt(label, -1) }
+
+// startAt is start with the mark at row number mark: for a ring whose
+// first row is still to come (a reader's). A negative mark is after the
+// newest committed row.
+func (a *archiver) startAt(label string, mark int64) error {
 	var err error
 	if a.wp.on() {
 		err = a.flushAll()
@@ -546,8 +551,10 @@ func (a *archiver) start(label string) error {
 	a.label = label
 	if !a.wp.on() {
 		// off until now: the rows before the mark are not planned
-		committed := a.ring.NewestSeq() + 1
-		a.wp.start(committed)
+		if mark < 0 {
+			mark = a.ring.NewestSeq() + 1
+		}
+		a.wp.start(mark)
 	}
 	return nil
 }

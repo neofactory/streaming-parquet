@@ -3113,6 +3113,154 @@ def _():
             s.close()
 
 
+print("\n--- a reader that writes files ---")
+
+def _copy_rows(store, name):
+    """(the rows of every finished file of a reader's copy as one table
+    sorted by tv, the files' names, the files' metadata)."""
+    import pyarrow.parquet as pq
+    folder = os.path.join(store, "streams", *name.split("/"))
+    names = sorted(f for f in os.listdir(folder) if f.endswith(".parquet"))
+    tables = [pq.read_table(os.path.join(folder, f)) for f in names]
+    meta = [pq.read_schema(os.path.join(folder, f)).metadata for f in names]
+    return pa.concat_tables(tables).sort_by("tv"), names, meta
+
+
+@test("a reader with parquet_store writes the rows it receives to files "
+      "of its own: every row once, the writer's run and row numbers, a "
+      "cut with a label, the durable row number")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        store, copies = os.path.join(tmp, "store"), os.path.join(tmp, "copies")
+        s = sp.create_stream("v2test/copy", SCHEMA, store=store,
+                             memory=MemoryOptions(rows=500))
+        a = sp.connect("v2test/copy", store=store, parquet_store=copies,
+                       memory=MemoryOptions(rows=500),
+                       parquet=ParquetOptions(checkpoint_seconds=0.05))
+        try:
+            fill(s, 7)              # before the reader streams: not its rows
+            wait_for(lambda: a.state == "streaming", what="the reader streams")
+            assert a.get_durable_row_number() == -1
+            fill(s, 30, start=7)
+            wait_for(lambda: a.get_durable_row_number() == 36,
+                     what="row 36 in a checkpoint of the copy")
+            st = a.archive_state()
+            assert not st.failing and st.file and st.location.startswith(copies), st
+            a.cut("second")
+            fill(s, 13, start=37)
+            wait_for(lambda: a.get_durable_row_number() == 49,
+                     what="row 49 in the second file")
+            assert a.memory_state().rows_unarchived == 0
+        finally:
+            a.close()
+            run = s._run
+            s.close()
+        rows, names, meta = _copy_rows(copies, "v2test/copy")
+        assert len(names) == 2 and "second" in names[1], names
+        first = rows.column("tv")[0].as_py()
+        assert rows.column("tv").to_pylist() == \
+            [float(i) for i in range(int(first), 50)], rows.column("tv")
+        assert first <= 7.0, first              # every row after it joined
+        assert meta[0][b"sp_run"].decode() == run, meta[0]
+        assert int(meta[0][b"sp_base_seq"]) == int(first), meta[0]
+        assert int(meta[1][b"sp_base_seq"]) == 37, meta[1]
+        # no ticket and no catalog name a reader's files
+        assert not os.path.exists(os.path.join(copies, "tickets"))
+        assert not os.path.exists(os.path.join(
+            copies, "streams", "v2test", "copy", "catalog.sqlite"))
+
+
+@test("a reader's start_parquet is a mark: no file before it, the rows "
+      "after it in a file with its label, and stop_parquet ends the file")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        store, copies = os.path.join(tmp, "store"), os.path.join(tmp, "copies")
+        s = sp.create_stream("v2test/copy2", SCHEMA, store=store,
+                             memory=MemoryOptions(rows=500))
+        a = sp.connect("v2test/copy2", store=store, parquet_store=copies,
+                       memory=MemoryOptions(rows=500))
+        try:
+            wait_for(lambda: a.state == "streaming", what="the reader streams")
+            fill(s, 10)
+            wait_for(lambda: a.memory_state().rows == 10, what="10 rows received")
+            assert a.archive_state().file is None
+            a.start_parquet("job", ParquetOptions(checkpoint_seconds=0.05))
+            fill(s, 10, start=10)
+            wait_for(lambda: a.get_durable_row_number() == 19, what="row 19 stored")
+            a.stop_parquet()
+            fill(s, 5, start=20)
+            wait_for(lambda: a.memory_state().rows == 25, what="25 rows received")
+            wait_for(lambda: a.archive_state().file is None, what="the file ended")
+        finally:
+            a.close()
+            s.close()
+        rows, names, _meta = _copy_rows(copies, "v2test/copy2")
+        assert len(names) == 1 and "job" in names[0], names
+        assert rows.column("tv").to_pylist() == [float(i) for i in range(10, 20)]
+
+
+@test("a reader's files: refused with no store for them, in the writer's "
+      "store, on a reader of this process's stream, and for a second "
+      "reader of the same folder")
+def _():
+    def refused(what, fn, part, kind=ValueError):
+        try:
+            fn()
+        except kind as e:
+            assert part in str(e), (what, e)
+        else:
+            raise AssertionError(f"{what}: not refused")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        store, copies = os.path.join(tmp, "store"), os.path.join(tmp, "copies")
+        s = sp.create_stream("v2test/copy3", SCHEMA, store=store,
+                             memory=MemoryOptions(rows=500))
+        try:
+            refused("parquet with no parquet_store",
+                    lambda: sp.connect("v2test/copy3", store=store,
+                                       parquet=ParquetOptions()),
+                    "needs parquet_store=")
+            refused("the writer's store",
+                    lambda: sp.connect("v2test/copy3", store=store,
+                                       parquet_store="file://" + store + "/"),
+                    "a store of its own")
+            refused("a row group the reader's memory cannot hold",
+                    lambda: sp.connect("v2test/copy3", store=store,
+                                       parquet_store=copies,
+                                       memory=MemoryOptions(rows=500),
+                                       parquet=ParquetOptions(row_group_rows=300)),
+                    "less than two row groups")
+            plain = sp.connect("v2test/copy3", store=store)
+            refused("a reader of this process's stream",
+                    lambda: plain.start_parquet("x"), "in place")
+            plain.close()
+
+            a = sp.connect("v2test/copy3", store=store, parquet_store=copies,
+                           memory=MemoryOptions(rows=500),
+                           parquet=ParquetOptions(checkpoint_seconds=0.05))
+            b = sp.connect("v2test/copy3", store=store, parquet_store=copies,
+                           memory=MemoryOptions(rows=500),
+                           parquet=ParquetOptions(checkpoint_seconds=0.05))
+            try:
+                wait_for(lambda: a.state == "streaming" and b.state == "streaming",
+                         what="both readers stream")
+                fill(s, 10)
+                wait_for(lambda: a.archive_state().failing
+                         or b.archive_state().failing,
+                         what="the second reader of the folder is refused")
+                states = [a.archive_state(), b.archive_state()]
+                bad = [st for st in states if st.failing]
+                assert len(bad) == 1 and "writer.lock" in bad[0].error, states
+                good = a if not a.archive_state().failing else b
+                wait_for(lambda: good.get_durable_row_number() == 9,
+                         what="the first reader's rows stored")
+            finally:
+                a.close()
+                b.close()
+        finally:
+            s.close()
+
+
 print("\n--- the stream core, side by side ---")
 
 @test("the ticket in the store is the core's text, with every member")

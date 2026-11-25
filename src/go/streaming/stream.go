@@ -85,7 +85,8 @@ func (s *Stream) own() error {
 	if s.owner != nil {
 		return nil
 	}
-	o, err := s.proc.claim(s.Name, s.run, s.root, s.tickets)
+	o, err := s.proc.claim(fmt.Sprintf("CreateStream(%q)", s.Name), lockDir(s.root),
+		s.Name, s.run, s.root, s.tickets)
 	if err != nil {
 		return err
 	}
@@ -552,8 +553,8 @@ func (s *Stream) heartbeat(stop chan struct{}) {
 // was off are in no file.
 //
 // o replaces the stream's parquet options whole, from this file on. Nil
-// means the options the stream has; a stream that never had any needs
-// them here. A row group the ring
+// means the options the stream has, or the defaults when it never had
+// any. A row group the ring
 // cannot hold is refused: the ring was sized at CreateStream.
 func (s *Stream) StartParquet(label string, o *ParquetOptions) error {
 	s.io.Lock()
@@ -561,16 +562,16 @@ func (s *Stream) StartParquet(label string, o *ParquetOptions) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if o == nil {
-		if s.parquet == nil {
-			return fmt.Errorf("stream %s: StartParquet needs ParquetOptions: "+
-				"the stream has none", s.Name)
-		}
-		if s.arch != nil {
+		switch {
+		case s.parquet == nil:
+			o = &ParquetOptions{} // the defaults
+		case s.arch != nil:
 			err := s.arch.start(label)
 			s.wrote(err)
 			return err
+		default:
+			o = s.parquet
 		}
-		o = s.parquet
 	}
 	opts := *o
 	_, groupRows, err := ringSizes(s.Name, s.ringRows, opts.RowGroupRows)
