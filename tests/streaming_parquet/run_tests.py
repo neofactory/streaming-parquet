@@ -2663,12 +2663,12 @@ def _():
       "is there once")
 def _():
     import random as _random
-    from streaming_parquet import _stream
+    from streaming_parquet import _files
     flat = pa.schema([F('n', pa.int64(), nullable=False),
                       F('s', pa.utf8(), nullable=False)])
     rng = _random.Random(3)
-    was = _stream.FILE_CUT_BYTES
-    _stream.FILE_CUT_BYTES = 10_000      # about two row groups of these rows
+    was = _files.FILE_CUT_BYTES
+    _files.FILE_CUT_BYTES = 10_000      # about two row groups of these rows
     try:
         with tempfile.TemporaryDirectory() as tmp:
             s = sp.create_stream("v2test/bytecut", flat, store=tmp,
@@ -2706,7 +2706,7 @@ def _():
             finally:
                 s.close()
     finally:
-        _stream.FILE_CUT_BYTES = was
+        _files.FILE_CUT_BYTES = was
 
 
 print("\n--- diagnostics ---")
