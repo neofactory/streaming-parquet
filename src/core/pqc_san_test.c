@@ -123,6 +123,523 @@ static uint32_t rnd(void) {
     return rng_state >> 8;
 }
 
+/* ---- checkpoint versions, the mirror, the sweep --------------------------- */
+
+static Report R;                 /* for the calls with no helper */
+
+/* A pretend copy of a file's objects: names and sizes. */
+typedef struct { char name[PQC_OBJECT_MAX]; uint64_t size; } Obj;
+typedef struct { Obj o[512]; int n; } Sink;
+
+static int sink_find(const Sink *s, const char *name) {
+    for (int i = 0; i < s->n; i++)
+        if (strcmp(s->o[i].name, name) == 0) return i;
+    return -1;
+}
+static void sink_put(Sink *s, const char *name, uint64_t size) {
+    int i = sink_find(s, name);
+    if (i < 0) { assert(s->n < 512); i = s->n++; }
+    snprintf(s->o[i].name, sizeof s->o[i].name, "%s", name);
+    s->o[i].size = size;
+}
+static void sink_delete(Sink *s, const char *name) {
+    int i = sink_find(s, name);
+    assert(i >= 0);
+    s->o[i] = s->o[--s->n];
+}
+
+/* A writer of "f.parquet" whose objects go to `local`; each call adds
+ * row groups and answers a new checkpoint version: its object name and
+ * bytes (free them). */
+typedef struct { PqcWriter *w; Sink *local; int seq; } Source;
+
+static uint8_t *next_version(Source *src, int groups, char object[PQC_OBJECT_MAX],
+                             uint64_t *len, uint64_t *rows) {
+    static uint8_t mini[1 << 16];
+    char name[PQC_NAME_MAX], err[512];
+    const uint8_t *data;
+    uint64_t n;
+    uint32_t crc;
+    for (int g = 0; g < groups; g++) {
+        size_t m = mini_file(mini, 200 + rnd() % 900, 1, 2, 42);
+        assert(t_pqc_add_group(src->w, mini, m, err, 512) >= 0);
+        while (t_pqc_next_object(src->w, name, &data, &n, &crc) == 1) {
+            sink_put(src->local, name, n);
+            pqc_object_stored(src->w);
+        }
+    }
+    uint8_t *ck = t_pqc_build_checkpoint(src->w, NULL, 0, len, rows, err, 512);
+    assert(ck);
+    assert(pqc_ckpt_object("f.parquet", ++src->seq, object, &R) == REPORT_OK);
+    sink_put(src->local, object, *len);
+    return ck;
+}
+
+/* What a pass did. */
+typedef struct {
+    int stats, uploads, versions, stored, deletes, local, remote, flag;
+    int last;                    /* the action that ended it */
+    uint64_t stored_rows;
+    char stored_object[PQC_OBJECT_MAX];
+} Pass;
+
+/* One pass of the mirror between two pretend copies. fail_at: the
+ * number (from 1) of the step on the remote or the disk that fails;
+ * 0 for none. Checks THE ORDER at each version sent. */
+static Pass run_pass(PqcMirror *m, Sink *local, Sink *remote,
+                     const char *object, const uint8_t *ck, uint64_t len,
+                     int final_exists, int live, int fail_at) {
+    Pass p = {0};
+    PqcMirrorStep st;
+    int acts = 0;
+    assert(pqc_mirror_local(m, object, ck, len, final_exists, live, &R)
+           == REPORT_OK);
+    for (;;) {
+        assert(pqc_mirror_next(m, &st, &R) == REPORT_OK);
+        p.last = st.action;
+        if (st.action == PQC_MIRROR_NOTHING || st.action == PQC_MIRROR_DONE) {
+            assert(pqc_mirror_doing(m)[0] == 0);
+            return p;
+        }
+        /* the same step again until it is answered */
+        PqcMirrorStep again;
+        assert(pqc_mirror_next(m, &again, &R) == REPORT_OK);
+        assert(again.action == st.action && strcmp(again.name, st.name) == 0);
+        if (st.action != PQC_MIRROR_STORED && fail_at && ++acts == fail_at) {
+            pqc_mirror_failed(m);
+            assert(pqc_mirror_next(m, &st, &R) == REPORT_OK);
+            assert(st.action == PQC_MIRROR_NOTHING);
+            p.last = -1;
+            return p;
+        }
+        switch (st.action) {
+        case PQC_MIRROR_STAT: {
+            int i = sink_find(remote, st.name);
+            p.stats++;
+            assert(pqc_mirror_remote_has(m, i >= 0,
+                                         i >= 0 ? remote->o[i].size : 0, &R)
+                   == REPORT_OK);
+            continue;
+        }
+        case PQC_MIRROR_UPLOAD: {
+            int i = sink_find(local, st.name);
+            assert(i >= 0 && local->o[i].size == st.size);
+            assert(strstr(pqc_mirror_doing(m), "uploading object"));
+            sink_put(remote, st.name, st.size);
+            p.uploads++;
+            break;
+        }
+        case PQC_MIRROR_UPLOAD_VERSION: {
+            /* THE ORDER: everything it names is there already */
+            PqcReader *r = t_pqc_reader_open(ck, len, NULL, 0);
+            assert(r && strcmp(st.name, object) == 0 && st.size == len);
+            for (uint32_t k = 0; k < pqc_reader_n_chunks(r); k++) {
+                const char *name;
+                uint64_t length;
+                uint32_t crc;
+                pqc_reader_chunk(r, k, &name, &length, &crc);
+                int i = sink_find(remote, name);
+                assert(i >= 0 && remote->o[i].size == length);
+            }
+            pqc_reader_free(r);
+            assert(strstr(pqc_mirror_doing(m), "uploading checkpoint"));
+            sink_put(remote, st.name, st.size);
+            p.versions++;
+            break;
+        }
+        case PQC_MIRROR_STORED:
+            p.stored++;
+            p.stored_rows = st.size;
+            snprintf(p.stored_object, sizeof p.stored_object, "%s", st.name);
+            break;
+        case PQC_MIRROR_DELETE:
+            sink_delete(remote, st.name);
+            p.deletes++;
+            break;
+        case PQC_MIRROR_ASSEMBLE_LOCAL:
+            p.local++;
+            break;
+        case PQC_MIRROR_ASSEMBLE_REMOTE:
+            assert(strstr(pqc_mirror_doing(m), "assembling f.parquet"));
+            p.remote++;
+            p.flag = st.flag;
+            break;
+        default:
+            assert(!"an action the mirror does not have");
+        }
+        assert(pqc_mirror_did(m, &R) == REPORT_OK);
+    }
+}
+
+static void version_names_tests(void) {
+    char out[PQC_OBJECT_MAX], name[PQC_OBJECT_MAX];
+    int64_t seq = -1;
+    assert(pqc_ckpt_object("a/b.parquet", 7, out, &R) == REPORT_OK);
+    assert(strcmp(out, "a/b.parquet.000007.ckpt") == 0);
+    assert(pqc_ckpt_object("b.parquet", 12345678, out, &R) == REPORT_OK);
+    assert(strcmp(out, "b.parquet.12345678.ckpt") == 0);
+    assert(pqc_ckpt_object("b.parquet", -1, out, &R) == REPORT_INVALID);
+    assert(pqc_ckpt_object(NULL, 1, out, &R) == REPORT_INVALID);
+    assert(pqc_ckpt_object("b.parquet", 1, out, NULL) == REPORT_INVALID);
+    char big[400];
+    memset(big, 'x', sizeof big);
+    memcpy(big + 380, ".parquet", 9);
+    assert(pqc_ckpt_object(big, 1, out, &R) == REPORT_INVALID);
+
+    assert(pqc_ckpt_object_parse("a/b.parquet.000007.ckpt", name, &seq) == 1);
+    assert(strcmp(name, "a/b.parquet") == 0 && seq == 7);
+    assert(pqc_ckpt_object_parse("b.parquet.12345678.ckpt", name, &seq) == 1);
+    assert(strcmp(name, "b.parquet") == 0 && seq == 12345678);
+    /* a checkpoint written before versions is version 0 */
+    assert(pqc_ckpt_object_parse("b.parquet.ckpt", name, &seq) == 1);
+    assert(strcmp(name, "b.parquet") == 0 && seq == 0);
+    assert(pqc_ckpt_object_parse("b.parquet.ckpt", NULL, NULL) == 1);
+    static const char *not_one[] = {
+        "b.parquet", "b.parquet.00007.ckpt", "b.parquet.x00007.ckpt",
+        "b.parquet.chunks/000001", ".parquet.ckpt", ".parquet.000001.ckpt",
+        "b.txt.000001.ckpt", "000001.ckpt", ".ckpt", "", "b.parquet.000001",
+        "b.parquet.0000000000000000001.ckpt", NULL};
+    for (int i = 0; not_one[i]; i++)
+        assert(pqc_ckpt_object_parse(not_one[i], name, &seq) == 0);
+    assert(pqc_ckpt_object_parse(NULL, name, &seq) == 0);
+}
+
+/* Does version bytes ck name the object? */
+static int names_it(const uint8_t *ck, uint64_t len, const char *object) {
+    PqcReader *r = t_pqc_reader_open(ck, len, NULL, 0);
+    int found = 0;
+    for (uint32_t k = 0; r && k < pqc_reader_n_chunks(r); k++) {
+        const char *name;
+        uint64_t length;
+        uint32_t crc;
+        pqc_reader_chunk(r, k, &name, &length, &crc);
+        found |= strcmp(name, object) == 0;
+    }
+    pqc_reader_free(r);
+    return found;
+}
+
+static void versions_tests(void) {
+    char err[512];
+    Sink local = {0};
+    Source src = {t_pqc_writer_new("f.parquet", 4096, err, 512), &local, 0};
+    char o1[PQC_OBJECT_MAX], o2[PQC_OBJECT_MAX], o3[PQC_OBJECT_MAX];
+    uint64_t l1, l2, l3, rows;
+    uint8_t *c1 = next_version(&src, 1, o1, &l1, &rows);   /* loose groups */
+    uint8_t *c2 = next_version(&src, 1, o2, &l2, &rows);
+    uint8_t *c3 = next_version(&src, 9, o3, &l3, &rows);   /* chunks replace them */
+
+    PqcVersions *v = NULL;
+    assert(pqc_versions_new(-1, &v, &R) == REPORT_INVALID && !v);
+    assert(pqc_versions_new(600, NULL, &R) == REPORT_INVALID);
+    assert(pqc_versions_new(600, &v, NULL) == REPORT_INVALID);
+    assert(pqc_versions_new(600, &v, &R) == REPORT_OK && v);
+    pqc_test_set_clock(1, 1000, 100);
+    assert(pqc_versions_stored(v, o1, c1, l1, &R) == REPORT_OK);
+    assert(!pqc_versions_due(v, 0));
+    pqc_test_set_clock(1, 1010, 110);
+    assert(pqc_versions_stored(v, o2, c2, l2, &R) == REPORT_OK);
+    assert(!pqc_versions_due(v, 0));           /* replaced 0 s ago: kept */
+    /* 599 s after the first was replaced: still kept */
+    pqc_test_set_clock(1, 1609, 709);
+    assert(pqc_versions_stored(v, o2, c2, l2, &R) == REPORT_OK);  /* again: itself */
+    assert(!pqc_versions_due(v, 0));
+    /* 600 s after: the first goes, and the objects only it named */
+    pqc_test_set_clock(1, 1610, 710);
+    assert(pqc_versions_stored(v, o3, c3, l3, &R) == REPORT_OK);
+    assert(pqc_versions_due(v, 0) && strcmp(pqc_versions_due(v, 0), o1) == 0);
+    int n_due = 0;
+    for (int32_t i = 0; pqc_versions_due(v, i); i++, n_due++) {
+        const char *d = pqc_versions_due(v, i);
+        if (i == 0) continue;
+        assert(names_it(c1, l1, d));           /* the first named it */
+        assert(!names_it(c2, l2, d) && !names_it(c3, l3, d));
+        assert(!pqc_versions_names(v, d));
+    }
+    /* what a kept version names is not in the list */
+    {
+        PqcReader *r = t_pqc_reader_open(c3, l3, err, 512);
+        assert(pqc_reader_n_chunks(r) > 0);
+        const char *name;
+        uint64_t length;
+        uint32_t crc;
+        pqc_reader_chunk(r, 0, &name, &length, &crc);
+        assert(pqc_versions_names(v, name));
+        for (int32_t i = 0; pqc_versions_due(v, i); i++)
+            assert(strcmp(pqc_versions_due(v, i), name) != 0);
+        pqc_reader_free(r);
+    }
+    /* a delete that failed stays; one that worked leaves */
+    assert(pqc_versions_deleted(v, "not-listed", &R) == REPORT_INVALID);
+    assert(pqc_versions_deleted(v, o1, &R) == REPORT_OK);
+    assert(pqc_versions_deleted(v, o1, &R) == REPORT_INVALID);
+    while (pqc_versions_due(v, 0)) {
+        char d[PQC_OBJECT_MAX];
+        snprintf(d, sizeof d, "%s", pqc_versions_due(v, 0));
+        assert(pqc_versions_deleted(v, d, &R) == REPORT_OK);
+        n_due--;
+    }
+    assert(n_due == 1);
+    /* bytes that are not a checkpoint are refused, and nothing changes */
+    assert(pqc_versions_stored(v, "x.parquet.000009.ckpt",
+                               (const uint8_t *)"garbage", 7, &R)
+           == REPORT_REFUSED && R.error[0]);
+    assert(pqc_versions_stored(v, NULL, c1, l1, &R) == REPORT_INVALID);
+    assert(!pqc_versions_due(v, 0));
+    pqc_versions_free(v);
+    pqc_versions_free(NULL);
+
+    /* keep 0: a replaced version goes at once */
+    assert(pqc_versions_new(0, &v, &R) == REPORT_OK);
+    assert(pqc_versions_stored(v, o1, c1, l1, &R) == REPORT_OK);
+    assert(pqc_versions_stored(v, o2, c2, l2, &R) == REPORT_OK);
+    assert(strcmp(pqc_versions_due(v, 0), o1) == 0);
+    pqc_versions_free(v);                       /* with deletes still listed */
+
+    pqc_test_set_clock(0, 0, 0);
+    pqc_free(c1); pqc_free(c2); pqc_free(c3);
+    pqc_writer_free(src.w);
+}
+
+static void mirror_tests(void) {
+    char err[512];
+    Sink local = {0}, remote = {0};
+    Source src = {t_pqc_writer_new("f.parquet", 4096, err, 512), &local, 0};
+    char o1[PQC_OBJECT_MAX], o2[PQC_OBJECT_MAX], o3[PQC_OBJECT_MAX];
+    uint64_t l1, l2, l3, r1, r2, r3;
+    uint8_t *c1 = next_version(&src, 2, o1, &l1, &r1);
+    PqcMirror *m = NULL;
+    PqcMirrorStep st;
+
+    assert(pqc_mirror_new("f.txt", 600, &m, &R) == REPORT_INVALID && !m);
+    assert(pqc_mirror_new(NULL, 600, &m, &R) == REPORT_INVALID);
+    assert(pqc_mirror_new("f.parquet", -1, &m, &R) == REPORT_INVALID && !m);
+    assert(pqc_mirror_new("f.parquet", 600, &m, NULL) == REPORT_INVALID);
+    assert(pqc_mirror_new("f.parquet", 600, &m, &R) == REPORT_OK && m);
+    assert(pqc_mirror_next(m, &st, &R) == REPORT_INVALID);    /* no pass yet */
+    assert(pqc_mirror_did(m, &R) == REPORT_INVALID);
+    assert(pqc_mirror_remote_has(m, 1, 5, &R) == REPORT_INVALID);
+    assert(!pqc_mirror_shipped(m, NULL, NULL, NULL));
+    pqc_mirror_failed(m);                                     /* nothing to end */
+    pqc_test_set_clock(1, 1000, 100);
+
+    /* nothing local yet, the writer still on the file: nothing to do */
+    Pass p = run_pass(m, &local, &remote, NULL, NULL, 0, 0, 1, 0);
+    assert(p.last == PQC_MIRROR_NOTHING && remote.n == 0);
+
+    /* the first version: every object, then the version, then the ticket */
+    PqcReader *rd = t_pqc_reader_open(c1, l1, err, 512);
+    int n1 = (int)pqc_reader_n_chunks(rd);
+    pqc_reader_free(rd);
+    assert(n1 >= 1);
+    p = run_pass(m, &local, &remote, o1, c1, l1, 0, 1, 0);
+    assert(p.stats == n1 && p.uploads == n1 && p.versions == 1);
+    assert(p.stored == 1 && p.stored_rows == r1 && !strcmp(p.stored_object, o1));
+    assert(p.deletes == 0 && p.local == 0 && p.remote == 0);
+    assert(p.last == PQC_MIRROR_NOTHING && remote.n == n1 + 1);
+    const uint8_t *sb; size_t sl; const char *so;
+    assert(pqc_mirror_shipped(m, &sb, &sl, &so) && sl == l1 &&
+           memcmp(sb, c1, l1) == 0 && strcmp(so, o1) == 0);
+
+    /* the same version again: nothing is asked of the remote */
+    p = run_pass(m, &local, &remote, o1, c1, l1, 0, 1, 0);
+    assert(p.stats == 0 && p.uploads == 0 && p.versions == 0 && p.stored == 0);
+
+    /* a later version: only what the remote lacks, and an outage in
+     * the middle loses nothing of what was sent */
+    uint8_t *c2 = next_version(&src, 6, o2, &l2, &r2);
+    p = run_pass(m, &local, &remote, o2, c2, l2, 0, 1, 2);    /* the 2nd step fails */
+    assert(p.last == -1 && p.versions == 0 && p.stored == 0);
+    int had = remote.n;
+    p = run_pass(m, &local, &remote, o2, c2, l2, 0, 1, 0);
+    assert(p.versions == 1 && p.stored_rows == r2);
+    assert(remote.n > had && sink_find(&remote, o2) >= 0);
+    /* an object the remote holds with the wrong size is sent again */
+    {
+        PqcMirror *m2 = NULL;
+        Sink half = remote;
+        assert(pqc_mirror_new("f.parquet", 600, &m2, &R) == REPORT_OK);
+        int cut = -1;
+        for (int i = 0; i < half.n; i++)
+            if (strstr(half.o[i].name, ".chunks/") && names_it(c2, l2, half.o[i].name))
+                cut = i;
+        assert(cut >= 0);
+        half.o[cut].size -= 1;
+        p = run_pass(m2, &local, &half, o2, c2, l2, 0, 1, 0);
+        assert(p.uploads == 1 && p.versions == 1);       /* a mirror that knows nothing asks */
+        assert(half.o[sink_find(&half, half.o[cut].name)].size ==
+               local.o[sink_find(&local, half.o[cut].name)].size);
+        pqc_mirror_free(m2);
+    }
+
+    /* 600 s after the first version was replaced, the next version
+     * sent takes it away, and the objects only it named */
+    pqc_test_set_clock(1, 1700, 800);
+    uint8_t *c3 = next_version(&src, 5, o3, &l3, &r3);
+    p = run_pass(m, &local, &remote, o3, c3, l3, 0, 1, 0);
+    assert(p.versions == 1 && p.deletes >= 1);
+    {
+        /* an object sent or seen is not asked about again: the remote
+         * was asked only about what the two earlier versions did not name */
+        PqcReader *r = t_pqc_reader_open(c3, l3, err, 512);
+        int fresh = 0;
+        for (uint32_t k = 0; k < pqc_reader_n_chunks(r); k++) {
+            const char *name; uint64_t length; uint32_t crc;
+            pqc_reader_chunk(r, k, &name, &length, &crc);
+            fresh += !names_it(c1, l1, name) && !names_it(c2, l2, name);
+        }
+        pqc_reader_free(r);
+        assert(fresh > 0 && p.stats == fresh && p.uploads == fresh);
+    }
+    assert(sink_find(&remote, o1) < 0 && sink_find(&remote, o2) >= 0);
+    for (int i = 0; i < remote.n; i++)                   /* nothing kept is gone */
+        if (strstr(remote.o[i].name, ".chunks/"))
+            assert(names_it(c2, l2, remote.o[i].name) ||
+                   names_it(c3, l3, remote.o[i].name));
+    {
+        PqcReader *r = t_pqc_reader_open(c3, l3, err, 512);
+        for (uint32_t k = 0; k < pqc_reader_n_chunks(r); k++) {
+            const char *name; uint64_t length; uint32_t crc;
+            pqc_reader_chunk(r, k, &name, &length, &crc);
+            assert(sink_find(&remote, name) >= 0);
+        }
+        pqc_reader_free(r);
+    }
+
+    /* THE END OF A FILE. The writer ended it: mirrored, then the local
+     * assembly, then the remote one from the version in hand. The
+     * remote fails at its assembly: the file waits there. */
+    p = run_pass(m, &local, &remote, o3, c3, l3, 0, 0, 2);   /* local ok, remote fails */
+    assert(p.last == -1 && p.local == 1 && p.remote == 0);
+    /* now the local copy has the finished file and no version */
+    p = run_pass(m, &local, &remote, NULL, NULL, 0, 1, 0, 0);
+    assert(p.local == 0 && p.remote == 1 && p.flag == 1);
+    assert(p.last == PQC_MIRROR_DONE);
+    /* done stays done */
+    p = run_pass(m, &local, &remote, NULL, NULL, 0, 1, 0, 0);
+    assert(p.last == PQC_MIRROR_DONE && p.remote == 0);
+    pqc_mirror_failed(m);
+    assert(pqc_mirror_next(m, &st, &R) == REPORT_OK && st.action == PQC_MIRROR_DONE);
+    pqc_mirror_free(m);
+
+    /* A NEW PROCESS, for a file an earlier one left: local finished,
+     * remote not. It has nothing in hand: from the remote's own. */
+    assert(pqc_mirror_new("f.parquet", 600, &m, &R) == REPORT_OK);
+    p = run_pass(m, &local, &remote, NULL, NULL, 0, 1, 0, 0);
+    assert(p.remote == 1 && p.flag == 0 && p.local == 0 &&
+           p.last == PQC_MIRROR_DONE);
+    pqc_mirror_free(m);
+    /* nothing local at all (the remote sweep found it) */
+    assert(pqc_mirror_new("f.parquet", 600, &m, &R) == REPORT_OK);
+    p = run_pass(m, &local, &remote, NULL, NULL, 0, 0, 0, 0);
+    assert(p.remote == 1 && p.flag == 0 && p.last == PQC_MIRROR_DONE);
+    pqc_mirror_free(m);
+    /* a new process with the last version still local: it asks the
+     * remote about every object, sends none, sends the version, and
+     * ends the file */
+    assert(pqc_mirror_new("f.parquet", 600, &m, &R) == REPORT_OK);
+    p = run_pass(m, &local, &remote, o3, c3, l3, 0, 0, 0);
+    assert(p.stats > 0 && p.uploads == 0 && p.versions == 1);
+    assert(p.local == 1 && p.remote == 1 && p.flag == 1 &&
+           p.last == PQC_MIRROR_DONE);
+    pqc_mirror_free(m);
+
+    /* refusals: bytes that are no checkpoint, a checkpoint of another
+     * file; the pass is over and nothing is sent */
+    assert(pqc_mirror_new("f.parquet", 600, &m, &R) == REPORT_OK);
+    assert(pqc_mirror_local(m, o1, (const uint8_t *)"garbage", 7, 0, 1, &R)
+           == REPORT_REFUSED && strstr(R.error, o1));
+    assert(pqc_mirror_next(m, &st, &R) == REPORT_OK && st.action == PQC_MIRROR_NOTHING);
+    assert(pqc_mirror_local(m, o1, NULL, 0, 0, 1, &R) == REPORT_INVALID);
+    assert(pqc_mirror_local(m, NULL, c1, l1, 0, 1, &R) == REPORT_INVALID);
+    assert(pqc_mirror_local(NULL, o1, c1, l1, 0, 1, &R) == REPORT_INVALID);
+    assert(pqc_mirror_local(m, o1, c1, l1, 0, 1, NULL) == REPORT_INVALID);
+    pqc_mirror_free(m);
+    assert(pqc_mirror_new("g.parquet", 600, &m, &R) == REPORT_OK);
+    assert(pqc_mirror_local(m, "g.parquet.000001.ckpt", c1, l1, 0, 1, &R)
+           == REPORT_REFUSED && strstr(R.error, "f.parquet"));
+    pqc_mirror_free(m);
+    pqc_mirror_free(NULL);
+    assert(pqc_mirror_doing(NULL)[0] == 0);
+
+    pqc_test_set_clock(0, 0, 0);
+    pqc_free(c1); pqc_free(c2); pqc_free(c3);
+    pqc_writer_free(src.w);
+}
+
+/* Many files, each mirrored through random outages while the clock
+ * runs: whatever fails, a version on the remote has every object it
+ * names (run_pass checks THE ORDER), the newest version sent is never
+ * deleted, and the file ends in both copies. */
+static void mirror_soak(void) {
+    char err[512];
+    double mono = 5000;
+    for (int iter = 0; iter < 150; iter++) {
+        Sink *local = calloc(1, sizeof *local), *remote = calloc(1, sizeof *remote);
+        Source src = {t_pqc_writer_new("f.parquet", 1024 + rnd() % 4096, err, 512),
+                      local, 0};
+        PqcMirror *m = NULL;
+        assert(pqc_mirror_new("f.parquet", 600, &m, &R) == REPORT_OK);
+        char object[PQC_OBJECT_MAX] = "";
+        uint8_t *ck = NULL;
+        uint64_t len = 0, rows = 0, shipped_rows = 0;
+        int versions = 2 + (int)(rnd() % 6);
+        for (int k = 0; k < versions; k++) {
+            pqc_free(ck);
+            ck = next_version(&src, 1 + (int)(rnd() % 5), object, &len, &rows);
+            mono += (double)(rnd() % 500);
+            pqc_test_set_clock(1, mono + 1e9, mono);
+            int passes = (int)(rnd() % 3);      /* 0: this version is never sent */
+            for (int t = 0; t < passes; t++) {
+                Pass p = run_pass(m, local, remote, object, ck, len, 0, 1,
+                                  rnd() % 3 ? 0 : 1 + (int)(rnd() % 6));
+                if (p.stored) shipped_rows = p.stored_rows;
+                const char *so;
+                if (pqc_mirror_shipped(m, NULL, NULL, &so))
+                    assert(sink_find(remote, so) >= 0);
+            }
+        }
+        /* the writer ends the file; passes until it is done */
+        int final_local = 0, done = 0;
+        for (int t = 0; t < 200 && !done; t++) {
+            Pass p = run_pass(m, local, remote, final_local ? NULL : object,
+                              final_local ? NULL : ck, final_local ? 0 : len,
+                              final_local, 0,
+                              rnd() % 2 ? 0 : 1 + (int)(rnd() % 8));
+            if (p.stored) shipped_rows = p.stored_rows;
+            if (p.local) final_local = 1;       /* its versions are gone locally */
+            done = p.last == PQC_MIRROR_DONE;
+        }
+        assert(done && shipped_rows == rows);
+        assert(sink_find(remote, object) >= 0); /* the last version was sent */
+        pqc_mirror_free(m);
+        pqc_free(ck);
+        pqc_writer_free(src.w);
+        free(local);
+        free(remote);
+    }
+    pqc_test_set_clock(0, 0, 0);
+}
+
+static void sweep_tests(void) {
+    /* local: (final there, mirrored, readers are told) */
+    assert(pqc_sweep_local(1, 0, 1) == PQC_SWEEP_AWAIT_CATALOG);
+    assert(pqc_sweep_local(1, 0, 0) == PQC_SWEEP_DISCARD);
+    assert(pqc_sweep_local(1, 1, 1) == PQC_SWEEP_DISCARD);    /* a spool's copy */
+    assert(pqc_sweep_local(1, 1, 0) == PQC_SWEEP_DISCARD);
+    assert(pqc_sweep_local(0, 1, 1) == PQC_SWEEP_MIRROR);
+    assert(pqc_sweep_local(0, 1, 0) == PQC_SWEEP_MIRROR);
+    assert(pqc_sweep_local(0, 0, 1) == PQC_SWEEP_FINISH);
+    assert(pqc_sweep_local(0, 0, 0) == PQC_SWEEP_FINISH);
+    /* remote: (final there, readers are told, it has a mirror) */
+    assert(pqc_sweep_remote(1, 1, 0) == PQC_SWEEP_AWAIT_CATALOG);
+    assert(pqc_sweep_remote(1, 1, 1) == PQC_SWEEP_AWAIT_CATALOG);
+    assert(pqc_sweep_remote(1, 0, 0) == PQC_SWEEP_DISCARD);
+    assert(pqc_sweep_remote(0, 1, 1) == PQC_SWEEP_NOTHING);
+    assert(pqc_sweep_remote(0, 1, 0) == PQC_SWEEP_MIRROR);
+    assert(pqc_sweep_remote(0, 0, 0) == PQC_SWEEP_MIRROR);
+}
+
 int main(void) {
     char err[512];
     uint8_t mini[1 << 16];
@@ -275,6 +792,11 @@ int main(void) {
                == NULL);                        /* no rows: needs a mini */
         pqc_writer_free(w);
     }
+    version_names_tests();
+    versions_tests();
+    mirror_tests();
+    mirror_soak();
+    sweep_tests();
     printf("san_test: OK\n");
     return 0;
 }

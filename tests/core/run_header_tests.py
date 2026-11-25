@@ -29,7 +29,7 @@ CORE = os.path.join(REPO, "src", "core")
 
 #: header -> the prefixes of the functions it declares
 HEADERS = {"arrow_ring.h": ("ar_",), "pqc.h": ("pqc_",), "sp.h": ("sp_",)}
-SOURCES = ("arrow_ring.c", "pqc.c", "sp.c", "sp_catalog.c")
+SOURCES = ("arrow_ring.c", "pqc.c", "pqc_mirror.c", "sp.c", "sp_catalog.c")
 
 #: Functions that return `int` and take no Report: each answers a
 #: question about a value the object holds, and cannot fail. A new one
@@ -37,6 +37,11 @@ SOURCES = ("arrow_ring.c", "pqc.c", "sp.c", "sp_catalog.c")
 INT_WITHOUT_REPORT = {
     # pqc.h
     "pqc_reader_chunk": "reads the idx-th entry; -1 past the last",
+    "pqc_ckpt_object_parse": "a yes or no, with the parts of the name",
+    "pqc_versions_names": "a yes or no",
+    "pqc_mirror_shipped": "1 and the values, or 0 for none",
+    "pqc_sweep_local": "what to do with a file",
+    "pqc_sweep_remote": "what to do with a file",
     # sp.h: reads of a ticket, a plan, a store, a reader, a view
     "sp_ticket_field_kind": "the kind of a member; -1 for none",
     "sp_ticket_integer": "1 and the value, or 0 for an unknown member",
@@ -59,7 +64,7 @@ RETURNS = {"int", "void", "double", "int32_t", "int64_t", "uint32_t",
 
 #: The only functions that take a time: the ones that set the clock a
 #: test sees.
-TEST_CLOCKS = {"ar_test_set_clock", "sp_test_set_clock"}
+TEST_CLOCKS = {"ar_test_set_clock", "pqc_test_set_clock", "sp_test_set_clock"}
 
 passed = failed = 0
 

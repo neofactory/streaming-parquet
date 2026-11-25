@@ -22,6 +22,7 @@ COPIES = [
     ("arrow_ring.c", "ring/arrow_ring_core.c"),
     ("arrow_ring.h", "ring/arrow_ring.h"),
     ("pqc.c", "pqc/pqc_core.c"),
+    ("pqc_mirror.c", "pqc/pqc_mirror.c"),
     ("pqc.h", "pqc/pqc.h"),
     ("sp.c", "streaming/sp_core.c"),
     ("sp_catalog.c", "streaming/sp_catalog.c"),

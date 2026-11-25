@@ -76,7 +76,7 @@ def _build_if_stale():
     """In a checkout, build the library from src/core into this package
     when a source is newer than it. An installed package has the
     library and no sources: nothing to do."""
-    sources = [os.path.join(_CORE_DIR, n) for n in ('pqc.c', 'pqc.h', 'report.h')]
+    sources = [os.path.join(_CORE_DIR, n) for n in ('pqc.c', 'pqc_mirror.c', 'pqc.h', 'report.h')]
     if not all(os.path.exists(s) for s in sources):
         if os.path.exists(_LIB_PATH):
             return

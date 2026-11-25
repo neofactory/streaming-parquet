@@ -110,6 +110,7 @@ static void mutate(uint8_t *b, size_t n) {
 static void hit(const uint8_t *buf, size_t n) {
   char err[512];
   PqcReader *r = t_pqc_reader_open(buf, n, err, sizeof err);
+  int accepted = r != NULL;
   if (r) {
     (void)pqc_reader_name(r); (void)pqc_reader_watermark(r);
     uint32_t nc = pqc_reader_n_chunks(r);
@@ -119,6 +120,44 @@ static void hit(const uint8_t *buf, size_t n) {
     }
     uint64_t off, dl; pqc_reader_data(r, &off, &dl);
     pqc_reader_free(r);
+  }
+  /* the version rule and the mirror read the same bytes */
+  {
+    Report rep;
+    PqcVersions *v = NULL;
+    if (pqc_versions_new(0, &v, &rep) == REPORT_OK) {
+      (void)pqc_versions_stored(v, "a.parquet.000001.ckpt", buf, n, &rep);
+      (void)pqc_versions_stored(v, "a.parquet.000002.ckpt", buf, n, &rep);
+      for (int32_t i = 0; pqc_versions_due(v, i); i++) {}
+      pqc_versions_free(v);
+    }
+    PqcMirror *m = NULL;
+    const char *file = "f.parquet";
+    char named[PQC_NAME_MAX + 16];
+    if (accepted) {                /* the name the bytes record, when it is one */
+      PqcReader *again = t_pqc_reader_open(buf, n, err, sizeof err);
+      if (again) {
+        snprintf(named, sizeof named, "%s", pqc_reader_name(again));
+        pqc_reader_free(again);
+        file = named;
+      }
+    }
+    if (pqc_mirror_new(file, 0, &m, &rep) == REPORT_OK) {
+      if (pqc_mirror_local(m, "v.parquet.000001.ckpt", buf, n, 0,
+                           (int)(xr() & 1), &rep) == REPORT_OK) {
+        PqcMirrorStep st;
+        for (int k = 0; k < 4096; k++) {
+          if (pqc_mirror_next(m, &st, &rep) != REPORT_OK) break;
+          if (st.action == PQC_MIRROR_NOTHING || st.action == PQC_MIRROR_DONE)
+            break;
+          if (st.action == PQC_MIRROR_STAT)
+            (void)pqc_mirror_remote_has(m, (int)(xr() & 1), st.size, &rep);
+          else if (xr() % 16 == 0) { pqc_mirror_failed(m); break; }
+          else (void)pqc_mirror_did(m, &rep);
+        }
+      }
+      pqc_mirror_free(m);
+    }
   }
   size_t ol = 0;
   uint8_t *o = t_pqc_shift_footer(buf, n, (int64_t)xr() - 1000, &ol,

@@ -52,10 +52,10 @@
  * function says how long until something is due, and the host waits.
  * A timestamp with no time domain named is the system's wall time.
  *
- * For tests, each core that reads the clock has one function that sets
- * the time the core sees (ar_test_set_clock, sp_test_set_clock): a test
- * of "ten minutes later" then takes no time. Library code does not call
- * it. The checkpoint core reads no clock.
+ * For tests, each core has one function that sets the time the core
+ * sees (ar_test_set_clock, pqc_test_set_clock, sp_test_set_clock): a
+ * test of "ten minutes later" then takes no time. Library code does not
+ * call it.
  */
 #ifndef CORE_REPORT_H
 #define CORE_REPORT_H
