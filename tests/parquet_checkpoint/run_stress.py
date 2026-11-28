@@ -36,7 +36,7 @@ sys.path[:0] = [os.path.join(REPO, "src", "python"),
 from parquet_checkpoint import (ckpt_versions,
                                 CheckpointError, CheckpointReader,
                                 CheckpointWriter, DirSink, FakeS3,
-                                Shipper, finalize, live_table)
+                                Uploader, finalize, live_table)
 from parquet_checkpoint._sinks import FaultInjected, SinkError
 
 F = pa.field
@@ -170,28 +170,28 @@ def sustained(seconds, rate, group_rows):
 
 def pipeline(seconds, rate, group_rows):
     """The full two-copies pipeline under stress: ring-rate writer with
-    tail checkpoints -> local DirSink -> Shipper (random injected S3
-    outages) -> FakeS3, with a remote reader hammering the shipped
+    tail checkpoints -> local DirSink -> Uploader (random injected S3
+    outages) -> FakeS3, with a remote reader hammering the uploaded
     checkpoint. Ends with the shutdown protocol; local and remote final
     files must be byte-identical and exact."""
     ckpt_seconds = 0.2
     stop = threading.Event()
     problems = []
-    stats = {'reads': 0, 'outage_polls': 0, 'ships': 0}
+    stats = {'reads': 0, 'outage_polls': 0, 'uploads': 0}
     with tempfile.TemporaryDirectory() as tmp:
         local = DirSink(tmp)
         remote = FakeS3(part_min=64 * 1024)
         w = CheckpointWriter('pipe.parquet', SCHEMA, sink=local,
                              chunk_bytes=256 * 1024, compression='none',
                              checkpoint_every_write=True)
-        ship = Shipper('pipe.parquet', local, remote)
+        upload = Uploader('pipe.parquet', local, remote)
         rng = random.Random()
 
         def remote_reader():
             seen = 0
             while not stop.is_set():
                 v = ckpt_versions(remote, 'pipe.parquet')
-                if not v:                      # nothing shipped yet
+                if not v:                      # nothing uploaded yet
                     time.sleep(0.02)
                     continue
                 try:
@@ -247,9 +247,9 @@ def pipeline(seconds, rate, group_rows):
                 if rng.random() < 0.10:              # WAN flaps
                     remote.fail_next('put:', n=rng.randrange(1, 30))
                 try:
-                    st = ship.poll()
-                    if st['state'] == 'shipped':
-                        stats['ships'] += 1
+                    st = upload.poll()
+                    if st['state'] == 'uploaded':
+                        stats['uploads'] += 1
                 except FaultInjected:
                     stats['outage_polls'] += 1       # host logs + retries
             ahead = (i + pending_rows) / rate - (time.monotonic() - t0)
@@ -260,14 +260,14 @@ def pipeline(seconds, rate, group_rows):
             w.write_table(pa.concat_tables(pending))
             i += pending_rows
         remote.clear_faults()
-        while not ship.synced:
+        while not upload.synced:
             try:
-                ship.poll()
+                upload.poll()
             except FaultInjected:
                 pass
         w.close()
-        assert ship.poll()['state'] == 'local-finalized'
-        status, _ = ship.close()
+        assert upload.poll()['state'] == 'local-finalized'
+        status, _ = upload.close()
         assert status == 'recovered'
         stop.set()
         rd.join()
@@ -282,7 +282,7 @@ def pipeline(seconds, rate, group_rows):
         assert not ckpt_versions(remote, 'pipe.parquet')
         print(f"\npipeline: {i:,} rows in {elapsed:.1f}s "
               f"({i / elapsed:,.0f} rows/s target {rate:,.0f})")
-        print(f"  ships: {stats['ships']}, outage polls ridden: "
+        print(f"  uploads: {stats['uploads']}, outage polls ridden: "
               f"{stats['outage_polls']}, remote reads: {stats['reads']}")
         print(f"  final: {len(local_bytes) / 1e6:.1f} MB, byte-identical "
               f"local == remote")
@@ -295,7 +295,7 @@ def main():
     ap.add_argument('--kills', type=int, default=0)
     ap.add_argument('--seconds', type=float, default=0)
     ap.add_argument('--pipeline', type=float, default=0,
-                    help='seconds of full writer->shipper->S3 soak')
+                    help='seconds of full writer->uploader->S3 soak')
     ap.add_argument('--rate', type=float, default=20000.0)
     ap.add_argument('--group-rows', type=int, default=2000)
     args = ap.parse_args()

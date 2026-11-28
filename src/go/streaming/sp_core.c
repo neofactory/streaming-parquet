@@ -180,7 +180,7 @@ static const struct { const char *name; int kind; } FIELD[SP_T_FIELDS] = {
     [SP_T_BEAT_SECONDS] = {"beat_seconds", SP_NUMBER},
     [SP_T_STALE_AFTER] = {"stale_after", SP_NUMBER},
     [SP_T_CHECKPOINT_SECONDS] = {"checkpoint_seconds", SP_NUMBER},
-    [SP_T_SHIP_SECONDS] = {"ship_seconds", SP_NUMBER},
+    [SP_T_UPLOAD_SECONDS] = {"upload_seconds", SP_NUMBER},
     [SP_T_STORED_ROW] = {"stored_row", SP_INTEGER},
     [SP_T_STORED_AT] = {"stored_at", SP_NUMBER},
     [SP_T_KEEP_SECONDS] = {"keep_seconds", SP_NUMBER},
@@ -194,7 +194,7 @@ static const struct { const char *name; int kind; } FIELD[SP_T_FIELDS] = {
  * after stored_at. `archive` is written only when it is known. */
 static const int WRITE_ORDER[] = {
     SP_T_NAME, SP_T_HOST, SP_T_PORT, SP_T_RUN, SP_T_BEAT_SECONDS,
-    SP_T_STALE_AFTER, SP_T_CHECKPOINT_SECONDS, SP_T_SHIP_SECONDS,
+    SP_T_STALE_AFTER, SP_T_CHECKPOINT_SECONDS, SP_T_UPLOAD_SECONDS,
     SP_T_STORED_ROW, SP_T_STORED_AT, -1 /* unfinished, files */,
     SP_T_KEEP_SECONDS, SP_T_CATALOG_ETAG, SP_T_REVISION, SP_T_TS,
 };

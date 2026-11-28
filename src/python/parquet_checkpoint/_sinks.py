@@ -340,7 +340,7 @@ class S3Sink:
     Credentials come from the standard AWS chain (the root only picks the
     bucket). Every call goes through _s3: its class (QUICK or TRANSFER)
     sets its timeouts and attempts, and it is timed and logged when
-    slow. An unreachable S3 surfaces in seconds, not minutes: a Shipper
+    slow. An unreachable S3 surfaces in seconds, not minutes: an Uploader
     poll on a dead WAN must fail fast and be retried by the host's next
     poll."""
 

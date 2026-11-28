@@ -104,17 +104,17 @@ func parquetFiles(t *testing.T, folder string) []string {
 	return found
 }
 
-// A bucket store is written through the spool. The mirror copies it;
+// A bucket store is written through the spool. The upload copies it;
 // while the bucket is away the writer goes on, a file ends locally and
 // waits, the ticket says only what the bucket holds; when the bucket is
-// back the mirror catches up, and both copies end with the same files.
-func TestSpoolAndMirror(t *testing.T) {
+// back the upload catches up, and both copies end with the same files.
+func TestSpoolAndUpload(t *testing.T) {
 	tel, bucket, bucketDir := withFakeBucket(t)
 	defer tel.Close()
 	spool := t.TempDir()
 	s, err := tel.CreateStream("t/spool", testSchema(), StreamOptions{Store: fakeStore, Spool: spool,
 		Memory:  &MemoryOptions{Rows: 400},
-		Parquet: &ParquetOptions{CheckpointSeconds: 0.05, ShipSeconds: 0.05}})
+		Parquet: &ParquetOptions{CheckpointSeconds: 0.05, UploadSeconds: 0.05}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,15 +125,15 @@ func TestSpoolAndMirror(t *testing.T) {
 		}
 		return *tk.StoredRow
 	}
-	if st := s.MirrorState(); st == nil || st.Failing {
-		t.Fatalf("mirror state at start: %+v", st)
+	if st := s.UploadState(); st == nil || st.Failing {
+		t.Fatalf("upload state at start: %+v", st)
 	}
 	writeRows(t, s, 0, 10)
 	waitUntil(t, "row 9 in the spool", func() bool { return s.DurableRowNumber() == 9 })
 	waitUntil(t, "row 9 in the bucket, by the ticket", func() bool { return stored() == 9 })
-	if tk, _ := ticketsOf2(tel).get("t/spool"); tk.ShipSeconds != 0.05 ||
+	if tk, _ := ticketsOf2(tel).get("t/spool"); tk.UploadSeconds != 0.05 ||
 		len(tk.Files) != 1 || !strings.HasPrefix(tk.Files[0].Checkpoint, "s3://fake-bucket/") {
-		t.Fatalf("the ticket of a mirrored stream: %+v", tk)
+		t.Fatalf("the ticket of an uploaded stream: %+v", tk)
 	}
 	if st := s.ArchiveState(); !strings.HasPrefix(st.Location, "file://"+spool) &&
 		!strings.HasPrefix(st.Location, spool) {
@@ -144,7 +144,7 @@ func TestSpoolAndMirror(t *testing.T) {
 	bucket.down.Store(true)
 	writeRows(t, s, 10, 10)
 	waitUntil(t, "row 19 in the spool", func() bool { return s.DurableRowNumber() == 19 })
-	waitUntil(t, "the mirror says it fails", func() bool { return s.MirrorState().Failing })
+	waitUntil(t, "the upload says it fails", func() bool { return s.UploadState().Failing })
 	if st := s.ArchiveState(); st.Failing {
 		t.Fatalf("the files fail while only the bucket is away: %+v", st)
 	}
@@ -157,15 +157,15 @@ func TestSpoolAndMirror(t *testing.T) {
 	s.Cut() // the file ends locally, and waits for the bucket
 	writeRows(t, s, 20, 5)
 	waitUntil(t, "row 24 in the spool", func() bool { return s.DurableRowNumber() == 24 })
-	waitUntil(t, "one file pending", func() bool { return len(s.MirrorState().Pending) == 1 })
-	if st := s.MirrorState(); !st.Failing || st.Error == "" {
-		t.Fatalf("mirror state during the outage: %+v", st)
+	waitUntil(t, "one file pending", func() bool { return len(s.UploadState().Pending) == 1 })
+	if st := s.UploadState(); !st.Failing || st.Error == "" {
+		t.Fatalf("upload state during the outage: %+v", st)
 	}
 
 	// the bucket is back
 	bucket.down.Store(false)
-	waitUntil(t, "the mirror recovered and nothing is pending", func() bool {
-		st := s.MirrorState()
+	waitUntil(t, "the upload recovered and nothing is pending", func() bool {
+		st := s.UploadState()
 		return !st.Failing && len(st.Pending) == 0
 	})
 	waitUntil(t, "row 24 in the bucket, by the ticket", func() bool { return stored() == 24 })
@@ -247,13 +247,13 @@ func TestSpoolSweepAtStart(t *testing.T) {
 
 	s, err := tel.CreateStream("t/left", testSchema(), StreamOptions{Store: fakeStore, Spool: spool,
 		Memory:  &MemoryOptions{Rows: 400},
-		Parquet: &ParquetOptions{ShipSeconds: 0.05}})
+		Parquet: &ParquetOptions{UploadSeconds: 0.05}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	waitUntil(t, "both leftovers finished in the bucket", func() bool {
 		return far.Exists("20260101-000000.parquet") && far.Exists("20260101-000001.parquet") &&
-			len(s.MirrorState().Pending) == 0
+			len(s.UploadState().Pending) == 0
 	})
 	for _, name := range []string{"20260101-000000.parquet", "20260101-000001.parquet"} {
 		a, _ := local.Get(name, 0, -1)
@@ -275,7 +275,7 @@ func TestSpoolSweepAtStart(t *testing.T) {
 }
 
 // A stream with no store writes its files to the spool alone: no
-// mirror, no ticket, no catalog.
+// upload, no ticket, no catalog.
 func TestNoStoreWritesToTheSpool(t *testing.T) {
 	tel, err := newProcess(processConfig{})
 	if err != nil {
@@ -288,8 +288,8 @@ func TestNoStoreWritesToTheSpool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.MirrorState() != nil {
-		t.Fatal("a stream with no store has a mirror")
+	if s.UploadState() != nil {
+		t.Fatal("a stream with no store has an upload")
 	}
 	writeRows(t, s, 0, 10)
 	if err := s.Close(); err != nil {

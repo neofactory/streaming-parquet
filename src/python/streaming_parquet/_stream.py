@@ -12,11 +12,11 @@ Attached does), and it all just works.
 How commit triggers the work (_publish): compare the committed count
 with three cursors and submit at most one task per kind to the worker
 pool -- the Flight push, the parquet write or tail checkpoint, the
-mirror pass. The push task sends everything from the Flight cursor to
+upload pass. The push task sends everything from the Flight cursor to
 the committed count at the moment it runs, and commit submits it only
 when none is pending, so a slow sink gets fewer, larger batches and a
 fast sink gets a row per push, with nothing configured. The time-driven
-work on a quiet stream (the tail checkpoint, the mirror retry, the
+work on a quiet stream (the tail checkpoint, the upload retry, the
 ticket beat) runs on the stream's heartbeat thread, which wakes on the
 shortest of its cadences. Slow operations never run on a caller's
 thread.
@@ -30,7 +30,7 @@ import pyarrow as pa
 import parquet_checkpoint
 
 from ._diag import _diag
-from ._options import MemoryOptions, ParquetOptions, MirrorState
+from ._options import MemoryOptions, ParquetOptions, UploadState
 from ._stream_data import _StreamData
 from ._worker_pool import get_pool
 from ._files import (Files, KEEP_LABEL, DEFAULT_ROW_GROUP_ROWS,  # noqa: F401
@@ -110,18 +110,18 @@ class Stream:
         self._lock = threading.Lock()
 
         a = parquet or ParquetOptions()
-        # The S3 mirror: every ship_seconds, while a file is live or
-        # pending, one mirror pass goes to the ship lane.
+        # The S3 upload: every upload_seconds, while a file is live or
+        # pending, one upload pass goes to the upload lane.
         self._remote = writer._remote if writer is not None else None
-        self._ship_seconds = a.ship_seconds
-        self._ship_mono = None          # last mirror pass submitted
-        self._ship_queued = False       # one pass queued at a time
-        self._ship_failing = False      # for transition logging
-        self._ship_error = None         # the last failure's text
+        self._upload_seconds = a.upload_seconds
+        self._upload_mono = None          # last upload pass submitted
+        self._upload_queued = False       # one pass queued at a time
+        self._upload_failing = False      # for transition logging
+        self._upload_error = None         # the last failure's text
 
         # The files: the write plan, the pins and the writes (_files).
         # What is the stream's own comes in as functions: its writer
-        # lock, its ticket after a write, its mirror and its beat.
+        # lock, its ticket after a write, its upload and its beat.
         self._files = Files(
             name, self._data, ring_rows, self._lock, options=parquet,
             writer=writer, make_writer=make_writer, nowhere=nowhere,
@@ -145,7 +145,7 @@ class Stream:
                               run=lambda: self._run)
 
         # The heartbeat thread: the ticket beat, and the time-due work on
-        # a stream committing nothing (the tail checkpoint, the mirror
+        # a stream committing nothing (the tail checkpoint, the upload
         # retry). Always runs; the ticket part only with a root.
         if not publish:
             _diag.info(f"[{self.name}] internal stream -- no ticket, not "
@@ -185,16 +185,16 @@ class Stream:
 
     def _set_beat(self):
         """The ticket's beat: the longest gap between ticket writes, the
-        cadence at which the store's data changes -- the ship interval
+        cadence at which the store's data changes -- the upload interval
         for a bucket behind a spool, else the checkpoint interval (the
-        ship interval when there is none). The heartbeat writes the
+        upload interval when there is none). The heartbeat writes the
         ticket when the stored state changes, and at least once a beat.
         With it, when a reader may call this writer dead: the one rule
         (three beats, at least 30 seconds), written into the ticket."""
         if self._remote is None and self._checkpoint_seconds is not None:
             self._beat_seconds = self._checkpoint_seconds
         else:
-            self._beat_seconds = self._ship_seconds
+            self._beat_seconds = self._upload_seconds
         self._stale_after = parquet_checkpoint.dead_after(self._beat_seconds)
 
     # --- the files' state, as the rest of the stream reads it -------------
@@ -223,13 +223,13 @@ class Stream:
         self._remote = writer._remote
 
     def _options_set(self, options):
-        """New parquet options: the mirror's cadence and the ticket's
+        """New parquet options: the upload's cadence and the ticket's
         beat follow. Under the lock."""
-        self._ship_seconds = options.ship_seconds
+        self._upload_seconds = options.upload_seconds
         self._set_beat()
 
     def _wrote(self):
-        """A write landed in the first copy. Without a mirror the first
+        """A write landed in the first copy. Without an upload the first
         copy is the store: the ticket says so now."""
         if self._remote is None:
             self._write_ticket()
@@ -358,7 +358,7 @@ class Stream:
                 "beat_seconds": self._beat_seconds,
                 "stale_after": self._stale_after,
                 "checkpoint_seconds": self._checkpoint_seconds,
-                "ship_seconds": (self._ship_seconds
+                "upload_seconds": (self._upload_seconds
                                  if self._remote is not None else None),
                 "stored_row": stored_row, "stored_at": stored_at,
                 "unfinished": unfinished, "files": files,
@@ -423,7 +423,7 @@ class Stream:
     def commit(self):
         """Freeze allocated rows: visible to readers at once. Then the
         publish step (memory stores and queue puts): the Flight push, the
-        parquet write when due, the mirror pass when due are submitted to
+        parquet write when due, the upload pass when due are submitted to
         the worker pool. Nothing slow runs here."""
         count = self._ring.commit()
         if count > 0:
@@ -481,14 +481,14 @@ class Stream:
             self._flight_server.notify(self.name)
         with self._lock:
             archive = self._files.committed(committed)
-            ship = self._ship_due()
-            if ship:
-                self._ship_queued = True
-                self._ship_mono = time.monotonic()
+            upload = self._upload_due()
+            if upload:
+                self._upload_queued = True
+                self._upload_mono = time.monotonic()
         if archive:
             self._files.submit(committed)
-        if ship:
-            self._pool.submit("ship", self.name, self._do_ship)
+        if upload:
+            self._pool.submit("upload", self.name, self._do_upload)
 
     # --- the archive's standing ---------------------------------------------
 
@@ -500,7 +500,7 @@ class Stream:
     def get_durable_row_number(self):
         """The number of the newest row that is in a written piece of a
         file or in a checkpoint, and -1 when no row is there yet. With
-        a spool that is the copy on the local disk: mirror_state() says
+        a spool that is the copy on the local disk: upload_state() says
         what the bucket has. A program that must acknowledge its input
         only when the row is safe (a queue consumer) notes
         get_newest_row_number() after its commit, and waits until this
@@ -519,44 +519,44 @@ class Stream:
     def _archive_location(self):
         return self._files.location()
 
-    # --- the S3 mirror ------------------------------------------------------
+    # --- the S3 upload ------------------------------------------------------
 
-    def _ship_due(self):
-        if self._remote is None or self._parquet is None or self._ship_queued:
+    def _upload_due(self):
+        if self._remote is None or self._parquet is None or self._upload_queued:
             return False
         if not self._parquet.get_in_flight() and self._parquet._remote_swept:
             return False
-        return (self._ship_mono is None
-                or time.monotonic() - self._ship_mono >= self._ship_seconds)
+        return (self._upload_mono is None
+                or time.monotonic() - self._upload_mono >= self._upload_seconds)
 
-    def _submit_ship(self, on_done=None):
+    def _submit_upload(self, on_done=None):
         with self._lock:
-            self._ship_queued = True
-            self._ship_mono = time.monotonic()
-        self._pool.submit("ship", self.name, self._do_ship, on_done=on_done)
+            self._upload_queued = True
+            self._upload_mono = time.monotonic()
+        self._pool.submit("upload", self.name, self._do_upload, on_done=on_done)
 
-    def _do_ship(self):
+    def _do_upload(self):
         with self._lock:
-            self._ship_queued = False
+            self._upload_queued = False
         try:
-            self._parquet.ship()
+            self._parquet.upload()
         except Exception as e:
-            self._ship_error = str(e)
-            if not self._ship_failing:
-                _diag.warning(f"[{self.name}] remote mirror failing: {e}")
-                self._ship_failing = True
+            self._upload_error = str(e)
+            if not self._upload_failing:
+                _diag.warning(f"[{self.name}] remote upload failing: {e}")
+                self._upload_failing = True
             return
-        if self._ship_failing:
-            _diag.info(f"[{self.name}] remote mirror recovered")
-            self._ship_failing = False
-            self._ship_error = None
+        if self._upload_failing:
+            _diag.info(f"[{self.name}] remote upload recovered")
+            self._upload_failing = False
+            self._upload_error = None
         self._write_ticket()            # right after the upload
 
-    def mirror_state(self):
-        """The S3 mirror's standing: None without a remote."""
+    def upload_state(self):
+        """The S3 upload's standing: None without a remote."""
         if self._remote is None:
             return None
-        return MirrorState(failing=self._ship_failing, error=self._ship_error,
+        return UploadState(failing=self._upload_failing, error=self._upload_error,
                            pending=self._parquet.get_pending())
 
     # --- memory -----------------------------------------------------------
@@ -663,31 +663,31 @@ class Stream:
         else:
             step("parquet-close", t0)
 
-        # The closing mirror pass: with the link up, the last file's
+        # The closing upload pass: with the link up, the last file's
         # remote copy is assembled before we return. With it down, the
         # file stays pending locally and the next start's boot sweep
         # finishes it.
         if self._remote is not None:
-            shipped = threading.Event()
+            uploaded = threading.Event()
             t0 = time.monotonic()
-            self._submit_ship(on_done=shipped.set)
+            self._submit_upload(on_done=uploaded.set)
             for _ in range(3):               # 3 s, a progress line a second
-                if shipped.wait(timeout=1.0):
+                if uploaded.wait(timeout=1.0):
                     break
-                doing = self._parquet.shipping_now()
+                doing = self._parquet.uploading_now()
                 if doing:
                     _diag.info(f"[{self.name}] close: {doing}, "
                                f"{time.monotonic() - t0:.0f} s so far")
-            if not shipped.is_set():
-                doing = self._parquet.shipping_now() or "the mirror pass"
+            if not uploaded.is_set():
+                doing = self._parquet.uploading_now() or "the upload pass"
                 msg = (f"[{self.name}] close: still {doing} after "
                        f"{time.monotonic() - t0:.0f} s; the file is complete "
                        f"in the local spool ({self._parquet.get_dir()}) and "
                        f"the next start finishes the upload")
                 _diag.warning(msg)
-                step("ship-wait TIMEOUT", t0)
+                step("upload-wait TIMEOUT", t0)
             else:
-                step("ship", t0)
+                step("upload", t0)
 
         # The catalog lists the last file before the stream goes, when it
         # can in a few seconds; otherwise its pass stops between two files
@@ -770,7 +770,7 @@ class Stream:
             waits.append(self._beat_seconds)
         waits.extend(self._files.cadences())
         if self._remote is not None:
-            waits.append(self._ship_seconds)
+            waits.append(self._upload_seconds)
         return max(0.01, min(waits) / 2.0)
 
     def _heartbeat_loop(self):
@@ -782,7 +782,7 @@ class Stream:
             # it as they land; this covers a stream with nothing new)
             self._write_ticket()
             # The time-due part of the publish step: a quiet stream's
-            # tail checkpoint, the mirror retry. Cheap when nothing is due.
+            # tail checkpoint, the upload retry. Cheap when nothing is due.
             try:
                 self._publish()
             except Exception as e:

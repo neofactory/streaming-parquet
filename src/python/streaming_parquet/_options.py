@@ -4,7 +4,7 @@ Options, given once at create_stream / attach:
 
     MemoryOptions(rows, segment_bytes)
     ParquetOptions(checkpoint_seconds, row_group_rows, row_group_seconds,
-                   ship_seconds, compression, catalog_copy_seconds)
+                   upload_seconds, compression, catalog_copy_seconds)
 
 A name that ends in Options is given; a name that ends in State is read
 back.
@@ -12,7 +12,7 @@ back.
 Results, read whenever a host wants them:
 
     ArchiveState   the first copy's standing
-    MirrorState    the S3 mirror's standing
+    UploadState    the S3 upload's standing
     MemoryState    what the stream holds in memory
     View           a DuckDB view registered on a connection
 
@@ -48,7 +48,7 @@ class ParquetOptions:
             gives no rows.
     row_group_seconds: also end a row group after this long. None =
             size-bound only.
-    ship_seconds: cadence of the pass that moves the spool's files to a
+    upload_seconds: cadence of the pass that moves the spool's files to a
             bucket store.
     compression: dict forwarded to the parquet writer (compression,
             compression_level, use_dictionary, column_encoding).
@@ -59,7 +59,7 @@ class ParquetOptions:
     checkpoint_seconds: Optional[float] = None
     row_group_rows: Optional[int] = None
     row_group_seconds: Optional[float] = None
-    ship_seconds: float = 5.0
+    upload_seconds: float = 5.0
     compression: dict = field(default_factory=dict)
     catalog_copy_seconds: Optional[float] = 86400.0
 
@@ -84,8 +84,8 @@ class ArchiveState:
 
 
 @dataclass(frozen=True)
-class MirrorState:
-    """The S3 mirror's standing. pending: files ended locally whose
+class UploadState:
+    """The S3 upload's standing. pending: files ended locally whose
     remote copy is not yet assembled."""
     failing: bool
     error: Optional[str]

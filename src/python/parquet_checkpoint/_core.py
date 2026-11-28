@@ -81,26 +81,26 @@ const char *pqc_versions_due(const PqcVersions *v, int32_t index);
 int pqc_versions_deleted(PqcVersions *v, const char *object, Report *report);
 int pqc_versions_names(const PqcVersions *v, const char *object);
 
-typedef struct PqcMirror PqcMirror;
+typedef struct PqcUpload PqcUpload;
 typedef struct {
     int32_t action;
     int32_t flag;
     uint64_t size;
     char name[320];
-} PqcMirrorStep;
-int pqc_mirror_new(const char *name, double keep_seconds, PqcMirror **out,
+} PqcUploadStep;
+int pqc_upload_new(const char *name, double keep_seconds, PqcUpload **out,
                    Report *report);
-void pqc_mirror_free(PqcMirror *m);
-int pqc_mirror_local(PqcMirror *m, const char *object, const uint8_t *ckpt,
+void pqc_upload_free(PqcUpload *m);
+int pqc_upload_local(PqcUpload *m, const char *object, const uint8_t *ckpt,
                      size_t len, int final_exists, int live, Report *report);
-int pqc_mirror_next(PqcMirror *m, PqcMirrorStep *step, Report *report);
-int pqc_mirror_remote_has(PqcMirror *m, int exists, uint64_t size,
+int pqc_upload_next(PqcUpload *m, PqcUploadStep *step, Report *report);
+int pqc_upload_remote_has(PqcUpload *m, int exists, uint64_t size,
                           Report *report);
-int pqc_mirror_did(PqcMirror *m, Report *report);
-void pqc_mirror_failed(PqcMirror *m);
-int pqc_mirror_shipped(const PqcMirror *m, const uint8_t **ckpt, size_t *len,
+int pqc_upload_did(PqcUpload *m, Report *report);
+void pqc_upload_failed(PqcUpload *m);
+int pqc_upload_version(const PqcUpload *m, const uint8_t **ckpt, size_t *len,
                        const char **object);
-const char *pqc_mirror_doing(const PqcMirror *m);
+const char *pqc_upload_doing(const PqcUpload *m);
 int pqc_sweep_local(int final_exists, int has_remote, int keeps_checkpoints);
 int pqc_sweep_remote(int final_exists, int keeps_checkpoints, int in_flight);
 void pqc_test_set_clock(int fixed, double wall, double mono);
@@ -112,7 +112,7 @@ void pqc_finish_free(PqcFinish *f);
 int pqc_finish_version(PqcFinish *f, const char *object, Report *report);
 int pqc_finish_given(PqcFinish *f, const char *object, const uint8_t *ckpt,
                      size_t len, Report *report);
-int pqc_finish_next(PqcFinish *f, PqcMirrorStep *step, Report *report);
+int pqc_finish_next(PqcFinish *f, PqcUploadStep *step, Report *report);
 int pqc_finish_has(PqcFinish *f, int exists, uint64_t size, Report *report);
 int pqc_finish_read(PqcFinish *f, const uint8_t *ckpt, size_t len,
                     Report *report);
@@ -135,7 +135,7 @@ def _build_if_stale():
     """In a checkout, build the library from src/core into this package
     when a source is newer than it. An installed package has the
     library and no sources: nothing to do."""
-    sources = [os.path.join(_CORE_DIR, n) for n in ('pqc.c', 'pqc_mirror.c', 'pqc.h', 'report.h')]
+    sources = [os.path.join(_CORE_DIR, n) for n in ('pqc.c', 'pqc_upload.c', 'pqc.h', 'report.h')]
     if not all(os.path.exists(s) for s in sources):
         if os.path.exists(_LIB_PATH):
             return
@@ -160,8 +160,8 @@ for _name in sorted(set(re.findall(r"\b(pqc_\w+)\s*\(", _CDEF))):
     getattr(lib, _name)
 for _type in ('Report *', 'PqcWriter **', f'char[{NAME_MAX}]',
               'const uint8_t **', 'uint8_t **', 'uint64_t *', 'int64_t *',
-              'uint32_t *', 'int *', 'PqcVersions **', 'PqcMirror **',
-              'PqcMirrorStep *', 'char[320]', 'size_t *', 'const char **',
+              'uint32_t *', 'int *', 'PqcVersions **', 'PqcUpload **',
+              'PqcUploadStep *', 'char[320]', 'size_t *', 'const char **',
               'PqcFinish **', 'PqcPart **', 'uint64_t[]'):
     ffi.new(_type, 1) if _type.endswith('[]') else ffi.new(_type)
 
@@ -300,7 +300,7 @@ class Writer:
             pass
 
 
-# ---- checkpoint versions, the mirror, the sweep (src/core/pqc.h) -----------
+# ---- checkpoint versions, the upload, the sweep (src/core/pqc.h) -----------
 
 OBJECT_MAX = 320                # PQC_OBJECT_MAX
 _NO_MEMORY = 4
@@ -383,32 +383,32 @@ class Versions:
         self.free()
 
 
-# PqcMirrorAction
-MIRROR_NOTHING, MIRROR_STAT, MIRROR_UPLOAD, MIRROR_UPLOAD_VERSION = 0, 1, 2, 3
-MIRROR_STORED, MIRROR_DELETE, MIRROR_ASSEMBLE_LOCAL = 4, 5, 6
-MIRROR_ASSEMBLE_REMOTE, MIRROR_DONE = 7, 8
+# PqcUploadAction
+UPLOAD_NOTHING, UPLOAD_STAT, UPLOAD_OBJECT, UPLOAD_VERSION = 0, 1, 2, 3
+UPLOAD_STORED, UPLOAD_DELETE, UPLOAD_ASSEMBLE_LOCAL = 4, 5, 6
+UPLOAD_ASSEMBLE_REMOTE, UPLOAD_DONE = 7, 8
 
 
-class Mirror:
-    """The mirror of one file from a local copy to a remote one
-    (PqcMirror): the rules of what is sent, in which order, what is
+class Upload:
+    """The upload of one file from a local copy to a remote one
+    (PqcUpload): the rules of what is sent, in which order, what is
     deleted, and how a file ends. The host does each step."""
 
     def __init__(self, name, keep_seconds):
         self._m = ffi.NULL
-        out = ffi.new('PqcMirror **')
+        out = ffi.new('PqcUpload **')
         r = _report()
-        _check(lib.pqc_mirror_new(name.encode('utf-8'), float(keep_seconds),
+        _check(lib.pqc_upload_new(name.encode('utf-8'), float(keep_seconds),
                                   out, r), r)
         self._m = out[0]
-        self._step = ffi.new('PqcMirrorStep *')
+        self._step = ffi.new('PqcUploadStep *')
 
     def local(self, obj, ckpt, final_exists, live):
         """A pass begins: the newest local version and its bytes (None,
         None for none), whether the finished file is there, whether the
         writer still has the file open."""
         r = _report()
-        _check(lib.pqc_mirror_local(
+        _check(lib.pqc_upload_local(
             self._m, obj.encode('utf-8') if obj is not None else ffi.NULL,
             ckpt if ckpt is not None else ffi.NULL,
             len(ckpt) if ckpt is not None else 0,
@@ -417,42 +417,42 @@ class Mirror:
     def next(self):
         """(action, name, size, flag) of the next step."""
         r = _report()
-        _check(lib.pqc_mirror_next(self._m, self._step, r), r)
+        _check(lib.pqc_upload_next(self._m, self._step, r), r)
         st = self._step
         return (st.action, ffi.string(st.name).decode('utf-8'), int(st.size),
                 int(st.flag))
 
     def remote_has(self, exists, size):
         r = _report()
-        _check(lib.pqc_mirror_remote_has(self._m, 1 if exists else 0,
+        _check(lib.pqc_upload_remote_has(self._m, 1 if exists else 0,
                                          int(size), r), r)
 
     def did(self):
         r = _report()
-        _check(lib.pqc_mirror_did(self._m, r), r)
+        _check(lib.pqc_upload_did(self._m, r), r)
 
     def failed(self):
-        lib.pqc_mirror_failed(self._m)
+        lib.pqc_upload_failed(self._m)
 
-    def shipped(self):
+    def uploaded(self):
         """(bytes, object) of the newest version stored on the remote,
         or (None, None)."""
         ck = ffi.new('const uint8_t **')
         n = ffi.new('size_t *')
         obj = ffi.new('const char **')
-        if not lib.pqc_mirror_shipped(self._m, ck, n, obj):
+        if not lib.pqc_upload_version(self._m, ck, n, obj):
             return None, None
         return bytes(ffi.buffer(ck[0], n[0])), ffi.string(obj[0]).decode('utf-8')
 
     @property
     def doing(self):
-        """What the mirror is doing on the remote now, or None."""
-        text = ffi.string(lib.pqc_mirror_doing(self._m)).decode('utf-8')
+        """What the upload is doing on the remote now, or None."""
+        text = ffi.string(lib.pqc_upload_doing(self._m)).decode('utf-8')
         return text or None
 
     def free(self):
         if self._m != ffi.NULL:
-            lib.pqc_mirror_free(self._m)
+            lib.pqc_upload_free(self._m)
             self._m = ffi.NULL
 
     def __del__(self):
@@ -460,7 +460,7 @@ class Mirror:
 
 
 # PqcSweep
-SWEEP_NOTHING, SWEEP_FINISH, SWEEP_MIRROR = 0, 1, 2
+SWEEP_NOTHING, SWEEP_FINISH, SWEEP_UPLOAD = 0, 1, 2
 SWEEP_AWAIT_CATALOG, SWEEP_DISCARD = 3, 4
 
 
@@ -493,7 +493,7 @@ class Finish:
         _check(lib.pqc_finish_new(name.encode('utf-8'), int(mode),
                                   1 if keep_checkpoints else 0, out, r), r)
         self._f = out[0]
-        self._step = ffi.new('PqcMirrorStep *')
+        self._step = ffi.new('PqcUploadStep *')
 
     def version(self, obj):
         """The place holds the checkpoint version `obj`."""

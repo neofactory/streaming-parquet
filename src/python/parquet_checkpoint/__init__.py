@@ -69,7 +69,7 @@ from ._sinks import DirSink, FakeS3, S3Sink, SubSink, SinkError  # noqa: F401
 __all__ = ['CheckpointWriter', 'CheckpointReader', 'finalize',
            'recover_directory', 'dead_after',
            'live_table', 'live_metadata', 'verify',
-           'CheckpointError', 'DirSink', 'FakeS3', 'S3Sink', 'SubSink', 'Shipper']
+           'CheckpointError', 'DirSink', 'FakeS3', 'S3Sink', 'SubSink', 'Uploader']
 
 MAGIC = b'PAR1'
 CKPT_MAGIC = b'PQC2'
@@ -599,7 +599,7 @@ def finalize(name, sink, ckpt_bytes=None, ckpt_object=None,
     checkpoint versions are deleted last. Runnable by anyone, anywhere,
     anytime: it assembles from the newest version whose CRC holds.
     `ckpt_bytes`, `ckpt_object`: the newest version's bytes and object
-    name when the caller just put them there (a Shipper); the read-back
+    name when the caller just put them there (an Uploader); the read-back
     is then skipped. `keep_checkpoints`: leave the chunks and versions
     for readers that were told of them; discard_checkpoints() later.
 
@@ -759,4 +759,4 @@ def verify(path):
     return r.verify()
 
 
-from ._shipper import Shipper  # noqa: E402  (needs the names above)
+from ._uploader import Uploader  # noqa: E402  (needs the names above)

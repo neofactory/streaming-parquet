@@ -106,16 +106,16 @@ finalize(name, sink) -> (status, name)   # checkpoint -> ordinary .parquet;
                                          # idempotent; ckpt deleted last
 recover_directory(sink_or_dir)           # the boot sweep
 
-# The mirror's rules (what is sent, the order, what is deleted, how a
-# file ends) are the C core's: src/core/pqc.h, THE MIRROR. The Shipper
-# does what the core asks; the Go host's pqc.Mirror does the same.
-Shipper(name, local, remote)             # mirror local -> S3; pollable,
-ship.poll() -> {'state': ...}            #   no threads; raises on sink
-ship.synced                              #   failure (host logs + retries).
-ship.close()                             # finalize the REMOTE copy from
-                                         #   its own shipped artifacts
+# The upload's rules (what is sent, the order, what is deleted, how a
+# file ends) are the C core's: src/core/pqc.h, THE UPLOAD. The Uploader
+# does what the core asks; the Go host's pqc.Upload does the same.
+Uploader(name, local, remote)             # upload local -> S3; pollable,
+upload.poll() -> {'state': ...}            #   no threads; raises on sink
+upload.synced                              #   failure (host logs + retries).
+upload.close()                             # finalize the REMOTE copy from
+                                         #   its own uploaded artifacts
                                          #   (byte-identical to local).
-                                         # Catch-up after an outage ships
+                                         # Catch-up after an outage uploads
                                          # missing chunks + ONLY the
                                          # latest checkpoint.
 
@@ -280,8 +280,8 @@ Test content (all in `run_tests.py`, 14 tests):
   file.
 - The union-view payoff: arrow_ring hot + checkpoint reader cold,
   exact seam every cycle.
-- The shipper: rides a WAN outage (local keeps writing), one catch-up
-  pass ships missed chunks and only the latest checkpoint, remote
+- The uploader: rides a WAN outage (local keeps writing), one catch-up
+  pass uploads missed chunks and only the latest checkpoint, remote
   final file byte-identical to the local one.
 - The C core (`run_c_compat.py`, 6 tests), against things that are not
   the core: CRC-32 equal to zlib's; the thrift rebase read by pyarrow

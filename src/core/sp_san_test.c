@@ -83,7 +83,7 @@ int main(void) {
     size_t len;
     char *text = t_ticket_write(t, &len);
     CHECK(text != NULL && strlen(text) == len);
-    CHECK(strstr(text, "\"ship_seconds\": null") != NULL);  /* unknown: null */
+    CHECK(strstr(text, "\"upload_seconds\": null") != NULL);  /* unknown: null */
     CHECK(strstr(text, "\"archive\"") == NULL);             /* not set: absent */
     CHECK(strstr(text, "\"unfinished\": [\"s3://b/streams/x/a.parquet.000003.ckpt\", ") != NULL);
     SpTicket *back = t_ticket_read(text, len, err, sizeof err);

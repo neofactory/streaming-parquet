@@ -209,7 +209,7 @@ func TestChunkRetryAfterFailedPut(t *testing.T) {
 	if _, err := WriteRows(w, makeRows(0, 2000)); err == nil {
 		t.Fatal("injected chunk-PUT failure must surface")
 	}
-	// retry: the same pending chunk ships now
+	// retry: the same pending chunk uploads now
 	if _, err := WriteRows(w, makeRows(2000, 100)); err != nil {
 		t.Fatal(err)
 	}

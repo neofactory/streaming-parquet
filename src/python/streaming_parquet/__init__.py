@@ -14,7 +14,7 @@ calls one of the reader verbs, and it all just works.
     # ---- writing ------------------------------------------------------
     s = sp.create_stream(name, arrow_schema, store=STORE,   # spool= for the local copy's place
             memory=sp.MemoryOptions(rows=rows),
-            parquet=sp.ParquetOptions(checkpoint_seconds=15, ship_seconds=15, compression={...}),   # None = no files until start_parquet
+            parquet=sp.ParquetOptions(checkpoint_seconds=15, upload_seconds=15, compression={...}),   # None = no files until start_parquet
             publish=True)                                   # False = internal: this process only
     row = s.get_mutable_row(); row.x = 1.0; s.commit()      # one row
     s.append(table_or_batch_or_dict)                        # many rows
@@ -22,7 +22,7 @@ calls one of the reader verbs, and it all just works.
     s.cut(label=...)                     # end the file; next file carries label
     s.start_parquet(label, options), s.stop_parquet()   # parquet on and off, stream live
     s.publish(), s.unpublish()           # found and read by other processes, or internal
-    s.archive_state(), s.mirror_state(), s.memory_state()
+    s.archive_state(), s.upload_state(), s.memory_state()
     s.get_newest_row_number()            # the last row committed
     s.get_durable_row_number()           # the newest row safe in a file
     s.close()
@@ -70,7 +70,7 @@ from . import _tickets
 from ._tickets import DEFAULT_PUBLIC_STORE, DEFAULT_SPOOL  # noqa: F401 -- public API
 from ._parquet_writer import ParquetWriter
 from ._options import (MemoryOptions, ParquetOptions, ArchiveState,  # noqa: F401
-                       MirrorState, MemoryState, View)
+                       UploadState, MemoryState, View)
 from ._stream import Stream, DEFAULT_ROW_GROUP_ROWS, KEEP_LABEL  # noqa: F401 -- public API
 from ._attach import Attached, Cursor, _Feeder, _Copy  # noqa: F401
 from ._files import _ring_sizes
@@ -123,14 +123,14 @@ def create_stream(name, schema, store=None, spool=DEFAULT_SPOOL,
              and its files, if any, go to the spool.
     spool:   the local write-behind copy a bucket store writes through:
              on disk, surviving a reboot, drained to the bucket on the
-             ship cadence, growing during an outage. Default
+             upload cadence, growing during an outage. Default
              /var/tmp/streaming-parquet/<user>/. None = no local copy,
              the bucket is the first copy. Ignored for a directory
              store, which is written straight into.
     memory:  MemoryOptions(rows, segment_bytes). None =
              the defaults: a ring of two parquet row groups.
     parquet: ParquetOptions(checkpoint_seconds, row_group_rows,
-             row_group_seconds, ship_seconds, compression,
+             row_group_seconds, upload_seconds, compression,
              catalog_copy_seconds): the tuning. None = no files until
              a start_parquet.
     publish: True = other processes can find the stream (its ticket in
@@ -191,7 +191,7 @@ def create_stream(name, schema, store=None, spool=DEFAULT_SPOOL,
             folder = folder if folder.endswith("/") else folder + "/"
             writer.catalog = _catalog.Catalog(
                 name, folder,
-                retry_s=options.ship_seconds,
+                retry_s=options.upload_seconds,
                 copy_s=options.catalog_copy_seconds)
             writer.catalog.on_listed = writer.cataloged
         writer.start()
@@ -222,7 +222,7 @@ def create_stream(name, schema, store=None, spool=DEFAULT_SPOOL,
 def _writer_for(name, schema, store, spool, parquet, run):
     """The ParquetWriter for a stream's store and spool.
 
-    bucket store, spool given: first copy in the spool, mirrored to the
+    bucket store, spool given: first copy in the spool, uploaded to the
         bucket name for name (the box's disk buffers a WAN outage)
     bucket store, spool None: the bucket is the first copy
     directory store: written straight into it; the spool is unused
@@ -550,7 +550,7 @@ def close():
                         "(its Flight client may pin shutdown)")
 
     # Close local streams concurrently (each: final cut, the closing
-    # mirror pass -- a second of S3 round trips per stream -- the ticket
+    # upload pass -- a second of S3 round trips per stream -- the ticket
     # delete). Joined: the files must be finished in both places before
     # the process ends.
     def _close_stream(stream):

@@ -29,10 +29,10 @@ func (o *outage) Assemble(dest string, sources []Source) error {
 	return o.Sink.Assemble(dest, sources)
 }
 
-// The mirror, by the core's rules: an outage loses nothing that was
+// The upload, by the core's rules: an outage loses nothing that was
 // sent, an object is sent once, the ticket is told at each version, and
 // the file ends in both copies with the same bytes.
-func TestMirror(t *testing.T) {
+func TestUpload(t *testing.T) {
 	local, _ := NewDirSink(t.TempDir())
 	far, _ := NewDirSink(t.TempDir())
 	remote := &outage{Sink: far}
@@ -40,7 +40,7 @@ func TestMirror(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, err := NewMirror("m.parquet", local, remote, SupersededKeep)
+	m, err := NewUpload("m.parquet", local, remote, SupersededKeep)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestMirror(t *testing.T) {
 	}
 	remote.down = false
 	st, err := m.Run(true, false, stored)
-	if err != nil || st.State != "shipped" || st.Chunks == 0 || st.Rows != 2000 {
+	if err != nil || st.State != "uploaded" || st.Chunks == 0 || st.Rows != 2000 {
 		t.Fatalf("the first version: %+v %v", st, err)
 	}
 	if len(told) != 1 || told[0] != 2000 || m.LastObject() != st.Object {
@@ -76,7 +76,7 @@ func TestMirror(t *testing.T) {
 		t.Fatal(err)
 	}
 	st, err = m.Run(true, false, stored)
-	if err != nil || st.State != "shipped" || st.Rows != 3500 {
+	if err != nil || st.State != "uploaded" || st.Rows != 3500 {
 		t.Fatalf("the second version: %+v %v", st, err)
 	}
 	names, _ := far.List("")
@@ -125,9 +125,9 @@ func TestMirror(t *testing.T) {
 	}
 
 	// the sweep's table is the core's
-	if SweepLocal(false, true, true) != SweepMirror || SweepLocal(false, false, true) != SweepFinish ||
+	if SweepLocal(false, true, true) != SweepUpload || SweepLocal(false, false, true) != SweepFinish ||
 		SweepLocal(true, false, true) != SweepAwaitCatalog || SweepLocal(true, true, true) != SweepDiscard ||
-		SweepRemote(false, true, true) != SweepNothing || SweepRemote(false, true, false) != SweepMirror {
+		SweepRemote(false, true, true) != SweepNothing || SweepRemote(false, true, false) != SweepUpload {
 		t.Fatal("the sweep's answers are not the core's")
 	}
 	// and so are the names of versions

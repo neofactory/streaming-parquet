@@ -1,8 +1,8 @@
-/* pqc_mirror.c -- the checkpoint core's rules for checkpoint versions,
- * for the mirror of a file from a local copy to a remote one, for the
+/* pqc_upload.c -- the checkpoint core's rules for checkpoint versions,
+ * for the upload of a file from a local copy to a remote one, for the
  * assembly of a file from its checkpoint, and for the parts of a
  * multipart assembly. pqc.h is the spec (CHECKPOINT VERSIONS, THE
- * MIRROR, THE SWEEP AT START, THE ASSEMBLY OF A FILE, THE PARTS OF AN
+ * UPLOAD, THE SWEEP AT START, THE ASSEMBLY OF A FILE, THE PARTS OF AN
  * ASSEMBLY). No input, no output, no waiting: the host stores, copies
  * and deletes; this says what, and in which order.
  */
@@ -342,7 +342,7 @@ int pqc_versions_deleted(PqcVersions *v, const char *object, Report *report) {
     return REPORT_OK;
 }
 
-/* ---- the mirror ---------------------------------------------------------- */
+/* ---- the upload ---------------------------------------------------------- */
 
 enum {
     PASS_NONE = 0,      /* no pass yet */
@@ -350,7 +350,7 @@ enum {
     PASS_VERSION,       /* that version itself */
     PASS_STORED,        /* tell the host what the remote holds now */
     PASS_DELETES,       /* the replaced versions that are due */
-    PASS_AFTER,         /* mirrored: is the file ended? */
+    PASS_AFTER,         /* uploaded: is the file ended? */
     PASS_LOCAL,         /* assemble it locally */
     PASS_REMOTE,        /* assemble it on the remote */
     PASS_OVER,          /* nothing more in this pass */
@@ -359,14 +359,14 @@ enum {
 
 enum { LOCAL_NOTHING, LOCAL_FINISHED, LOCAL_SAME, LOCAL_NEWER };
 
-struct PqcMirror {
+struct PqcUpload {
     char name[PQC_NAME_MAX];
     PqcVersions *versions;        /* the remote versions this stored */
     Names there;                  /* objects known to be on the remote */
-    uint8_t *shipped;             /* the newest version stored there */
-    size_t shipped_len;
-    uint64_t shipped_rows;
-    char shipped_object[PQC_OBJECT_MAX];
+    uint8_t *uploaded;             /* the newest version stored there */
+    size_t uploaded_len;
+    uint64_t uploaded_rows;
+    char uploaded_object[PQC_OBJECT_MAX];
 
     int phase;
     int local;                    /* LOCAL_* of this pass */
@@ -381,7 +381,7 @@ struct PqcMirror {
     char doing[PQC_OBJECT_MAX + 64];
 };
 
-static void pass_free(PqcMirror *m) {
+static void pass_free(PqcUpload *m) {
     pqc_reader_free(m->reader);
     m->reader = NULL;
     free(m->raw);
@@ -392,23 +392,23 @@ static void pass_free(PqcMirror *m) {
     m->doing[0] = 0;
 }
 
-int pqc_mirror_new(const char *name, double keep_seconds, PqcMirror **out,
+int pqc_upload_new(const char *name, double keep_seconds, PqcUpload **out,
                    Report *report) {
     if (!report_begin(report)) return REPORT_INVALID;
     if (!name || !out)
         return report_fail(report, REPORT_INVALID,
-                           "pqc_mirror_new: a NULL argument");
+                           "pqc_upload_new: a NULL argument");
     *out = NULL;
     size_t len = strlen(name);
     if (!ends_with(name, len, PARQUET) || len <= strlen(PARQUET))
         return report_fail(report, REPORT_INVALID,
-                           "pqc_mirror_new: the file's name %.80s does not "
+                           "pqc_upload_new: the file's name %.80s does not "
                            "end in .parquet", name);
     if (len >= PQC_NAME_MAX)
         return report_fail(report, REPORT_INVALID,
-                           "pqc_mirror_new: the file's name is longer than "
+                           "pqc_upload_new: the file's name is longer than "
                            "%d bytes", PQC_NAME_MAX - 1);
-    PqcMirror *m = calloc(1, sizeof *m);
+    PqcUpload *m = calloc(1, sizeof *m);
     if (!m) return no_memory(report);
     memcpy(m->name, name, len + 1);
     if (pqc_versions_new(keep_seconds, &m->versions, report) != REPORT_OK) {
@@ -419,12 +419,12 @@ int pqc_mirror_new(const char *name, double keep_seconds, PqcMirror **out,
     return REPORT_OK;
 }
 
-void pqc_mirror_free(PqcMirror *m) {
+void pqc_upload_free(PqcUpload *m) {
     if (!m) return;
     pass_free(m);
     pqc_versions_free(m->versions);
     names_free(&m->there);
-    free(m->shipped);
+    free(m->uploaded);
     free(m);
 }
 
@@ -434,12 +434,12 @@ static const char *base_name(const char *path) {
     return slash ? slash + 1 : path;
 }
 
-int pqc_mirror_local(PqcMirror *m, const char *object, const uint8_t *ckpt,
+int pqc_upload_local(PqcUpload *m, const char *object, const uint8_t *ckpt,
                      size_t len, int final_exists, int live, Report *report) {
     if (!report_begin(report)) return REPORT_INVALID;
     if (!m || (object && !ckpt) || (!object && len))
         return report_fail(report, REPORT_INVALID,
-                           "pqc_mirror_local: a NULL argument");
+                           "pqc_upload_local: a NULL argument");
     if (m->phase == PASS_DONE) return REPORT_OK;
     pass_free(m);
     m->live = live != 0;
@@ -451,11 +451,11 @@ int pqc_mirror_local(PqcMirror *m, const char *object, const uint8_t *ckpt,
     if (strlen(object) >= PQC_OBJECT_MAX) {
         m->phase = PASS_OVER;
         return report_fail(report, REPORT_INVALID,
-                           "pqc_mirror_local: the version's name is longer "
+                           "pqc_upload_local: the version's name is longer "
                            "than %d bytes", PQC_OBJECT_MAX - 1);
     }
-    if (m->shipped && len == m->shipped_len &&
-        memcmp(ckpt, m->shipped, len) == 0) {
+    if (m->uploaded && len == m->uploaded_len &&
+        memcmp(ckpt, m->uploaded, len) == 0) {
         m->local = LOCAL_SAME;    /* the remote has it: nothing to send */
         m->phase = PASS_DELETES;
         return REPORT_OK;
@@ -468,7 +468,7 @@ int pqc_mirror_local(PqcMirror *m, const char *object, const uint8_t *ckpt,
                            inner.error);
     if (strcmp(pqc_reader_name(r), base_name(m->name)) != 0) {
         report_fail(report, REPORT_REFUSED,
-                    "%s: the checkpoint is of the file %s, and this mirror "
+                    "%s: the checkpoint is of the file %s, and this upload "
                     "is of %s: not sent", object, pqc_reader_name(r),
                     m->name);
         pqc_reader_free(r);
@@ -489,7 +489,7 @@ int pqc_mirror_local(PqcMirror *m, const char *object, const uint8_t *ckpt,
     return REPORT_OK;
 }
 
-static void step_set(PqcMirrorStep *step, int action, const char *name,
+static void step_set(PqcUploadStep *step, int action, const char *name,
                      uint64_t size, int flag) {
     step->action = action;
     step->flag = flag;
@@ -497,17 +497,17 @@ static void step_set(PqcMirrorStep *step, int action, const char *name,
     snprintf(step->name, sizeof step->name, "%s", name ? name : "");
 }
 
-int pqc_mirror_next(PqcMirror *m, PqcMirrorStep *step, Report *report) {
+int pqc_upload_next(PqcUpload *m, PqcUploadStep *step, Report *report) {
     if (!report_begin(report)) return REPORT_INVALID;
     if (!m || !step)
         return report_fail(report, REPORT_INVALID,
-                           "pqc_mirror_next: a NULL argument");
-    step_set(step, PQC_MIRROR_NOTHING, NULL, 0, 0);
+                           "pqc_upload_next: a NULL argument");
+    step_set(step, PQC_UPLOAD_NOTHING, NULL, 0, 0);
     for (;;) {
         switch (m->phase) {
         case PASS_NONE:
             return report_fail(report, REPORT_INVALID,
-                               "pqc_mirror_next before pqc_mirror_local: "
+                               "pqc_upload_next before pqc_upload_local: "
                                "no pass has begun");
         case PASS_OBJECTS: {
             uint32_t n = pqc_reader_n_chunks(m->reader);
@@ -527,9 +527,9 @@ int pqc_mirror_next(PqcMirror *m, PqcMirrorStep *step, Report *report) {
                 snprintf(m->doing, sizeof m->doing,
                          "uploading object %s (%.1f MB)", name,
                          (double)length / 1e6);
-                step_set(step, PQC_MIRROR_UPLOAD, name, length, 0);
+                step_set(step, PQC_UPLOAD_OBJECT, name, length, 0);
             } else {
-                step_set(step, PQC_MIRROR_STAT, name, length, 0);
+                step_set(step, PQC_UPLOAD_STAT, name, length, 0);
             }
             return REPORT_OK;
         }
@@ -537,12 +537,12 @@ int pqc_mirror_next(PqcMirror *m, PqcMirrorStep *step, Report *report) {
             snprintf(m->doing, sizeof m->doing,
                      "uploading checkpoint %s (%.1f MB)", m->raw_object,
                      (double)m->raw_len / 1e6);
-            step_set(step, PQC_MIRROR_UPLOAD_VERSION, m->raw_object,
+            step_set(step, PQC_UPLOAD_VERSION, m->raw_object,
                      m->raw_len, 0);
             return REPORT_OK;
         case PASS_STORED:
-            step_set(step, PQC_MIRROR_STORED, m->shipped_object,
-                     m->shipped_rows, 0);
+            step_set(step, PQC_UPLOAD_STORED, m->uploaded_object,
+                     m->uploaded_rows, 0);
             return REPORT_OK;
         case PASS_DELETES: {
             const char *due = pqc_versions_due(m->versions, 0);
@@ -550,7 +550,7 @@ int pqc_mirror_next(PqcMirror *m, PqcMirrorStep *step, Report *report) {
                 m->phase = PASS_AFTER;
                 continue;
             }
-            step_set(step, PQC_MIRROR_DELETE, due, 0, 0);
+            step_set(step, PQC_UPLOAD_DELETE, due, 0, 0);
             return REPORT_OK;
         }
         case PASS_AFTER:
@@ -562,16 +562,16 @@ int pqc_mirror_next(PqcMirror *m, PqcMirrorStep *step, Report *report) {
                 m->phase = PASS_REMOTE;
             continue;
         case PASS_LOCAL:
-            step_set(step, PQC_MIRROR_ASSEMBLE_LOCAL, m->name, 0, 0);
+            step_set(step, PQC_UPLOAD_ASSEMBLE_LOCAL, m->name, 0, 0);
             return REPORT_OK;
         case PASS_REMOTE:
             snprintf(m->doing, sizeof m->doing, "assembling %s on the store",
                      m->name);
-            step_set(step, PQC_MIRROR_ASSEMBLE_REMOTE, m->name, 0,
-                     m->shipped != NULL);
+            step_set(step, PQC_UPLOAD_ASSEMBLE_REMOTE, m->name, 0,
+                     m->uploaded != NULL);
             return REPORT_OK;
         case PASS_DONE:
-            step_set(step, PQC_MIRROR_DONE, m->name, 0, 0);
+            step_set(step, PQC_UPLOAD_DONE, m->name, 0, 0);
             return REPORT_OK;
         default:                  /* PASS_OVER */
             return REPORT_OK;
@@ -579,16 +579,16 @@ int pqc_mirror_next(PqcMirror *m, PqcMirrorStep *step, Report *report) {
     }
 }
 
-int pqc_mirror_remote_has(PqcMirror *m, int exists, uint64_t size,
+int pqc_upload_remote_has(PqcUpload *m, int exists, uint64_t size,
                           Report *report) {
     if (!report_begin(report)) return REPORT_INVALID;
     if (!m)
         return report_fail(report, REPORT_INVALID,
-                           "pqc_mirror_remote_has: a NULL argument");
+                           "pqc_upload_remote_has: a NULL argument");
     uint32_t n = m->phase == PASS_OBJECTS ? pqc_reader_n_chunks(m->reader) : 0;
     if (m->phase != PASS_OBJECTS || m->upload || m->idx >= n)
         return report_fail(report, REPORT_INVALID,
-                           "pqc_mirror_remote_has: the mirror did not ask "
+                           "pqc_upload_remote_has: the upload did not ask "
                            "about an object");
     const char *name;
     uint64_t length;
@@ -603,11 +603,11 @@ int pqc_mirror_remote_has(PqcMirror *m, int exists, uint64_t size,
     return REPORT_OK;
 }
 
-int pqc_mirror_did(PqcMirror *m, Report *report) {
+int pqc_upload_did(PqcUpload *m, Report *report) {
     if (!report_begin(report)) return REPORT_INVALID;
     if (!m)
         return report_fail(report, REPORT_INVALID,
-                           "pqc_mirror_did: a NULL argument");
+                           "pqc_upload_did: a NULL argument");
     m->doing[0] = 0;
     switch (m->phase) {
     case PASS_OBJECTS: {
@@ -624,16 +624,16 @@ int pqc_mirror_did(PqcMirror *m, Report *report) {
     }
     case PASS_VERSION: {
         /* the remote holds it: that is so whatever follows */
-        free(m->shipped);
-        m->shipped = m->raw;
-        m->shipped_len = m->raw_len;
-        m->shipped_rows = m->raw_rows;
-        memcpy(m->shipped_object, m->raw_object, sizeof m->shipped_object);
+        free(m->uploaded);
+        m->uploaded = m->raw;
+        m->uploaded_len = m->raw_len;
+        m->uploaded_rows = m->raw_rows;
+        memcpy(m->uploaded_object, m->raw_object, sizeof m->uploaded_object);
         m->raw = NULL;
         m->raw_len = 0;
         m->phase = PASS_STORED;
-        if (pqc_versions_stored(m->versions, m->shipped_object, m->shipped,
-                                m->shipped_len, report) != REPORT_OK)
+        if (pqc_versions_stored(m->versions, m->uploaded_object, m->uploaded,
+                                m->uploaded_len, report) != REPORT_OK)
             return report->status;
         /* what the remote may lack again: an object that goes with
          * its last version */
@@ -661,25 +661,25 @@ int pqc_mirror_did(PqcMirror *m, Report *report) {
         break;
     }
     return report_fail(report, REPORT_INVALID,
-                       "pqc_mirror_did: the mirror gave no step to do");
+                       "pqc_upload_did: the upload gave no step to do");
 }
 
-void pqc_mirror_failed(PqcMirror *m) {
+void pqc_upload_failed(PqcUpload *m) {
     if (!m || m->phase == PASS_NONE || m->phase == PASS_DONE) return;
     pass_free(m);
     m->phase = PASS_OVER;
 }
 
-int pqc_mirror_shipped(const PqcMirror *m, const uint8_t **ckpt, size_t *len,
+int pqc_upload_version(const PqcUpload *m, const uint8_t **ckpt, size_t *len,
                        const char **object) {
-    if (!m || !m->shipped) return 0;
-    if (ckpt) *ckpt = m->shipped;
-    if (len) *len = m->shipped_len;
-    if (object) *object = m->shipped_object;
+    if (!m || !m->uploaded) return 0;
+    if (ckpt) *ckpt = m->uploaded;
+    if (len) *len = m->uploaded_len;
+    if (object) *object = m->uploaded_object;
     return 1;
 }
 
-const char *pqc_mirror_doing(const PqcMirror *m) {
+const char *pqc_upload_doing(const PqcUpload *m) {
     return m ? m->doing : "";
 }
 
@@ -693,15 +693,15 @@ int pqc_sweep_local(int final_exists, int has_remote, int keeps_checkpoints) {
         return (!has_remote && keeps_checkpoints) ? PQC_SWEEP_AWAIT_CATALOG
                                                   : PQC_SWEEP_DISCARD;
     }
-    return has_remote ? PQC_SWEEP_MIRROR : PQC_SWEEP_FINISH;
+    return has_remote ? PQC_SWEEP_UPLOAD : PQC_SWEEP_FINISH;
 }
 
 int pqc_sweep_remote(int final_exists, int keeps_checkpoints, int in_flight) {
     if (final_exists)
         return keeps_checkpoints ? PQC_SWEEP_AWAIT_CATALOG : PQC_SWEEP_DISCARD;
     /* its local file was assembled and the crash came before the
-     * remote one: a mirror finishes it from the remote's own objects */
-    return in_flight ? PQC_SWEEP_NOTHING : PQC_SWEEP_MIRROR;
+     * remote one: an upload finishes it from the remote's own objects */
+    return in_flight ? PQC_SWEEP_NOTHING : PQC_SWEEP_UPLOAD;
 }
 
 /* ---- the assembly of a file ---------------------------------------------- */

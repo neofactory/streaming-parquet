@@ -115,10 +115,10 @@ func (t *process) resolve(store string) (string, ticketStore, error) {
 func spoolDir() string { return lockDir("") }
 
 // places answers where a stream's files go: the first copy, and the
-// store it is mirrored to (nil when the first copy is the store).
+// store it is uploaded to (nil when the first copy is the store).
 //
 //	a directory store            written straight into; the spool is not used
-//	a bucket store, a spool      the first copy in the spool, mirrored to the bucket
+//	a bucket store, a spool      the first copy in the spool, uploaded to the bucket
 //	a bucket store, no spool     the bucket is the first copy
 //	no store                     the spool is the only copy
 func (t *process) places(store, spool string, noSpool bool, name string) (first, remote pqc.Sink, err error) {

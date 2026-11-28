@@ -136,7 +136,7 @@ func coreTicket(t *Ticket) (*C.SpTicket, error) {
 		number(C.SP_T_BEAT_SECONDS, t.BeatSeconds) &&
 		number(C.SP_T_STALE_AFTER, t.StaleAfter) &&
 		number(C.SP_T_CHECKPOINT_SECONDS, t.CheckpointSeconds) &&
-		number(C.SP_T_SHIP_SECONDS, t.ShipSeconds) &&
+		number(C.SP_T_UPLOAD_SECONDS, t.UploadSeconds) &&
 		integer(C.SP_T_STORED_ROW, t.StoredRow) &&
 		number(C.SP_T_STORED_AT, t.StoredAt) &&
 		number(C.SP_T_KEEP_SECONDS, t.KeepSeconds) &&
@@ -218,7 +218,7 @@ func ticketFromText(b []byte) (*Ticket, error) {
 		BeatSeconds:       number(C.SP_T_BEAT_SECONDS),
 		StaleAfter:        number(C.SP_T_STALE_AFTER),
 		CheckpointSeconds: number(C.SP_T_CHECKPOINT_SECONDS),
-		ShipSeconds:       number(C.SP_T_SHIP_SECONDS),
+		UploadSeconds:     number(C.SP_T_UPLOAD_SECONDS),
 		StoredRow:         integer(C.SP_T_STORED_ROW),
 		StoredAt:          number(C.SP_T_STORED_AT),
 		KeepSeconds:       number(C.SP_T_KEEP_SECONDS),
@@ -471,7 +471,7 @@ func (st *storeState) stored(file string, version int, checkpoint string, finalR
 
 // covers: a checkpoint version is written in the first copy, which is
 // not the store (a spool): it holds finalRows in finished row groups,
-// and rows in all. The store has it when the mirror sends it (inStore).
+// and rows in all. The store has it when the upload sends it (inStore).
 func (st *storeState) covers(file string, version int, checkpoint string, finalRows, rows int64) {
 	cf, cc := C.CString(file), C.CString(checkpoint)
 	defer C.free(unsafe.Pointer(cf))
@@ -483,7 +483,7 @@ func (st *storeState) covers(file string, version int, checkpoint string, finalR
 	st.took(&r)
 }
 
-// inStore: the mirror put the checkpoint version in the store; it holds
+// inStore: the upload put the checkpoint version in the store; it holds
 // rows of the file.
 func (st *storeState) inStore(file string, version int, checkpoint string, rows int64) {
 	cf, cc := C.CString(file), C.CString(checkpoint)

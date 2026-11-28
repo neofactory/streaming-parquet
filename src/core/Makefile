@@ -30,8 +30,8 @@ libsp: $(OUT)/libsp.dylib
 $(OUT)/libarrow_ring.dylib: arrow_ring.c arrow_ring.h report.h
 	$(CC) $(CFLAGS) -shared -o $@ arrow_ring.c -lpthread
 
-$(OUT)/libpqc.dylib: pqc.c pqc_mirror.c pqc.h report.h
-	$(CC) $(CFLAGS) -shared -o $@ pqc.c pqc_mirror.c
+$(OUT)/libpqc.dylib: pqc.c pqc_upload.c pqc.h report.h
+	$(CC) $(CFLAGS) -shared -o $@ pqc.c pqc_upload.c
 
 # The catalog (sp_catalog.c) is a SQLite database: the system's SQLite
 # library and its header (Ubuntu: libsqlite3-dev).
@@ -45,8 +45,8 @@ san-arrow_ring: arrow_ring.c arrow_ring.h report.h arrow_ring_san_test.c
 	$(CC) $(SAN) -o arrow_ring_san_test_bin arrow_ring.c arrow_ring_san_test.c -lpthread
 	./arrow_ring_san_test_bin
 
-san-pqc: pqc.c pqc_mirror.c pqc.h report.h pqc_test_calls.h pqc_san_test.c
-	$(CC) $(SAN) -o pqc_san_test_bin pqc.c pqc_mirror.c pqc_san_test.c
+san-pqc: pqc.c pqc_upload.c pqc.h report.h pqc_test_calls.h pqc_san_test.c
+	$(CC) $(SAN) -o pqc_san_test_bin pqc.c pqc_upload.c pqc_san_test.c
 	./pqc_san_test_bin
 
 san-sp: sp.c sp_catalog.c sp.h report.h sp_test_calls.h sp_san_test.c
@@ -54,10 +54,10 @@ san-sp: sp.c sp_catalog.c sp.h report.h sp_test_calls.h sp_san_test.c
 	./sp_san_test_bin
 
 # macOS leak check (LeakSanitizer is unavailable on Apple clang)
-leaks: arrow_ring.c arrow_ring.h arrow_ring_san_test.c pqc.c pqc_mirror.c pqc.h pqc_san_test.c
+leaks: arrow_ring.c arrow_ring.h arrow_ring_san_test.c pqc.c pqc_upload.c pqc.h pqc_san_test.c
 	$(CC) -std=c11 -g -O1 -o arrow_ring_san_test_bin arrow_ring.c arrow_ring_san_test.c -lpthread
 	leaks --atExit -- ./arrow_ring_san_test_bin | tail -3
-	$(CC) -std=c11 -g -O1 -o pqc_san_test_bin pqc.c pqc_mirror.c pqc_san_test.c
+	$(CC) -std=c11 -g -O1 -o pqc_san_test_bin pqc.c pqc_upload.c pqc_san_test.c
 	leaks --atExit -- ./pqc_san_test_bin | tail -3
 
 # ---- fuzz: mutation drivers, no libFuzzer runtime needed (macOS) ----
@@ -65,8 +65,8 @@ fuzz: fuzz-pqc fuzz-sp
 
 # pqc's reader and footer shift take bytes from the store: real
 # checkpoints and footers (pqc_corpus/, made by make_corpus.py), mutated.
-fuzz-pqc: pqc.c pqc_mirror.c pqc.h report.h pqc_test_calls.h pqc_fuzz.c
-	$(CC) $(SAN) -DFUZZ_STANDALONE -o pqc_fuzz_bin pqc.c pqc_mirror.c pqc_fuzz.c
+fuzz-pqc: pqc.c pqc_upload.c pqc.h report.h pqc_test_calls.h pqc_fuzz.c
+	$(CC) $(SAN) -DFUZZ_STANDALONE -o pqc_fuzz_bin pqc.c pqc_upload.c pqc_fuzz.c
 	python3 ../../tests/parquet_checkpoint/make_corpus.py
 	./pqc_fuzz_bin $${FUZZ_ITERS:-200000} pqc_corpus
 

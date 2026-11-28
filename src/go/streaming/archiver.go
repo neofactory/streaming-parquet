@@ -38,16 +38,16 @@ type archiver struct {
 	location string // where the first copy is: the local directory, or the sink's URI
 	sink     pqc.Sink
 	// With a spool: sink is the spool's folder, and remote the store's.
-	// A mirror for each file in flight copies it to the store and ends it
-	// there (pqc.Mirror: the core's rules). Nil: the first copy is the
+	// An upload for each file in flight copies it to the store and ends it
+	// there (pqc.Upload: the core's rules). Nil: the first copy is the
 	// store.
 	remote        pqc.Sink
 	storeLocation string // the stream's folder in the store: what the ticket says
-	shipMu        sync.Mutex
-	ships         []*pqc.Mirror // the open file's, and each ended file's until it is done
+	uploadMu      sync.Mutex
+	uploads       []*pqc.Upload // the open file's, and each ended file's until it is done
 	live          string        // the name of the open file, "" for none
 	remoteSwept   bool          // the remote half of the start sweep runs in the first pass
-	shipSeconds   float64       // the cadence of the mirror's passes
+	uploadSeconds float64       // the cadence of the upload's passes
 	label         string
 	wp            *writePlan
 	store         *storeState // what the store holds, for the ticket; the owner's
@@ -80,8 +80,8 @@ func (a *archiver) lost() int64 { return a.lostBefore + a.wp.lost() }
 // ParquetOptions says how a stream's rows are written to parquet. Where
 // is the stream's store: the files are at <store>/streams/<name>/.
 type ParquetOptions struct {
-	RowGroupRows int64   // rows per row group; see ringSizes for the default
-	ShipSeconds  float64 // with a spool: the cadence of the pass that copies it to the bucket; 0 = 5 s
+	RowGroupRows  int64   // rows per row group; see ringSizes for the default
+	UploadSeconds float64 // with a spool: the cadence of the pass that copies it to the bucket; 0 = 5 s
 	// CatalogCopySeconds: the interval of the catalog's dated copies,
 	// catalog.<YYYYMMDD-HHMMSS>.sqlite beside it, each made only if the
 	// catalog changed since the newest one. 0 = a day; negative = none.
@@ -92,9 +92,9 @@ type ParquetOptions struct {
 	Dictionary         []string // top-level columns to dictionary-encode; default none
 }
 
-// defaultShipSeconds is the cadence of the mirror's passes when the
-// options give none (the Python ParquetOptions.ship_seconds default).
-const defaultShipSeconds = 5.0
+// defaultUploadSeconds is the cadence of the upload's passes when the
+// options give none (the Python ParquetOptions.upload_seconds default).
+const defaultUploadSeconds = 5.0
 
 // defaultRowGroupRows is DuckDB's row group, 60 of its 2,048-row
 // vectors: DuckDB, the archive's main reader, reads row groups in
@@ -134,7 +134,7 @@ func ringSizes(name string, ringRows, rowGroupRows int64) (int64, int64, error) 
 // deleted at once, and no ticket names the file after it.
 // files is where the first copy goes: the stream's folder in it is
 // streams/<name>/. remote, when not nil, is the store that first copy is
-// mirrored to (files is then the spool).
+// uploaded to (files is then the spool).
 func newArchiver(r *ring.Ring, name, run string, o ParquetOptions, files, remote pqc.Sink, store *storeState,
 	catFor func(sink pqc.Sink, folder string) *catalog, log *slog.Logger) (*archiver, error) {
 	if store == nil {
@@ -158,8 +158,8 @@ func newArchiver(r *ring.Ring, name, run string, o ParquetOptions, files, remote
 	if err != nil {
 		return nil, err
 	}
-	if o.ShipSeconds <= 0 {
-		o.ShipSeconds = defaultShipSeconds
+	if o.UploadSeconds <= 0 {
+		o.UploadSeconds = defaultUploadSeconds
 	}
 	a := &archiver{
 		storedRow:       -1,
@@ -173,7 +173,7 @@ func newArchiver(r *ring.Ring, name, run string, o ParquetOptions, files, remote
 		location:        location,
 		sink:            sink,
 		storeLocation:   location,
-		shipSeconds:     o.ShipSeconds,
+		uploadSeconds:   o.UploadSeconds,
 		rowGroupRows:    o.RowGroupRows,
 		rowGroupSeconds: o.RowGroupSeconds,
 		ckptSeconds:     o.CheckpointSeconds,
@@ -222,22 +222,22 @@ func (a *archiver) hasCheckpoint(name string) bool {
 // files: a finished file's versions then stay until the catalog lists it.
 func (a *archiver) keeps() bool { return a.cat != nil }
 
-// addMirror gives file name a mirror. Caller does not hold shipMu.
-func (a *archiver) addMirror(name string) error {
-	m, err := pqc.NewMirror(name, a.sink, a.remote, pqc.SupersededKeep)
+// addUpload gives file name an upload. Caller does not hold uploadMu.
+func (a *archiver) addUpload(name string) error {
+	m, err := pqc.NewUpload(name, a.sink, a.remote, pqc.SupersededKeep)
 	if err != nil {
 		return err
 	}
-	a.shipMu.Lock()
-	a.ships = append(a.ships, m)
-	a.shipMu.Unlock()
+	a.uploadMu.Lock()
+	a.uploads = append(a.uploads, m)
+	a.uploadMu.Unlock()
 	return nil
 }
 
 func (a *archiver) inFlight(name string) bool {
-	a.shipMu.Lock()
-	defer a.shipMu.Unlock()
-	for _, m := range a.ships {
+	a.uploadMu.Lock()
+	defer a.uploadMu.Unlock()
+	for _, m := range a.uploads {
 		if m.Name() == name {
 			return true
 		}
@@ -248,10 +248,10 @@ func (a *archiver) inFlight(name string) bool {
 // pending names the files ended locally whose copy in the store is not
 // finished yet.
 func (a *archiver) pending() []string {
-	a.shipMu.Lock()
-	defer a.shipMu.Unlock()
+	a.uploadMu.Lock()
+	defer a.uploadMu.Unlock()
 	var out []string
-	for _, m := range a.ships {
+	for _, m := range a.uploads {
 		if m.Name() != a.live {
 			out = append(out, m.Name())
 		}
@@ -306,9 +306,9 @@ func (a *archiver) bootSweep() error {
 			if err := pqc.DiscardCheckpoints(final, a.sink); err != nil {
 				return fmt.Errorf("boot sweep %s: %w", final, err)
 			}
-		case pqc.SweepMirror:
+		case pqc.SweepUpload:
 			// pending: its passes send it and end it
-			if err := a.addMirror(final); err != nil {
+			if err := a.addUpload(final); err != nil {
 				return fmt.Errorf("boot sweep %s: %w", final, err)
 			}
 			a.log.Info(fmt.Sprintf("[%s] boot sweep: %s pending its copy in the store",
@@ -326,8 +326,8 @@ func (a *archiver) bootSweep() error {
 }
 
 // sweepRemote is the store's half of the start sweep, in the first
-// mirror pass, so that a store that cannot be reached at start delays
-// the mirror and never the stream.
+// upload pass, so that a store that cannot be reached at start delays
+// the upload and never the stream.
 func (a *archiver) sweepRemote() error {
 	files, newest, err := unfinished(a.remote)
 	if err != nil {
@@ -343,10 +343,10 @@ func (a *archiver) sweepRemote() error {
 			if err := pqc.DiscardCheckpoints(final, a.remote); err != nil {
 				return err
 			}
-		case pqc.SweepMirror:
+		case pqc.SweepUpload:
 			// its local file was assembled and the crash came before the
-			// store's: a mirror finishes it from the store's own objects
-			if err := a.addMirror(final); err != nil {
+			// store's: an upload finishes it from the store's own objects
+			if err := a.addUpload(final); err != nil {
 				return err
 			}
 			a.store.kept(final, v.Seq, v.Object) // its version is in the store
@@ -357,24 +357,24 @@ func (a *archiver) sweepRemote() error {
 	return nil
 }
 
-// ship is one mirror pass over every file in flight: the open file's
+// upload is one upload pass over every file in flight: the open file's
 // newest version goes to the store; a file the writer ended is sent,
 // assembled locally and then in the store. An error ends the pass; the
-// next one goes on from what was done. The stream's ship goroutine
+// next one goes on from what was done. The stream's upload goroutine
 // calls it, with none of the stream's locks held: the store may be slow
 // or away, and the writer is not held up.
-func (a *archiver) ship() error {
+func (a *archiver) upload() error {
 	if !a.remoteSwept {
 		if err := a.sweepRemote(); err != nil {
 			return err
 		}
 		a.remoteSwept = true
 	}
-	a.shipMu.Lock()
-	ships := append([]*pqc.Mirror(nil), a.ships...)
+	a.uploadMu.Lock()
+	uploads := append([]*pqc.Upload(nil), a.uploads...)
 	live := a.live
-	a.shipMu.Unlock()
-	for _, m := range ships {
+	a.uploadMu.Unlock()
+	for _, m := range uploads {
 		name := m.Name()
 		st, err := m.Run(name == live, a.keeps(), func(object string, rows uint64) {
 			// the ticket's row moves at the moment the store has a version
@@ -387,14 +387,14 @@ func (a *archiver) ship() error {
 		if !st.Done {
 			continue
 		}
-		a.shipMu.Lock()
-		for i, x := range a.ships {
+		a.uploadMu.Lock()
+		for i, x := range a.uploads {
 			if x == m {
-				a.ships = append(a.ships[:i], a.ships[i+1:]...)
+				a.uploads = append(a.uploads[:i], a.uploads[i+1:]...)
 				break
 			}
 		}
-		a.shipMu.Unlock()
+		a.uploadMu.Unlock()
 		last := m.LastObject()
 		m.Free()
 		if a.keeps() {
@@ -422,12 +422,12 @@ func (a *archiver) ship() error {
 	return nil
 }
 
-// shipping says what a mirror is doing in the store right now, "" for
+// uploading says what an upload is doing in the store right now, "" for
 // nothing.
-func (a *archiver) shipping() string {
-	a.shipMu.Lock()
-	defer a.shipMu.Unlock()
-	for _, m := range a.ships {
+func (a *archiver) uploading() string {
+	a.uploadMu.Lock()
+	defer a.uploadMu.Unlock()
+	for _, m := range a.uploads {
 		if d := m.Doing(); d != "" {
 			return d
 		}
@@ -482,16 +482,16 @@ func (a *archiver) open(baseSeq int64) error {
 		[]string{fmt.Sprintf("%d", baseSeq), a.run})
 	a.fileSchema = arrow.NewSchema(a.schema.Fields(), &md)
 	if a.remote != nil {
-		if err := a.addMirror(name); err != nil {
+		if err := a.addUpload(name); err != nil {
 			w.Free()
 			return err
 		}
 	}
 	a.w = w
 	a.fileName = name
-	a.shipMu.Lock()
+	a.uploadMu.Lock()
 	a.live = name
-	a.shipMu.Unlock()
+	a.uploadMu.Unlock()
 	a.store.begins(name, baseSeq)
 	return nil
 }
@@ -506,7 +506,7 @@ func (a *archiver) noteStored() {
 	}
 	_, version, _ := pqc.ParseCkptObject(ck)
 	if a.remote != nil {
-		// written in the spool: the store has it when the mirror sends it
+		// written in the spool: the store has it when the upload sends it
 		a.store.covers(a.fileName, version, ck, int64(a.w.RowsFinal()),
 			int64(a.w.RowsCheckpointed()))
 		return
@@ -808,8 +808,8 @@ func (a *archiver) rotate() error {
 		return err
 	}
 	if a.remote != nil {
-		// With a mirror the file is ended, not assembled: its last
-		// checkpoint here, and the mirror's passes do the rest in the
+		// With an upload the file is ended, not assembled: its last
+		// checkpoint here, and the upload's passes do the rest in the
 		// core's order. While the store cannot be reached the file
 		// waits, readable and crash-durable in the spool.
 		ck, final := "", int64(a.w.RowsFinal())
@@ -842,9 +842,9 @@ func (a *archiver) rotate() error {
 	}
 	a.w = nil
 	a.fileName = ""
-	a.shipMu.Lock()
+	a.uploadMu.Lock()
 	a.live = ""
-	a.shipMu.Unlock()
+	a.uploadMu.Unlock()
 	return err
 }
 

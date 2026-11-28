@@ -28,7 +28,7 @@ type Ticket struct {
 	BeatSeconds       float64 // the longest gap between two writes of the ticket
 	StaleAfter        float64 // seconds after Ts at which a reader calls the writer dead
 	CheckpointSeconds float64
-	ShipSeconds       float64
+	UploadSeconds     float64
 	StoredRow         *int64 // the newest row of this run the store holds; -1 = none
 	StoredAt          float64
 	Files             []TicketFile // the files not finished in the store

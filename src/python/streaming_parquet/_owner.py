@@ -73,7 +73,7 @@ def claim(name, lock_dir, store, host, port, run, who=None):
         ticket = _tickets.get_ticket(store, name)
     except Exception as e:
         # The ticket check needs the store; an unreachable bucket at start
-        # delays the mirror and never the stream. This server's lock still
+        # delays the upload and never the stream. This server's lock still
         # holds; the other-server check runs again at the next start.
         _diag.warning(_core.ownership_unread(name, store, e))
         return owned

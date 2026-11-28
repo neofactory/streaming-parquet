@@ -419,43 +419,43 @@ def _():
         assert st.min == 0 and st.max == 299
 
 
-@test("shipper: outage rides, catch-up skips missed ckpts, byte-identical")
+@test("uploader: outage rides, catch-up skips missed ckpts, byte-identical")
 def _():
-    from parquet_checkpoint import Shipper
+    from parquet_checkpoint import Uploader
     tmp = tempfile.mkdtemp()
     try:
         local = DirSink(tmp)
         remote = FakeS3(part_min=4096)
         w = CheckpointWriter('s.parquet', SCHEMA, sink=local,
                              chunk_bytes=16 * 1024, compression='none')
-        ship = Shipper('s.parquet', local, remote)
-        assert ship.poll()['state'] == 'idle'
+        upload = Uploader('s.parquet', local, remote)
+        assert upload.poll()['state'] == 'idle'
         w.write_table(make_rows(0, 500))
-        st = ship.poll()
-        assert st['state'] == 'shipped' and st['watermark'] == 500, st
+        st = upload.poll()
+        assert st['state'] == 'uploaded' and st['watermark'] == 500, st
         assert CheckpointReader(newest(remote, 's.parquet'), remote).num_rows == 500
-        assert ship.poll()['state'] == 'synced'
+        assert upload.poll()['state'] == 'synced'
         # WAN outage: every remote PUT fails; local keeps writing
         remote.fail_next('put:', n=1000)
         w.write_table(make_rows(500, 800))
         try:
-            ship.poll()
+            upload.poll()
             raise AssertionError("outage must surface to the host")
         except FaultInjected:
             pass
         w.write_table(make_rows(1300, 700))      # local rides the outage
-        assert not ship.synced
+        assert not upload.synced
         remote.clear_faults()
-        st = ship.poll()                          # ONE catch-up pass
-        assert st['state'] == 'shipped' and st['watermark'] == 2000, st
-        assert ship.poll()['state'] == 'synced' and ship.synced
+        st = upload.poll()                          # ONE catch-up pass
+        assert st['state'] == 'uploaded' and st['watermark'] == 2000, st
+        assert upload.poll()['state'] == 'synced' and upload.synced
         r = CheckpointReader(newest(remote, 's.parquet'), remote)
         assert r.num_rows == 2000
         check_exact(r.table(), 2000)
         # shutdown protocol: synced -> writer close -> remote finalize
         w.close()
-        assert ship.poll()['state'] == 'local-finalized'
-        status, _ = ship.close()
+        assert upload.poll()['state'] == 'local-finalized'
+        status, _ = upload.close()
         assert status == 'recovered'
         assert remote.get('s.parquet') == local.get('s.parquet')
         check_exact(pq.read_table(
@@ -732,39 +732,39 @@ def _():
     assert pq.read_table(pa.BufferReader(s2.get('old.parquet'))).num_rows == 7
 
 
-@test("checkpoint versions: the shipper ships each newest version under "
+@test("checkpoint versions: the uploader uploads each newest version under "
       "its own name; a remote version superseded SUPERSEDED_KEEP_S is "
-      "deleted by a later ship")
+      "deleted by a later upload")
 def _():
-    from parquet_checkpoint import Shipper
+    from parquet_checkpoint import Uploader
     with tempfile.TemporaryDirectory() as d:
         local, remote = DirSink(d), FakeS3(part_min=1024)
         w = CheckpointWriter('sv.parquet', SCHEMA, sink=local, chunk_bytes=1024)
-        ship = Shipper('sv.parquet', local, remote, superseded_keep_s=0)
+        upload = Uploader('sv.parquet', local, remote, superseded_keep_s=0)
         for k in range(5):
             w.write_table(make_rows(k * 50, 50))
-            st = ship.poll()
-            assert st['state'] == 'shipped' and st['object'] == w.ckpt_name, st
+            st = upload.poll()
+            assert st['state'] == 'uploaded' and st['object'] == w.ckpt_name, st
             v = ckpt_versions(remote, 'sv.parquet')
             assert [o for _s, o in v] == [w.ckpt_name], v
-        assert ship.poll()['state'] == 'synced'
+        assert upload.poll()['state'] == 'synced'
         w.close()
-        assert ship.close() == ('recovered', 'sv.parquet')
+        assert upload.close() == ('recovered', 'sv.parquet')
         assert ckpt_versions(remote, 'sv.parquet') == []
         assert remote.get('sv.parquet') == local.get('sv.parquet')
 
 
-@test("the shipper sends each object once; after an outage it sends only "
+@test("the uploader sends each object once; after an outage it sends only "
       "what the newest version names; the remote keeps no object that no "
       "kept version names")
 def _():
-    from parquet_checkpoint import Shipper
+    from parquet_checkpoint import Uploader
     with tempfile.TemporaryDirectory() as d:
         local, remote = DirSink(d), FakeS3(part_min=1024)
         w = CheckpointWriter('so.parquet', SCHEMA, sink=local,
                              chunk_bytes=64 * 1024, compression='none',
                              checkpoint_every_write=False)
-        ship = Shipper('so.parquet', local, remote, superseded_keep_s=0)
+        upload = Uploader('so.parquet', local, remote, superseded_keep_s=0)
 
         def remote_puts():
             got = [o[len('put:'):] for o in remote.op_log
@@ -779,7 +779,7 @@ def _():
         # a poll at each checkpoint: one new object and the version
         for k in range(1, 31):
             w.checkpoint(make_rows(0, k * 40))
-            assert ship.poll()['state'] == 'shipped'
+            assert upload.poll()['state'] == 'uploaded'
             puts = remote_puts()
             assert len(puts) == 2 and puts[-1] == w.ckpt_name, (k, puts)
             named = remote_reads(k)
@@ -787,30 +787,30 @@ def _():
             # most what the one before it named
             assert named <= set(remote.list('so.parquet.chunks/')), k
         # an outage: 25 checkpoints with no poll, small objects merged
-        # and gone meanwhile; one poll ships what the newest names and
+        # and gone meanwhile; one poll uploads what the newest names and
         # the remote lacks, nothing the outage swallowed
         for k in range(31, 56):
             w.checkpoint(make_rows(0, k * 40))
-        assert ship.poll()['state'] == 'shipped'
+        assert upload.poll()['state'] == 'uploaded'
         puts = remote_puts()
         named = remote_reads(55)
         assert puts[-1] == w.ckpt_name and set(puts[:-1]) <= named, puts
         assert len(puts) < 20, puts
         # the next poll deletes the version before and its objects
         w.checkpoint(make_rows(0, 56 * 40))
-        assert ship.poll()['state'] == 'shipped'
+        assert upload.poll()['state'] == 'uploaded'
         before = remote_reads(56)
         w.checkpoint(make_rows(0, 57 * 40))
-        assert ship.poll()['state'] == 'shipped'
+        assert upload.poll()['state'] == 'uploaded'
         named = remote_reads(57)
         assert set(remote.list('so.parquet.chunks/')) <= named | before, (
             sorted(set(remote.list('so.parquet.chunks/')) - named - before))
         # the final rows, then both copies finish the same file
         w.write_table(make_rows(0, 57 * 40))
         w.checkpoint()
-        assert ship.poll()['state'] == 'shipped'
+        assert upload.poll()['state'] == 'uploaded'
         w.close()
-        assert ship.close() == ('recovered', 'so.parquet')
+        assert upload.close() == ('recovered', 'so.parquet')
         assert remote.get('so.parquet') == local.get('so.parquet')
         assert remote.list('') == ['so.parquet'], remote.list('')
         assert sorted(os.listdir(d)) == ['so.parquet'], os.listdir(d)

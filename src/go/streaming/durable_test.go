@@ -506,7 +506,7 @@ func TestTicketIsTheCores(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, member := range []string{`"ship_seconds": null`, `"stored_row": 41`,
+	for _, member := range []string{`"upload_seconds": null`, `"stored_row": 41`,
 		`"unfinished": ["s3://b/streams/x/a.parquet.000003.ckpt", "s3://b/streams/x/b.parquet.000001.ckpt"]`,
 		`"first_row": 0, "final_rows": 30, "rows": null`} {
 		if !strings.Contains(string(text), member) {

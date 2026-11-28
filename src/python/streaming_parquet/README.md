@@ -50,7 +50,7 @@ concatenated, is the file. Relative names make the set relocatable.
 
 **Two copies, one format.** The same bytes are written to local disk
 (the spool: fsync, tight cadence, never waits on the network) and to
-the store (S3, mirrored at whatever cadence the link allows). Local
+the store (S3, uploaded at whatever cadence the link allows). Local
 disk is WAN-outage buffering and machine-local tooling, not a separate
 tier or mode.
 
@@ -314,7 +314,7 @@ A name may carry a hierarchy (`plant/line-1/probe/voltages`),
 so a site's streams group under one prefix and access rules fall on
 whole subtrees: tickets readable by every reader, streams by site.
 The same shape holds under a bucket and under a directory, so the
-spool mirrors the bucket name for name and a reader derives every
+spool holds the same names as the bucket and a reader derives every
 location from the store it connected through. A prefix inside a
 bucket is refused: one shape per deployment. A stream URI is its
 archive directory, `<store>/streams/<name>`, and `connect()` accepts
@@ -324,7 +324,7 @@ it in place of a name.
 
 A stream's ticket is one JSON object at `<store>/tickets/<name>.json`:
 who writes the stream (`name`, `host`, `port`, `run`), how often the
-store's data changes (`checkpoint_seconds`, `ship_seconds`,
+store's data changes (`checkpoint_seconds`, `upload_seconds`,
 `beat_seconds`) and when to call the writer dead (`stale_after`: three
 beats, and never under 30 seconds), what
 the store holds of this run (`stored_row`, `stored_at`), the files still
@@ -441,33 +441,33 @@ store is written through the spool, the local write-behind copy at
 `/var/tmp/streaming-parquet/<user>/` unless `spool=` says where, or
 `spool=None` for the bucket as the only copy; a directory store is
 written straight into. The Go host has the same spool and the same
-mirror: the mirror's rules are the C core's (`src/core/pqc.h`, THE
-MIRROR), and each host does what the core asks. Severity follows the shape: the first copy failing
+upload: the upload's rules are the C core's (`src/core/pqc.h`, THE
+UPLOAD), and each host does what the core asks. Severity follows the shape: the first copy failing
 means rows are durable nowhere but the ring, and `archive_state()`
 says so (`failing`, the last error, `lost_rows` for rows recycled
-before their flush, the location, the open `file`); the mirror failing
-loses nothing, and `mirror_state()` says that (`failing`, the last
+before their flush, the location, the open `file`); the upload failing
+loses nothing, and `upload_state()` says that (`failing`, the last
 error, the files pending). Both return named objects. A daemon reads
 both each loop and decides what to call them; the library logs each
-transition once, the archive at ERROR, the mirror at WARNING.
+transition once, the archive at ERROR, the upload at WARNING.
 
 With a bucket store the writer never waits for the network: chunks and
-the checkpoint land in the spool at the stream's own cadence, and a
-Shipper per file copies them to the bucket on a ship task of the
-worker pool, one pass every `ship_seconds`, submitted by `commit()`'s
+the checkpoint land in the spool at the stream's own cadence, and an
+Uploader per file copies them to the bucket on an upload task of the
+worker pool, one pass every `upload_seconds`, submitted by `commit()`'s
 publish step while any file is live or pending and by the stream's
 heartbeat thread when nothing is being committed, so a session that
 ended during an outage finishes as soon as the link is back.
 
 A file finishes in one order: its final checkpoint on the first copy,
-that checkpoint shipped, first-copy assembly, remote assembly
+that checkpoint uploaded, first-copy assembly, remote assembly
 (server-side, no bytes travel). While the remote is unreachable a
 finished file stays in its checkpoint form, readable and
 crash-durable; the writer opens the next file as usual and every
 later pass retries. A clean stop makes one closing pass and waits 3 s
 for it; a file still pending after that is registered by the next
-start's boot sweep, whose remote half runs on the first mirror pass,
-so an unreachable remote at start delays the mirror and never the
+start's boot sweep, whose remote half runs on the first upload pass,
+so an unreachable remote at start delays the upload and never the
 stream. `S3Sink` fails fast (5 s connect, 15 s read, 2 attempts).
 
 ## Failure table
@@ -476,7 +476,7 @@ stream. `S3Sink` fails fast (5 s connect, 15 s read, 2 attempts).
 |---|---|---|
 | process crash | 0 rows past the last local checkpoint | assembly from local chunks + checkpoint |
 | disk loss | rows since the last S3 checkpoint PUT | assembly from S3, from any machine |
-| WAN outage | none (local copies continue; S3 catches up) | shipper drains the backlog |
+| WAN outage | none (local copies continue; S3 catches up) | uploader drains the backlog |
 | crash during assembly | none; objects and checkpoint are durable | re-run; a lifecycle rule deletes the dead multipart upload |
 | corrupted checkpoint version | none | header CRC refuses it; repair uses the newest version that holds |
 | corrupted chunk | detected | manifest CRC refuses it at read/assembly |
@@ -500,7 +500,7 @@ create_stream(name, schema, store=STORE, spool=DEFAULT_SPOOL, memory=MemoryOptio
     # spool: the local write-behind copy a bucket store writes through;
     #        default /var/tmp/streaming-parquet/<user>/, None for none
     # MemoryOptions(rows, segment_bytes): the rows kept in memory
-    # ParquetOptions(checkpoint_seconds, row_group_rows, row_group_seconds, ship_seconds,
+    # ParquetOptions(checkpoint_seconds, row_group_rows, row_group_seconds, upload_seconds,
     #         catalog_copy_seconds, compression): tuning; None = no files
     #         until a start_parquet
     # publish: False = an internal stream: no ticket, not served to other
@@ -525,7 +525,7 @@ Stream (writing): get_mutable_row(block_s) commit()
                   wire_map(entries) from_wire(wmap, frame)
                   cut(label) start_parquet(label, options) stop_parquet()
                   parquet_options  publish() unpublish() published
-                  archive_state() mirror_state() memory_state() close()
+                  archive_state() upload_state() memory_state() close()
 
 reading (a stream we write and one we connect to, alike):
                   newest_row() -> Row | None
@@ -540,7 +540,7 @@ reading (a stream we write and one we connect to, alike):
                   .name .schema .state .reason is_connected() close()
 
 results: ArchiveState(failing, error, lost_rows, location, file, catalog_error)
-         MirrorState(failing, error, pending)   MemoryState(rows, rows_unarchived, capacity)
+         UploadState(failing, error, pending)   MemoryState(rows, rows_unarchived, capacity)
          View(name, close())
 errors:  StaleReadError, PinStalledError
 ```
@@ -556,7 +556,7 @@ import streaming_parquet as sp
 
 s = sp.create_stream(name, pa.schema([...]), store="s3://my-bucket",
                      memory=sp.MemoryOptions(rows=200_000),
-                     parquet=sp.ParquetOptions(checkpoint_seconds=15, ship_seconds=15))
+                     parquet=sp.ParquetOptions(checkpoint_seconds=15, upload_seconds=15))
 row = s.get_mutable_row()            # the ring vocabulary
 row.servo.pos = 100                  # struct leaves; strings; lists
 s.commit()                           # visible at once; the pool does the rest
@@ -691,8 +691,8 @@ s, _ := streaming.CreateStream("press/fieldbus", schema,
 // directory or a whole bucket ("s3://my-bucket", on the standard AWS
 // credential chain). A bucket is written through a spool on the local
 // disk (StreamOptions.Spool, default /var/tmp/streaming-parquet/<user>;
-// NoSpool: the bucket is the first copy) and mirrored every
-// ParquetOptions.ShipSeconds; s.MirrorState() says how that goes. A
+// NoSpool: the bucket is the first copy) and uploaded every
+// ParquetOptions.UploadSeconds; s.UploadState() says how that goes. A
 // stream with no store writes its files to the spool alone.
 // Memory holds two row groups: MemoryOptions.Rows and
 // ParquetOptions.RowGroupRows default to 245,760 and DuckDB's 122,880;

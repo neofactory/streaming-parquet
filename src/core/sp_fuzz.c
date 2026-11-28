@@ -17,7 +17,7 @@ static uint32_t rnd(void) {
 static const char *SEEDS[] = {
     ("{\"name\": \"plant/line-1/press\", \"host\": \"10.0.0.5\", \"port\": 8815, "
     "\"run\": \"2026-11-12T20:31:12.123456Z\", \"beat_seconds\": 15, "
-    "\"stale_after\": 45, \"checkpoint_seconds\": 0.1, \"ship_seconds\": null, "
+    "\"stale_after\": 45, \"checkpoint_seconds\": 0.1, \"upload_seconds\": null, "
     "\"stored_row\": 12345, \"stored_at\": 1762979472.123456, "
     "\"unfinished\": [\"s3://b/streams/x/a.parquet.000003.ckpt\"], "
     "\"files\": [{\"checkpoint\": \"s3://b/streams/x/a.parquet.000003.ckpt\", "

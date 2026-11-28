@@ -6,14 +6,14 @@ finalize it into an ordinary .parquet file. At construction the writer
 finalizes any checkpoint a crashed prior run left under ITS OWN
 stream-name prefix (never other streams' live files in a shared dir).
 
-With a `remote` sink (S3), every file is also mirrored by a
-parquet_checkpoint.Shipper: the local directory stays the writer's
-own tight-cadence copy, and ship() copies chunks and the newest
+With a `remote` sink (S3), every file is also uploaded by a
+parquet_checkpoint.Uploader: the local directory stays the writer's
+own tight-cadence copy, and upload() copies chunks and the newest
 checkpoint outward at whatever cadence the link allows. A file
-finalizes in one order: final checkpoint locally, shipped, local
+finalizes in one order: final checkpoint locally, uploaded, local
 assembly, remote assembly. While S3 is unreachable a finished file
 stays in its local checkpoint form (readable, crash-durable), the
-writer moves on to the next file, and every later ship() retries the
+writer moves on to the next file, and every later upload() retries the
 pending finalize. The boot sweep goes through the same path.
 """
 
@@ -73,9 +73,9 @@ class ParquetWriter:
     process via the `.ckpt` object (parquet_checkpoint.live_table).
     """
 
-    #: A mirror pass at or over this many seconds is logged with its
+    #: An upload pass at or over this many seconds is logged with its
     #: per-file, per-phase breakdown at normal verbosity.
-    SHIP_SLOW_S = 1.0
+    UPLOAD_SLOW_S = 1.0
 
     def __init__(self, stream_name, schema, run, base_dir=None,
                  compression="zstd", compression_level=None,
@@ -89,9 +89,9 @@ class ParquetWriter:
             (DirSink, S3Sink); None = a DirSink under <base_dir>/parquet.
             The same meaning as the Go host's ArchiveOptions.Sink: the one
             copy, whose failure is the archive failing.
-        remote: a parquet_checkpoint sink (S3Sink) that mirrors the first
-            copy name for name through a Shipper; None = no mirror. Its
-            failure delays the mirror and loses nothing.
+        remote: a parquet_checkpoint sink (S3Sink) that uploads the first
+            copy name for name through an Uploader; None = no upload. Its
+            failure delays the upload and loses nothing.
         compression / compression_level: passed straight to pyarrow.
             Default zstd; level 9 when the codec is zstd and no level is
             given (another codec gets its own default level).
@@ -125,7 +125,7 @@ class ParquetWriter:
             sink = sink.sub(stream_dir)
         self._sink = sink
         self._remote = remote.sub(stream_dir) if remote is not None else None
-        self._ships = {}                # file name -> Shipper (live + pending)
+        self._uploads = {}                # file name -> Uploader (live + pending)
         # What the store holds of this run, for the ticket, and when a
         # finished file's checkpoints are deleted: the stream core's
         # rule and state (src/core/sp.h, WHAT THE STORE HOLDS). Written on
@@ -144,7 +144,7 @@ class ParquetWriter:
         self._ticket_catalog = None     # the catalog version the ticket names
         self.on_ticket = None           # the stream's "write the ticket now"
         self._remote_swept = False      # the remote half of the boot sweep
-                                        # runs on the first mirror pass
+                                        # runs on the first upload pass
         self._writer = None
         self._file_path = None
         self._file_first_row = None   # the stream row number of the open file's first row
@@ -199,9 +199,9 @@ class ParquetWriter:
                 self._await_catalog(final, self._sink, versions[-1][1])
             elif todo == pqc.SWEEP_DISCARD:  # a spool copy: no reader is told of it
                 parquet_checkpoint.discard_checkpoints(final, self._sink)
-            elif todo == pqc.SWEEP_MIRROR:
-                # pending: finalizes once its checkpoint is shipped
-                self._ships[final] = parquet_checkpoint.Shipper(
+            elif todo == pqc.SWEEP_UPLOAD:
+                # pending: finalizes once its checkpoint is uploaded
+                self._uploads[final] = parquet_checkpoint.Uploader(
                     final, self._sink, self._remote)
                 _diag.info(f"[{self._stream_name}] boot sweep: "
                            f"{self._where(final)} pending "
@@ -281,7 +281,7 @@ class ParquetWriter:
             superseded_keep_s=self.superseded_keep_s, **self._writer_kwargs()
         )
         if self._remote is not None:
-            self._ships[name] = parquet_checkpoint.Shipper(
+            self._uploads[name] = parquet_checkpoint.Uploader(
                 name, self._sink, self._remote,
                 superseded_keep_s=self.superseded_keep_s)
         self._file_opened_at = now
@@ -372,7 +372,7 @@ class ParquetWriter:
                                    w.rows_checkpointed)
 
     def _stored_locally(self):
-        """Without a mirror the first copy is the store: a checkpoint is
+        """Without an upload the first copy is the store: a checkpoint is
         the rows reaching it, and the upload step that deletes what is
         superseded."""
         if self._remote is None:
@@ -425,7 +425,7 @@ class ParquetWriter:
 
     def discard_due(self):
         """Delete the checkpoints of files the ticket dropped at least
-        the keep time ago. Called in the steps that upload (a ship
+        the keep time ago. Called in the steps that upload (an upload
         pass; a checkpoint when the first copy is the store) and when
         the catalog drops files; nothing runs on a timer."""
         with self._store_lock:
@@ -482,7 +482,7 @@ class ParquetWriter:
 
     def store_location(self):
         """The stream's folder in the store, ending in '/': the bucket's
-        when mirrored, else the first copy's (a directory, or a bucket
+        when uploaded, else the first copy's (a directory, or a bucket
         written directly)."""
         if self._remote is not None:
             loc = self._remote.uri
@@ -494,7 +494,7 @@ class ParquetWriter:
 
     def _finish_writer(self):
         """End the current file. Local only: assemble it now. With a
-        remote: write its final checkpoint and leave it pending; ship()
+        remote: write its final checkpoint and leave it pending; upload()
         assembles both copies once that checkpoint is on the remote."""
         if self._remote is None:
             name = self._writer.name
@@ -527,20 +527,20 @@ class ParquetWriter:
 
     def close(self):
         """Finalize the current file (with a remote: leave it pending
-        for the stream's closing mirror pass)."""
+        for the stream's closing upload pass)."""
         if self._writer is not None:
             self._finish_writer()
 
-    def ship(self):
-        """One mirror pass over every file in flight: the live file
-        ships its newest checkpoint; a pending file (ended locally,
+    def upload(self):
+        """One upload pass over every file in flight: the live file
+        uploads its newest checkpoint; a pending file (ended locally,
         not yet assembled) finishes once its final checkpoint is on
         the remote: local assembly, then remote assembly. Raises on
         any remote failure; the host retries on its next pass."""
         if self._remote is None:
             return
         # Each pass is timed per file and per phase. A pass slower than
-        # SHIP_SLOW_S is reported with its breakdown at normal
+        # UPLOAD_SLOW_S is reported with its breakdown at normal
         # verbosity; at verbosity 2 every pass is (the S3 sink then
         # also logs each call, see parquet_checkpoint._sinks.S3Sink).
         t_pass = time.monotonic()
@@ -551,15 +551,15 @@ class ParquetWriter:
             self._remote_swept = True
             parts.append(f"sweep {time.monotonic() - t0:.2f}s")
         live = self._writer.name if self._writer is not None else None
-        for name, ship in list(self._ships.items()):
-            # One pass of the file's mirror, as the core orders it
-            # (pqc.h: THE MIRROR): the newest version to the remote, and
+        for name, upload in list(self._uploads.items()):
+            # One pass of the file's upload, as the core orders it
+            # (pqc.h: THE UPLOAD): the newest version to the remote, and
             # for a file the writer ended, the local assembly and then
             # the remote one. The ticket's row moves at the moment the
             # remote holds a version, also in a pass that fails after.
             t0 = time.monotonic()
             keep = self._keeps_checkpoints()
-            status = ship.run(
+            status = upload.run(
                 live=(name == live), keep_checkpoints=keep,
                 stored=lambda obj, rows, name=name: self._stored(name, rows, obj))
             state = status['state']
@@ -574,9 +574,9 @@ class ParquetWriter:
             parts.append(detail)
             if not status['done']:
                 continue
-            del self._ships[name]
+            del self._uploads[name]
             if keep:
-                last = ship._last_object or (
+                last = upload._last_object or (
                     parquet_checkpoint.ckpt_versions(self._remote, name)
                     or [(0, None)])[-1][1]
                 self._await_catalog(name, self._remote, last)
@@ -585,41 +585,41 @@ class ParquetWriter:
             _diag.info(f"[{self._stream_name}] remote finalized {name}")
         self.discard_due()              # the upload step deletes what is superseded
         elapsed = time.monotonic() - t_pass
-        if parts and (elapsed >= self.SHIP_SLOW_S or _diag.isEnabledFor(logging.DEBUG)):
-            _diag.info(f"[{self._stream_name}] ship pass {elapsed:.2f}s"
-                       f"{' SLOW' if elapsed >= self.SHIP_SLOW_S else ''}: "
+        if parts and (elapsed >= self.UPLOAD_SLOW_S or _diag.isEnabledFor(logging.DEBUG)):
+            _diag.info(f"[{self._stream_name}] upload pass {elapsed:.2f}s"
+                       f"{' SLOW' if elapsed >= self.UPLOAD_SLOW_S else ''}: "
                        + "; ".join(parts))
 
     def _sweep_remote(self):
-        """The remote half of the boot sweep, on the ship lane so that an
-        unreachable S3 at start delays the mirror and never the stream:
+        """The remote half of the boot sweep, on the upload lane so that an
+        unreachable S3 at start delays the upload and never the stream:
         a checkpoint left on the remote whose local file already
-        finalized (crash between the two assemblies) gets a Shipper that
+        finalized (crash between the two assemblies) gets an Uploader that
         finishes it from the remote's own artifacts."""
         from parquet_checkpoint import _core as pqc
         for final, versions in sorted(
                 parquet_checkpoint.unfinished_files(self._remote).items()):
             todo = pqc.sweep_remote(self._remote.exists(final),
                                     self._keeps_checkpoints(),
-                                    final in self._ships)
+                                    final in self._uploads)
             if todo == pqc.SWEEP_AWAIT_CATALOG:
                 # finished before the crash; checkpoints kept for readers
                 self._await_catalog(final, self._remote, versions[-1][1])
             elif todo == pqc.SWEEP_DISCARD:
                 parquet_checkpoint.discard_checkpoints(final, self._remote)
-            elif todo == pqc.SWEEP_MIRROR:
-                self._ships[final] = parquet_checkpoint.Shipper(
+            elif todo == pqc.SWEEP_UPLOAD:
+                self._uploads[final] = parquet_checkpoint.Uploader(
                     final, self._sink, self._remote)
                 # its checkpoint is already in the store
                 self._stored(final, 0, versions[-1][1])
                 _diag.info(f"[{self._stream_name}] remote sweep: "
                            f"{final} pending its remote assembly")
 
-    def shipping_now(self):
-        """What the mirror is doing on the remote right now ("uploading
+    def uploading_now(self):
+        """What the upload is doing on the remote right now ("uploading
         checkpoint ... (3.4 MB)"), or None."""
-        for ship in list(self._ships.values()):
-            doing = ship.doing
+        for upload in list(self._uploads.values()):
+            doing = upload.doing
             if doing:
                 return doing
         return None
@@ -628,9 +628,9 @@ class ParquetWriter:
         """Names of files ended locally whose remote copy is not yet
         assembled (empty with no remote)."""
         live = self._writer.name if self._writer is not None else None
-        return [n for n in self._ships if n != live]
+        return [n for n in self._uploads if n != live]
 
     def get_in_flight(self):
         """Names of files with a remote copy still to tend: the live
         file and every pending one. Empty with no remote."""
-        return list(self._ships)
+        return list(self._uploads)

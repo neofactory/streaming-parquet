@@ -2,10 +2,10 @@
 
 Workers are interchangeable threads that execute Flight push tasks
 (small, frequent, latency-sensitive), Parquet write tasks (large,
-infrequent, throughput-bound), or ship tasks (the S3 mirror: bounded by
+infrequent, throughput-bound), or upload tasks (the S3 upload: bounded by
 network timeouts, never by the local disk). Per-stream serialization
 keeps Flight batches in order, prevents concurrent parquet writes to the
-same file, and keeps one mirror pass at a time, while still allowing the
+same file, and keeps one upload pass at a time, while still allowing the
 three kinds for the same stream to run in parallel on different worker
 threads.
 """
@@ -19,7 +19,7 @@ _diag = logging.getLogger("streaming_parquet")
 
 class _StreamSlots:
     """Per-stream serialization state: the set of task kinds in flight
-    ('flight', 'parquet', 'ship'). At most one task of each kind may be
+    ('flight', 'parquet', 'upload'). At most one task of each kind may be
     in flight for a given stream at a time. Held under the pool's lock."""
 
     __slots__ = ("busy",)
@@ -32,7 +32,7 @@ class Task:
     __slots__ = ("kind", "stream_name", "fn", "args", "on_done")
 
     def __init__(self, kind, stream_name, fn, args, on_done):
-        self.kind = kind                 # "flight" | "parquet" | "ship"
+        self.kind = kind                 # "flight" | "parquet" | "upload"
         self.stream_name = stream_name
         self.fn = fn                     # callable doing the work
         self.args = args                 # tuple of args for fn

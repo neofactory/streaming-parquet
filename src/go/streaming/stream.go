@@ -50,16 +50,16 @@ type Stream struct {
 	stopWork chan struct{}
 	workDone sync.WaitGroup
 
-	// The spool and its mirror. A bucket store is written through a
-	// local spool, and the ship goroutine copies the spool to the bucket:
-	// the one caller of the archiver's ship, so no two passes overlap.
-	// mirrorFailing and mirrorError are under mu.
+	// The spool and its upload. A bucket store is written through a
+	// local spool, and the upload goroutine copies the spool to the bucket:
+	// the one caller of the archiver's upload, so no two passes overlap.
+	// uploadFailing and uploadError are under mu.
 	spool         string // "" = the default spool
 	noSpool       bool
-	shipKick      chan chan struct{} // a pass now; the channel given is closed after it
-	shipStop      chan struct{}
-	mirrorFailing bool
-	mirrorError   string
+	uploadKick    chan chan struct{} // a pass now; the channel given is closed after it
+	uploadStop    chan struct{}
+	uploadFailing bool
+	uploadError   string
 
 	// Published or internal. pubMu orders Publish, Unpublish and Close.
 	pubMu     sync.Mutex
@@ -131,7 +131,7 @@ func (m *MemoryOptions) rows() int64 {
 //
 // Spool is the local write-behind copy a bucket store is written
 // through: on disk, surviving a reboot, copied to the bucket every
-// ParquetOptions.ShipSeconds, growing while the bucket cannot be
+// ParquetOptions.UploadSeconds, growing while the bucket cannot be
 // reached. A directory store is written straight into, and the spool is
 // not used. A stream with no store writes its files to the spool alone.
 //
@@ -183,7 +183,7 @@ func (t *process) CreateStream(name string, schema *arrow.Schema,
 	}
 	s := &Stream{Name: name, proc: t, root: root, tickets: tickets, ring: r, ringRows: ringRows,
 		spool: o.Spool, noSpool: o.NoSpool,
-		shipKick: make(chan chan struct{}), shipStop: make(chan struct{}),
+		uploadKick: make(chan chan struct{}), uploadStop: make(chan struct{}),
 		run: runStart(), wake: make(chan struct{}, 1),
 		store: newStoreState(pqc.SupersededKeep), ticketNow: make(chan struct{}, 1),
 		stopWork: make(chan struct{})}
@@ -215,7 +215,7 @@ func (t *process) CreateStream(name string, schema *arrow.Schema,
 	t.mu.Unlock()
 	s.workDone.Add(1)
 	go s.work()
-	go s.shipLoop()
+	go s.uploadLoop()
 	if !o.Internal {
 		if err := s.Publish(); err != nil {
 			s.Close()
@@ -415,72 +415,72 @@ func (s *Stream) ArchiveState() ArchiveState {
 	return st
 }
 
-// MirrorState is the standing of the copy of a spool to its bucket.
+// UploadState is the standing of the copy of a spool to its bucket.
 // Pending names the files ended locally whose copy in the bucket is not
-// finished yet. A failing mirror loses no rows: they are in the spool,
+// finished yet. A failing upload loses no rows: they are in the spool,
 // and the passes go on.
-type MirrorState struct {
+type UploadState struct {
 	Failing bool
 	Error   string
 	Pending []string
 }
 
-// MirrorState answers the mirror's standing; nil for a stream whose
+// UploadState answers the upload's standing; nil for a stream whose
 // first copy is its store (no spool in use).
-func (s *Stream) MirrorState() *MirrorState {
+func (s *Stream) UploadState() *UploadState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.arch == nil || s.arch.remote == nil {
 		return nil
 	}
-	return &MirrorState{Failing: s.mirrorFailing, Error: s.mirrorError,
+	return &UploadState{Failing: s.uploadFailing, Error: s.uploadError,
 		Pending: s.arch.pending()}
 }
 
-// shipLoop is the stream's ship goroutine: a mirror pass every
-// ShipSeconds, and one when Close asks. It holds none of the stream's
+// uploadLoop is the stream's upload goroutine: an upload pass every
+// UploadSeconds, and one when Close asks. It holds none of the stream's
 // locks during a pass: a bucket that is slow or away never holds up a
 // commit or a write.
-func (s *Stream) shipLoop() {
+func (s *Stream) uploadLoop() {
 	for {
 		var reply chan struct{}
 		s.mu.Lock()
-		every := defaultShipSeconds
+		every := defaultUploadSeconds
 		if s.arch != nil {
-			every = s.arch.shipSeconds
+			every = s.arch.uploadSeconds
 		}
 		s.mu.Unlock()
 		select {
-		case <-s.shipStop:
+		case <-s.uploadStop:
 			return
-		case reply = <-s.shipKick:
+		case reply = <-s.uploadKick:
 		case <-time.After(time.Duration(every * float64(time.Second))):
 		}
-		s.shipOnce()
+		s.uploadOnce()
 		if reply != nil {
 			close(reply)
 		}
 	}
 }
 
-func (s *Stream) shipOnce() {
+func (s *Stream) uploadOnce() {
 	s.mu.Lock()
 	arch := s.arch
 	s.mu.Unlock()
 	if arch == nil || arch.remote == nil {
 		return
 	}
-	err := arch.ship()
+	err := arch.upload()
 	s.mu.Lock()
 	switch {
 	case err != nil:
-		if !s.mirrorFailing {
-			s.proc.log.Warn(fmt.Sprintf("[%s] remote mirror failing: %v", s.Name, err))
+		if !s.uploadFailing {
+			s.proc.log.Warn(fmt.Sprintf("[%s] remote upload failing: %v", s.Name, err))
 		}
-		s.mirrorFailing, s.mirrorError = true, err.Error()
-	case s.mirrorFailing:
-		s.proc.log.Info(fmt.Sprintf("[%s] remote mirror recovered", s.Name))
-		s.mirrorFailing, s.mirrorError = false, ""
+		s.uploadFailing, s.uploadError = true, err.Error()
+	case s.uploadFailing:
+		s.proc.log.Info(fmt.Sprintf("[%s] remote upload recovered", s.Name))
+		s.uploadFailing, s.uploadError = false, ""
 	}
 	s.mu.Unlock()
 	select { // the ticket says what the store holds: write it now
@@ -489,11 +489,11 @@ func (s *Stream) shipOnce() {
 	}
 }
 
-// closingShip is the mirror pass of a stream that closes: with the
+// closingUpload is the upload pass of a stream that closes: with the
 // bucket in reach, the last file's copy there is finished before Close
 // returns. Without, the file stays in the spool, and the next start's
 // sweep finishes it.
-func (s *Stream) closingShip() {
+func (s *Stream) closingUpload() {
 	s.mu.Lock()
 	arch := s.arch
 	s.mu.Unlock()
@@ -504,7 +504,7 @@ func (s *Stream) closingShip() {
 	reply := make(chan struct{})
 	deadline := time.After(3 * time.Second)
 	select {
-	case s.shipKick <- reply:
+	case s.uploadKick <- reply:
 	case <-deadline:
 		reply = nil // a pass is running, and did not end
 	}
@@ -513,15 +513,15 @@ func (s *Stream) closingShip() {
 		case <-reply:
 			return
 		case <-time.After(time.Second):
-			if doing := arch.shipping(); doing != "" {
+			if doing := arch.uploading(); doing != "" {
 				s.proc.log.Info(fmt.Sprintf("[%s] close: %s, %.0f s so far",
 					s.Name, doing, time.Since(t0).Seconds()))
 			}
 		}
 	}
-	doing := arch.shipping()
+	doing := arch.uploading()
 	if doing == "" {
-		doing = "the mirror pass"
+		doing = "the upload pass"
 	}
 	s.proc.log.Warn(fmt.Sprintf("[%s] close: still %s after %.0f s; the file is "+
 		"complete in the local spool (%s) and the next start finishes the upload",
@@ -655,7 +655,7 @@ func (s *Stream) heartbeat(stop chan struct{}) {
 				t.CheckpointSeconds = s.arch.ckptSeconds
 			}
 			if s.arch.remote != nil {
-				t.ShipSeconds = s.arch.shipSeconds
+				t.UploadSeconds = s.arch.uploadSeconds
 			}
 		}
 		s.mu.Unlock()
@@ -865,8 +865,8 @@ func (s *Stream) Close() error {
 	s.mu.Unlock()
 	s.io.Unlock()
 
-	s.closingShip()
-	close(s.shipStop)
+	s.closingUpload()
+	close(s.uploadStop)
 
 	// The catalog lists the last file before the stream goes, when it
 	// can in a few seconds; the ticket must still be there for it.

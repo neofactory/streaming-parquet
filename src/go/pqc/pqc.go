@@ -378,9 +378,9 @@ func (w *Writer) close(emptyMini []byte, keep bool) error {
 
 // Free releases the C writer without finalizing (a crash leaves the
 // checkpoint + objects for Finalize, from anywhere).
-// CheckpointFinal is the writer's last checkpoint of a file that a
-// mirror ends: every final row claimed, no unfinished rows, and the
-// file left as its versions and objects. The mirror assembles it, in
+// CheckpointFinal is the writer's last checkpoint of a file that an
+// upload ends: every final row claimed, no unfinished rows, and the
+// file left as its versions and objects. The upload assembles it, in
 // its order (THE END OF A FILE in the core's pqc.h). emptyMini is for a
 // file with no rows. The writer is not used after it.
 func (w *Writer) CheckpointFinal(emptyMini []byte) error {
@@ -532,7 +532,7 @@ func finalize(name string, sink Sink, keep bool) (string, error) {
 }
 
 // finalizeFrom is finalize; with ckpt, the bytes of the newest version
-// (object used) when the caller just put it there (a mirror): the
+// (object used) when the caller just put it there (an upload): the
 // read-back is then skipped.
 func finalizeFrom(name string, sink Sink, ckpt []byte, object string, keep bool) (string, error) {
 	assembled, err := finish(name, sink, C.PQC_FINISH_ASSEMBLE_FILE, keep, ckpt, object)

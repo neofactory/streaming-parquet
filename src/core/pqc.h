@@ -242,17 +242,17 @@ int pqc_versions_deleted(PqcVersions *v, const char *object, Report *report);
 /* 1 when a version this keeps names `object`. */
 int pqc_versions_names(const PqcVersions *v, const char *object);
 
-/* ---- the mirror --------------------------------------------------------- */
+/* ---- the upload --------------------------------------------------------- */
 
 /* THE TWO-COPIES MODEL. A writer writes its objects and checkpoint
  * versions to a LOCAL copy (a disk, the spool) at its own cadence,
- * never held up by the network. A mirror copies them to a REMOTE copy
+ * never held up by the network. An upload copies them to a REMOTE copy
  * (a bucket) at the cadence the link allows. The local disk's loss
  * window is the rows since the last pass that worked, by design.
  *
- * One PqcMirror for one file. It does no input and no output: in each
- * PASS the host says what the local copy has (pqc_mirror_local), then
- * asks for the next step (pqc_mirror_next), does it, and says how it
+ * One PqcUpload for one file. It does no input and no output: in each
+ * PASS the host says what the local copy has (pqc_upload_local), then
+ * asks for the next step (pqc_upload_next), does it, and says how it
  * went, until the step is NOTHING or DONE. The rules are here:
  *
  *   WHAT IS SENT. Only the newest local version, and of the objects it
@@ -264,7 +264,7 @@ int pqc_versions_names(const PqcVersions *v, const char *object);
  *   THE ORDER. Every object a version names is on the remote before
  *   that version: a reader told of a version finds what it names.
  *
- *   WHAT IS DELETED. The remote versions this mirror stored, by the
+ *   WHAT IS DELETED. The remote versions this upload stored, by the
  *   rule above (CHECKPOINT VERSIONS).
  *
  *   THE END OF A FILE, in one order: the writer's last checkpoint
@@ -275,94 +275,94 @@ int pqc_versions_names(const PqcVersions *v, const char *object);
  *   crash-durable locally; the writer goes on to its next file, and
  *   every later pass tries the next step again.
  *
- * A step that fails ends the pass (pqc_mirror_failed); what was done
+ * A step that fails ends the pass (pqc_upload_failed); what was done
  * before it stays done, and the next pass goes on from there. A new
- * process makes a new PqcMirror for a file an earlier one left
+ * process makes a new PqcUpload for a file an earlier one left
  * unfinished (THE SWEEP AT START, below): with nothing remembered it
  * asks the remote again, and finishes the file from what is there. */
-typedef struct PqcMirror PqcMirror;
+typedef struct PqcUpload PqcUpload;
 
 typedef enum {
-    PQC_MIRROR_NOTHING = 0,       /* the pass is over; nothing more now */
-    PQC_MIRROR_STAT = 1,          /* does the remote hold object `name`,
+    PQC_UPLOAD_NOTHING = 0,       /* the pass is over; nothing more now */
+    PQC_UPLOAD_STAT = 1,          /* does the remote hold object `name`,
                                      and how many bytes? Answer with
-                                     pqc_mirror_remote_has. `size`: the
+                                     pqc_upload_remote_has. `size`: the
                                      bytes it must have. */
-    PQC_MIRROR_UPLOAD = 2,        /* copy object `name` (`size` bytes)
+    PQC_UPLOAD_OBJECT = 2,        /* copy object `name` (`size` bytes)
                                      from the local copy to the remote */
-    PQC_MIRROR_UPLOAD_VERSION = 3,/* store the version `name` on the
+    PQC_UPLOAD_VERSION = 3,       /* store the version `name` on the
                                      remote: the bytes given to
-                                     pqc_mirror_local */
-    PQC_MIRROR_STORED = 4,        /* the remote now holds the file's first
+                                     pqc_upload_local */
+    PQC_UPLOAD_STORED = 4,        /* the remote now holds the file's first
                                      `size` rows in the version `name`: what
                                      a ticket may say. Nothing to do on
                                      the remote. */
-    PQC_MIRROR_DELETE = 5,        /* delete object `name` on the remote */
-    PQC_MIRROR_ASSEMBLE_LOCAL = 6,/* assemble the file in the local copy
+    PQC_UPLOAD_DELETE = 5,        /* delete object `name` on the remote */
+    PQC_UPLOAD_ASSEMBLE_LOCAL = 6,/* assemble the file in the local copy
                                      from its newest version there */
-    PQC_MIRROR_ASSEMBLE_REMOTE = 7,/* assemble the file on the remote.
-                                     flag 1: from the version this mirror
-                                     stored there (pqc_mirror_shipped has
+    PQC_UPLOAD_ASSEMBLE_REMOTE = 7,/* assemble the file on the remote.
+                                     flag 1: from the version this upload
+                                     stored there (pqc_upload_version has
                                      its bytes: no read-back). flag 0:
                                      from the newest version the remote
                                      holds, or nothing to do when the file
                                      is there already. */
-    PQC_MIRROR_DONE = 8           /* the file is finished in both copies:
-                                     free the mirror */
-} PqcMirrorAction;
+    PQC_UPLOAD_DONE = 8           /* the file is finished in both copies:
+                                     free the upload */
+} PqcUploadAction;
 
 typedef struct {
-    int32_t action;               /* PqcMirrorAction */
+    int32_t action;               /* PqcUploadAction */
     int32_t flag;
     uint64_t size;
     char name[PQC_OBJECT_MAX];
-} PqcMirrorStep;
+} PqcUploadStep;
 
 /* name: the file's name (it ends in ".parquet"). keep_seconds: how
  * long a replaced remote version stays. */
-int pqc_mirror_new(const char *name, double keep_seconds, PqcMirror **out,
+int pqc_upload_new(const char *name, double keep_seconds, PqcUpload **out,
                    Report *report);
-void pqc_mirror_free(PqcMirror *m);
+void pqc_upload_free(PqcUpload *m);
 
 /* A pass begins. What the local copy has now:
  *   object, ckpt, len  the newest checkpoint version of the file there
  *                      and its bytes; NULL and 0 when it has none
  *   final_exists       1 when the finished file is there
  *   live               1 while the writer has the file open: the pass
- *                      mirrors it and stops; 0 when the writer ended
+ *                      uploads it and stops; 0 when the writer ended
  *                      it: the pass also takes the steps of THE END OF
  *                      A FILE
  * REPORT_REFUSED when the bytes are not a checkpoint, or name another
  * file. The bytes are read during the call, and not kept after it
  * unless the version is stored on the remote. */
-int pqc_mirror_local(PqcMirror *m, const char *object, const uint8_t *ckpt,
+int pqc_upload_local(PqcUpload *m, const char *object, const uint8_t *ckpt,
                      size_t len, int final_exists, int live, Report *report);
 
 /* The next step of the pass. The same step is given again until the
- * host answers it: pqc_mirror_remote_has for STAT, pqc_mirror_did for
- * the others (STORED too), pqc_mirror_failed for one that failed.
+ * host answers it: pqc_upload_remote_has for STAT, pqc_upload_did for
+ * the others (STORED too), pqc_upload_failed for one that failed.
  * NOTHING and DONE need no answer. REPORT_INVALID before a pass
  * begins. */
-int pqc_mirror_next(PqcMirror *m, PqcMirrorStep *step, Report *report);
+int pqc_upload_next(PqcUpload *m, PqcUploadStep *step, Report *report);
 
 /* The answer to STAT: whether the remote holds the object, and its
  * bytes there. */
-int pqc_mirror_remote_has(PqcMirror *m, int exists, uint64_t size,
+int pqc_upload_remote_has(PqcUpload *m, int exists, uint64_t size,
                           Report *report);
 /* The step was done. */
-int pqc_mirror_did(PqcMirror *m, Report *report);
+int pqc_upload_did(PqcUpload *m, Report *report);
 /* The step failed: the pass is over. */
-void pqc_mirror_failed(PqcMirror *m);
+void pqc_upload_failed(PqcUpload *m);
 
-/* The newest version this mirror stored on the remote: its bytes (they
- * hold until the next pqc_mirror_did, and the mirror owns them) and its
+/* The newest version this upload stored on the remote: its bytes (they
+ * hold until the next pqc_upload_did, and the upload owns them) and its
  * object name. 1 when there is one, else 0. */
-int pqc_mirror_shipped(const PqcMirror *m, const uint8_t **ckpt, size_t *len,
+int pqc_upload_version(const PqcUpload *m, const uint8_t **ckpt, size_t *len,
                        const char **object);
 
-/* What the mirror is doing on the remote right now, in words for a
+/* What the upload is doing on the remote right now, in words for a
  * person who waits ("uploading object x (3.4 MB)"); "" between steps. */
-const char *pqc_mirror_doing(const PqcMirror *m);
+const char *pqc_upload_doing(const PqcUpload *m);
 
 /* THE SWEEP AT START. A writer that starts owns its stream, so every
  * checkpoint version it finds is a leftover of an earlier run. For
@@ -370,7 +370,7 @@ const char *pqc_mirror_doing(const PqcMirror *m);
 typedef enum {
     PQC_SWEEP_NOTHING = 0,
     PQC_SWEEP_FINISH = 1,         /* assemble the file here, now */
-    PQC_SWEEP_MIRROR = 2,         /* give it a mirror: its passes finish it */
+    PQC_SWEEP_UPLOAD = 2,         /* give it an upload: its passes finish it */
     PQC_SWEEP_AWAIT_CATALOG = 3,  /* it is finished; its versions stay until
                                      a catalog lists the file */
     PQC_SWEEP_DISCARD = 4         /* it is finished; delete its versions and
@@ -379,13 +379,13 @@ typedef enum {
 
 /* In the local copy. final_exists: the finished file is beside the
  * versions (it finished before the crash). has_remote: the local copy
- * is mirrored. keeps_checkpoints: readers are told of the store's
+ * is uploaded. keeps_checkpoints: readers are told of the store's
  * unfinished files, so a finished file's versions stay until a catalog
  * lists it. */
 int pqc_sweep_local(int final_exists, int has_remote, int keeps_checkpoints);
 
-/* On the remote, in the first pass. in_flight: the file already has a
- * mirror (the local sweep found it). */
+/* On the remote, in the first pass. in_flight: the file already has an
+ * upload (the local sweep found it). */
 int pqc_sweep_remote(int final_exists, int keeps_checkpoints, int in_flight);
 
 /* ---- the assembly of a file ---------------------------------------------- */
@@ -393,7 +393,7 @@ int pqc_sweep_remote(int final_exists, int keeps_checkpoints, int in_flight);
 /* THE ASSEMBLY OF A FILE. A file's checkpoint becomes the ordinary
  * .parquet file in one place (a directory, a bucket), from the objects
  * that place holds. Anyone can do it, at any time, any number of
- * times: the writer at its close, a mirror, the sweep at start. One
+ * times: the writer at its close, an upload, the sweep at start. One
  * PqcFinish for one assembly. The host lists, reads, assembles and
  * deletes; the rules are here:
  *
@@ -452,7 +452,7 @@ typedef enum {
                                      discard) */
 } PqcFinishAction;
 
-typedef PqcMirrorStep PqcFinishStep;
+typedef PqcUploadStep PqcFinishStep;
 
 /* name: the file's name in the place. REPORT_INVALID for a mode that
  * is not one, or a name that does not fit. */

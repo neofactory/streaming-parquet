@@ -121,7 +121,7 @@ static void hit(const uint8_t *buf, size_t n) {
     uint64_t off, dl; pqc_reader_data(r, &off, &dl);
     pqc_reader_free(r);
   }
-  /* the version rule and the mirror read the same bytes */
+  /* the version rule and the upload read the same bytes */
   {
     Report rep;
     PqcVersions *v = NULL;
@@ -131,7 +131,7 @@ static void hit(const uint8_t *buf, size_t n) {
       for (int32_t i = 0; pqc_versions_due(v, i); i++) {}
       pqc_versions_free(v);
     }
-    PqcMirror *m = NULL;
+    PqcUpload *m = NULL;
     const char *file = "f.parquet";
     char named[PQC_NAME_MAX + 16];
     if (accepted) {                /* the name the bytes record, when it is one */
@@ -142,21 +142,21 @@ static void hit(const uint8_t *buf, size_t n) {
         file = named;
       }
     }
-    if (pqc_mirror_new(file, 0, &m, &rep) == REPORT_OK) {
-      if (pqc_mirror_local(m, "v.parquet.000001.ckpt", buf, n, 0,
+    if (pqc_upload_new(file, 0, &m, &rep) == REPORT_OK) {
+      if (pqc_upload_local(m, "v.parquet.000001.ckpt", buf, n, 0,
                            (int)(xr() & 1), &rep) == REPORT_OK) {
-        PqcMirrorStep st;
+        PqcUploadStep st;
         for (int k = 0; k < 4096; k++) {
-          if (pqc_mirror_next(m, &st, &rep) != REPORT_OK) break;
-          if (st.action == PQC_MIRROR_NOTHING || st.action == PQC_MIRROR_DONE)
+          if (pqc_upload_next(m, &st, &rep) != REPORT_OK) break;
+          if (st.action == PQC_UPLOAD_NOTHING || st.action == PQC_UPLOAD_DONE)
             break;
-          if (st.action == PQC_MIRROR_STAT)
-            (void)pqc_mirror_remote_has(m, (int)(xr() & 1), st.size, &rep);
-          else if (xr() % 16 == 0) { pqc_mirror_failed(m); break; }
-          else (void)pqc_mirror_did(m, &rep);
+          if (st.action == PQC_UPLOAD_STAT)
+            (void)pqc_upload_remote_has(m, (int)(xr() & 1), st.size, &rep);
+          else if (xr() % 16 == 0) { pqc_upload_failed(m); break; }
+          else (void)pqc_upload_did(m, &rep);
         }
       }
-      pqc_mirror_free(m);
+      pqc_upload_free(m);
     }
     /* the assembly of a file from the same bytes: read as a version,
      * or given in hand; any answers */

@@ -38,7 +38,7 @@
  *   stale_after         number  seconds after ts at which a reader
  *                               calls the writer dead
  *   checkpoint_seconds  number  the writer's checkpoint cadence
- *   ship_seconds        number  the cadence of its uploads from a spool
+ *   upload_seconds      number  the cadence of its uploads from a spool
  *   stored_row          integer the newest row of this run the store
  *                               holds; -1 for none
  *   stored_at           number  when that row got there
@@ -87,7 +87,7 @@ typedef enum {
     SP_T_BEAT_SECONDS,
     SP_T_STALE_AFTER,
     SP_T_CHECKPOINT_SECONDS,
-    SP_T_SHIP_SECONDS,
+    SP_T_UPLOAD_SECONDS,
     SP_T_STORED_ROW,
     SP_T_STORED_AT,
     SP_T_KEEP_SECONDS,
@@ -348,7 +348,7 @@ int64_t sp_writes_lost(const SpWrites *w);
  *                       its finished row groups, and its rows
  *   sp_store_stored     a version is in the store (at once when the
  *                       first copy is the store; after its upload when
- *                       the store is a mirror). The file is in the
+ *                       the first copy is a spool). The file is in the
  *                       ticket's `files` with this version. What the
  *                       plan knew of older versions is dropped: no
  *                       later ticket names them. The newest stored row

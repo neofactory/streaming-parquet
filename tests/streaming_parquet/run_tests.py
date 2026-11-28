@@ -5,7 +5,7 @@ Run:  python3 tests/streaming_parquet/run_tests.py
 Streams on the arrow_ring core, the Arrow-schema API, attach()
 local/remote, the reader verbs (newest_row, cursor, arrow_table, the
 three DuckDB views), commit-driven publishing, the archive (cut,
-start/stop, checkpoints, the S3 mirror), playback clocks, and a real
+start/stop, checkpoints, the S3 upload), playback clocks, and a real
 Flight loopback. Each test tears the module down (sp.close()) so
 state is fresh.
 """
@@ -35,7 +35,7 @@ def _newest_ckpt(names):
     got = [(parquet_checkpoint.parse_ckpt_object(n)[1], n) for n in names
            if parquet_checkpoint.parse_ckpt_object(n) is not None]
     return max(got)[1] if got else None
-from streaming_parquet import StaleReadError, PinStalledError, MemoryOptions, ParquetOptions, ArchiveState, MirrorState
+from streaming_parquet import StaleReadError, PinStalledError, MemoryOptions, ParquetOptions, ArchiveState, UploadState
 
 # The suite reads the library's INFO lines; a program that sets nothing
 # up gets warnings and errors alone.
@@ -1109,11 +1109,11 @@ def _():
     assert a._read_row(9).tv == 9.0
 
 
-print("\n--- the S3 mirror (FakeS3 remote) ---")
+print("\n--- the S3 upload (FakeS3 remote) ---")
 
 
 def pump(stream, cond, timeout=8.0, what="condition"):
-    """Wait for the mirror: its passes ride the stream's own heartbeat
+    """Wait for the upload: its passes ride the stream's own heartbeat
     thread now, nothing to call."""
     wait_for(cond, timeout=timeout, what=what)
 
@@ -1192,13 +1192,13 @@ def _():
         s.close()                        # before the directory goes
 
 
-@test("remote mirror: live ships; outage rides; file ended during it assembles after, byte-identical")
+@test("remote upload: live uploads; outage rides; file ended during it assembles after, byte-identical")
 def _():
     import parquet_checkpoint
     from parquet_checkpoint import FakeS3
     with tempfile.TemporaryDirectory() as tmp:
         remote = FakeS3(part_min=4096)
-        s = sp.create_stream("v2test/rem", SCHEMA, memory=MemoryOptions(rows=500), store=remote, spool=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05, ship_seconds=0.02))
+        s = sp.create_stream("v2test/rem", SCHEMA, memory=MemoryOptions(rows=500), store=remote, spool=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05, upload_seconds=0.02))
         pq_dir = s.archive_state().location
         s.start_parquet("REM")
         fill(s, 30)
@@ -1240,7 +1240,7 @@ def _():
         assert not [n for n in remote.list('') if '.ckpt' in n or '.chunks/' in n]
 
 
-@test("remote mirror: S3 unreachable at start delays the mirror, never the stream")
+@test("remote upload: S3 unreachable at start delays the upload, never the stream")
 def _():
     from parquet_checkpoint import FakeS3
 
@@ -1259,34 +1259,34 @@ def _():
 
     with tempfile.TemporaryDirectory() as tmp:
         remote = Dark(part_min=4096)
-        s = sp.create_stream("v2test/dark", SCHEMA, memory=MemoryOptions(rows=500), store=remote, spool=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05, ship_seconds=0.02))
+        s = sp.create_stream("v2test/dark", SCHEMA, memory=MemoryOptions(rows=500), store=remote, spool=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05, upload_seconds=0.02))
         s.start_parquet("DARK")
         fill(s, 30)
         time.sleep(0.1)
         pq_dir = s.archive_state().location
         wait_for(lambda: any(f.endswith('.ckpt') for f in _local_names(pq_dir, 'DARK')),
                  what="local checkpoint with the remote dark")
-        for _ in range(10):              # the mirror keeps failing, quietly after the first
+        for _ in range(10):              # the upload keeps failing, quietly after the first
             time.sleep(0.02)
         assert not [n for n in FakeS3.list(remote, '') if 'DARK' in n], \
             "nothing may reach a dark remote"
-        m = s.mirror_state()
+        m = s.upload_state()
         assert m.failing and 'credentials' in m.error, m
         remote.down = False              # link up: the sweep, then the catch-up
         pump(s, lambda: _remote_ckpt_rows(remote, 'DARK') == 30,
              what="remote checkpoint after the link returned")
-        pump(s, lambda: not s.mirror_state().failing, what="mirror recovered")
-        assert s.mirror_state() == MirrorState(failing=False, error=None, pending=[])
+        pump(s, lambda: not s.upload_state().failing, what="upload recovered")
+        assert s.upload_state() == UploadState(failing=False, error=None, pending=[])
 
 
-@test("remote mirror: a checkpoint left on the remote by a crash between the assemblies is finished by the next start")
+@test("remote upload: a checkpoint left on the remote by a crash between the assemblies is finished by the next start")
 def _():
     import parquet_checkpoint
     from parquet_checkpoint import FakeS3
     with tempfile.TemporaryDirectory() as tmp:
         remote = FakeS3(part_min=4096)
         pq_dir = os.path.join(tmp, "streams", "v2test/half")
-        s = sp.create_stream("v2test/half", SCHEMA, memory=MemoryOptions(rows=500), store=remote, spool=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05, ship_seconds=0.02))
+        s = sp.create_stream("v2test/half", SCHEMA, memory=MemoryOptions(rows=500), store=remote, spool=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05, upload_seconds=0.02))
         s.start_parquet("HALF")
         fill(s, 20)
         time.sleep(0.1)
@@ -1299,7 +1299,7 @@ def _():
         sp.close()                # the closing pass fails the same way
         assert [n for n in remote.list('') if n.endswith('.ckpt') and 'HALF' in n]
         remote.clear_faults()
-        s2 = sp.create_stream("v2test/half", SCHEMA, memory=MemoryOptions(rows=500), store=remote, spool=tmp, parquet=ParquetOptions(ship_seconds=0.02))
+        s2 = sp.create_stream("v2test/half", SCHEMA, memory=MemoryOptions(rows=500), store=remote, spool=tmp, parquet=ParquetOptions(upload_seconds=0.02))
         s2.stop_parquet()                # nothing local in flight: the sweep alone
         pump(s2, lambda: not s2._parquet.get_in_flight()
              and any(n.endswith('.parquet') and 'HALF' in n for n in remote.list(''))
@@ -1310,14 +1310,14 @@ def _():
             open(os.path.join(pq_dir, final), 'rb').read()
 
 
-@test("remote mirror: a stop during an outage leaves the file pending; the next start finishes it")
+@test("remote upload: a stop during an outage leaves the file pending; the next start finishes it")
 def _():
     import parquet_checkpoint
     from parquet_checkpoint import FakeS3
     with tempfile.TemporaryDirectory() as tmp:
         remote = FakeS3(part_min=4096)
         pq_dir = os.path.join(tmp, "streams", "v2test/boot")
-        s = sp.create_stream("v2test/boot", SCHEMA, memory=MemoryOptions(rows=500), store=remote, spool=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05, ship_seconds=0.02))
+        s = sp.create_stream("v2test/boot", SCHEMA, memory=MemoryOptions(rows=500), store=remote, spool=tmp, parquet=ParquetOptions(checkpoint_seconds=0.05, upload_seconds=0.02))
         s.start_parquet("BOOT")
         fill(s, 20)
         time.sleep(0.1)
@@ -1333,12 +1333,12 @@ def _():
             not any(f.endswith('.parquet') for f in names), names
         assert _remote_ckpt_rows(remote, 'BOOT') == 25
         # next start, link up: the boot sweep registers the pending
-        # file and the first mirror passes finish it
+        # file and the first upload passes finish it
         remote.clear_faults()
         # (the checkpoint is seconds old: the owner finishes it anyway)
-        s2 = sp.create_stream("v2test/boot", SCHEMA, memory=MemoryOptions(rows=500), store=remote, spool=tmp, parquet=ParquetOptions(ship_seconds=0.02))
+        s2 = sp.create_stream("v2test/boot", SCHEMA, memory=MemoryOptions(rows=500), store=remote, spool=tmp, parquet=ParquetOptions(upload_seconds=0.02))
         assert s2._parquet.get_in_flight(), "boot sweep must register the pending file"
-        s2.stop_parquet()                # recording off: the heartbeat alone drives the mirror
+        s2.stop_parquet()                # recording off: the heartbeat alone drives the upload
         pump(s2, lambda: not s2._parquet.get_in_flight(), what="pending file finished")
         final = [f for f in _local_names(pq_dir, 'BOOT') if f.endswith('.parquet')][0]
         local_bytes = open(os.path.join(pq_dir, final), 'rb').read()
@@ -1482,7 +1482,7 @@ def _():
             t = ticket()
             assert t["run"] == s._run and t["beat_seconds"] == 0.05, t
             assert t["stale_after"] == 30.0, t
-            assert t["checkpoint_seconds"] == 0.05 and t["ship_seconds"] is None, t
+            assert t["checkpoint_seconds"] == 0.05 and t["upload_seconds"] is None, t
             assert isinstance(t["stored_at"], float), t
             d = os.path.join(root, "streams", "v2test", "tk")
             assert len(t["unfinished"]) == 1, t
@@ -1503,7 +1503,7 @@ def _():
 
 
 @test("ticket: a bucket behind a spool lists what the bucket holds -- "
-      "rows shipped, the remote checkpoint's path, the ship interval as the beat")
+      "rows uploaded, the remote checkpoint's path, the upload interval as the beat")
 def _():
     import tempfile
     from parquet_checkpoint import FakeS3
@@ -1513,14 +1513,14 @@ def _():
         s = sp.create_stream("v2test/tkr", flat, store=remote, spool=spool,
                                     memory=MemoryOptions(rows=500),
                                     parquet=ParquetOptions(checkpoint_seconds=0.05,
-                                                    ship_seconds=0.05))
+                                                    upload_seconds=0.05))
         try:
             s.append(pa.record_batch([pa.array(range(20))], schema=flat))
             def t():
                 return sp._tickets.get_ticket(remote, "v2test/tkr") or {}
-            wait_for(lambda: t().get("stored_row") == 19, what="shipped rows in the ticket")
+            wait_for(lambda: t().get("stored_row") == 19, what="uploaded rows in the ticket")
             tk = t()
-            assert tk["beat_seconds"] == 0.05 and tk["ship_seconds"] == 0.05, tk
+            assert tk["beat_seconds"] == 0.05 and tk["upload_seconds"] == 0.05, tk
             assert len(tk["unfinished"]) == 1, tk
             u = tk["unfinished"][0]
             want = remote.uri + "streams/v2test/tkr/"
@@ -1654,7 +1654,7 @@ def _():
         s = sp.create_stream("v2test/cat", bad, store=root,
                                     memory=MemoryOptions(rows=500),
                                     parquet=ParquetOptions(checkpoint_seconds=0.05,
-                                                    ship_seconds=60))
+                                                    upload_seconds=60))
         try:
             s.append(pa.record_batch([pa.array(["four"])], schema=bad))
             s.cut()
@@ -1706,7 +1706,7 @@ def _():
         s = sp.create_stream("v2test/copy", flat, store=root,
                                     memory=MemoryOptions(rows=500),
                                     parquet=ParquetOptions(checkpoint_seconds=0.05,
-                                                    ship_seconds=0.1,
+                                                    upload_seconds=0.1,
                                                     catalog_copy_seconds=1.5))
         try:
             s.append(pa.record_batch([pa.array(range(10))], schema=flat))
@@ -1917,11 +1917,11 @@ def _():
         s = sp.create_stream("v2test/slowup", flat, store=remote, spool=spool,
                                     memory=MemoryOptions(rows=500),
                                     parquet=ParquetOptions(checkpoint_seconds=0.05,
-                                                    ship_seconds=0.05))
+                                                    upload_seconds=0.05))
         s.append(pa.record_batch([pa.array(range(100))], schema=flat))
         wait_for(lambda: s.archive_state() is not None and
                  sp._tickets.get_ticket(remote, "v2test/slowup") is not None,
-                 what="first ship")
+                 what="first upload")
         put = remote.put
 
         def slow_put(name, data):

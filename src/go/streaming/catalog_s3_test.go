@@ -103,7 +103,7 @@ func TestCatalogRealS3(t *testing.T) {
 	}
 }
 
-// A spool mirrored to a real bucket: the uploads, the assembly in the
+// A spool uploaded to a real bucket: the uploads, the assembly in the
 // bucket and the catalog as S3 does them. Runs only when
 // SP_TEST_S3_BUCKET names a bucket; it writes under
 // streams/test/go-spool-check/ there, and the stream's ticket at
@@ -151,7 +151,7 @@ func TestSpoolRealS3(t *testing.T) {
 	spool := t.TempDir()
 	s, err := tel.CreateStream(name, testSchema(), StreamOptions{Store: "s3://" + bucket, Spool: spool,
 		Memory:  &MemoryOptions{Rows: 2000},
-		Parquet: &ParquetOptions{CheckpointSeconds: 0.5, ShipSeconds: 1}})
+		Parquet: &ParquetOptions{CheckpointSeconds: 0.5, UploadSeconds: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestSpoolRealS3(t *testing.T) {
 		deadline := time.Now().Add(60 * time.Second)
 		for !cond() {
 			if time.Now().After(deadline) {
-				t.Fatalf("timed out: %s; mirror %+v, files %+v", what, s.MirrorState(), s.ArchiveState())
+				t.Fatalf("timed out: %s; upload %+v, files %+v", what, s.UploadState(), s.ArchiveState())
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -185,10 +185,10 @@ func TestSpoolRealS3(t *testing.T) {
 	writeRows(t, s, 300, 200)
 	wait("the first file finished in the bucket and listed", func() bool {
 		st := s.ArchiveState()
-		return st.CatalogFiles == 1 && len(s.MirrorState().Pending) == 0
+		return st.CatalogFiles == 1 && len(s.UploadState().Pending) == 0
 	})
-	if st := s.MirrorState(); st.Failing {
-		t.Fatalf("mirror: %+v", st)
+	if st := s.UploadState(); st.Failing {
+		t.Fatalf("upload: %+v", st)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)

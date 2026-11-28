@@ -88,7 +88,7 @@ class Files:
     own:         () -> hold the lock of the one writer of these files;
                  raises, naming the holder, when another has it.
     publish:     () -> the user's step after a commit (a stream also
-                 tells its readers and its mirror); called where a
+                 tells its readers and its upload); called where a
                  boundary call must first see every committed row.
     writer_made: (writer) -> the first writer was built. Under `lock`.
     options_set: (options) -> the options changed. Under `lock`.
@@ -221,7 +221,7 @@ class Files:
             self._options_set(options)
         self.writer.set_compression(**(options.compression or {}))
         if self.writer.catalog is not None:
-            self.writer.catalog.set_cadence(options.ship_seconds,
+            self.writer.catalog.set_cadence(options.upload_seconds,
                                             options.catalog_copy_seconds)
 
     # --- after a commit ---------------------------------------------------------

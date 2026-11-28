@@ -81,7 +81,7 @@ Everything durable lives under one store—either a local directory or a whole S
   streams/<name>/catalog.sqlite        # per-stream catalog of finished files
 ```
 
-With an S3 store, writes land on a local write-behind **spool** first and mirror asynchronously to S3—so writers keep running through WAN outages and catch up automatically.
+With an S3 store, writes land on a local write-behind **spool** first and upload asynchronously to S3—so writers keep running through WAN outages and catch up automatically.
 
 ## Glossary
 
@@ -118,7 +118,7 @@ These are the Python names. Go has the same concepts: see [Python and Go: the sa
 
 **Options**
 - `MemoryOptions(rows)` — how many rows the ring holds. Default: two row groups.
-- `ParquetOptions(checkpoint_seconds, row_group_rows, row_group_seconds, ship_seconds, compression, catalog_copy_seconds)` — how the files are written. Where they go is the store and the spool.
+- `ParquetOptions(checkpoint_seconds, row_group_rows, row_group_seconds, upload_seconds, compression, catalog_copy_seconds)` — how the files are written. Where they go is the store and the spool.
 
 **Writing (`Stream`)**
 - `get_mutable_row(block_s)` / `commit()` — fill one row directly in ring memory and publish it; slow work (Flight, archival, S3) runs asynchronously.
@@ -141,7 +141,7 @@ These are the Python names. Go has the same concepts: see [Python and Go: the sa
 - `row_ids=True` on any of the three views adds two columns that identify a row for good: `sp_run_start_time` and `sp_run_row_number`.
 
 **Health & status**
-- `archive_state()` / `mirror_state()` / `memory_state()` — check durability errors, S3 mirror backlog, and ring utilization.
+- `archive_state()` / `upload_state()` / `memory_state()` — check durability errors, S3 upload backlog, and ring utilization.
 - `get_newest_row_number()` / `get_durable_row_number()` — the number of the last row committed, and of the newest row that is safe in a file. A program that must acknowledge its input only when the row is safe compares the two.
 - `reason` / `is_connected()` — check a reader's connection state in plain words.
 
@@ -156,7 +156,7 @@ The rule: the two languages have the same concepts, the same words and the same 
 | Rows kept in memory | `memory=sp.MemoryOptions(rows=n)` | `Memory: &MemoryOptions{Rows: n}` |
 | Parquet options | `parquet=sp.ParquetOptions(...)`; `None` = no files | `StreamOptions.Parquet *ParquetOptions`; `nil` = no files |
 | Where the files go | the store, through the spool for S3 | the same |
-| The spool | `spool=` (a directory; `None` = no spool); `ParquetOptions(ship_seconds=)` | `Spool:`, `NoSpool:`; `ParquetOptions{ShipSeconds:}` |
+| The spool | `spool=` (a directory; `None` = no spool); `ParquetOptions(upload_seconds=)` | `Spool:`, `NoSpool:`; `ParquetOptions{UploadSeconds:}` |
 | Dated copies of the catalog | `ParquetOptions(catalog_copy_seconds=)`; `None` = none | `ParquetOptions{CatalogCopySeconds:}`; negative = none |
 | Published or internal | `publish=True`; `s.publish()`, `s.unpublish()` | `StreamOptions.Internal`; `s.Publish()`, `s.Unpublish()`, `s.Published()` |
 | Write a row | `row = s.get_mutable_row()`; `row.x = 1.0`; `s.commit()` | `row, err := s.MutableRow(block)`; `row.SetF64(x, 1.0)`; `s.Commit()` |
@@ -165,7 +165,7 @@ The rule: the two languages have the same concepts, the same words and the same 
 | Packed binary frames | `s.wire_map(entries)`; `s.from_wire(m, frame)` | `s.WireMap(entries)`; `row.FromWire(m, frame)` |
 | End the file, begin the next | `s.cut(label)` | `s.Cut()`; `s.CutLabel(label)` |
 | Parquet on and off | `s.start_parquet(label, options)`; `s.stop_parquet()` | `s.StartParquet(label, options)`; `s.StopParquet()` |
-| The state of the files, the mirror and memory | `s.archive_state()`; `s.mirror_state()`; `s.memory_state()` | `s.ArchiveState()`; `s.MirrorState()`; `s.MemoryState()` |
+| The state of the files, the upload and memory | `s.archive_state()`; `s.upload_state()`; `s.memory_state()` | `s.ArchiveState()`; `s.UploadState()`; `s.MemoryState()` |
 | The last row committed, and the newest row safe in a file | `s.get_newest_row_number()`; `s.get_durable_row_number()` | `s.NewestRowNumber()`; `s.DurableRowNumber()` |
 | Read a stream | `a = sp.connect(name, store=...)` | `a, err := streaming.Connect(name, ConnectOptions{...})` |
 | A reader that writes files of its own | `parquet_store=`, `parquet=`; then `a.start_parquet`, `a.stop_parquet`, `a.cut`, `a.archive_state`, `a.get_durable_row_number` | `ParquetStore:`, `Parquet:`; then `a.StartParquet`, `a.StopParquet`, `a.Cut`, `a.CutLabel`, `a.ArchiveState`, `a.DurableRowNumber` |
@@ -186,7 +186,7 @@ The same in both, because one C core decides it:
 - **A reader's rules**: wait for a writer, refuse a path whose folder does not exist, say why it is not streaming.
 - **The catalog**: `catalog.sqlite`, written by the same C code from either language, and when a dated copy of it is due.
 - **Checkpoint versions**: their names, and when a replaced one is deleted with the objects only it named.
-- **The mirror from a spool to a bucket**: what is sent, in which order, what is deleted, the steps that end a file, and what a start does with a file an earlier run left.
+- **The upload from a spool to a bucket**: what is sent, in which order, what is deleted, the steps that end a file, and what a start does with a file an earlier run left.
 - **Defaults**: a row group of 122,880 rows, a ring of two row groups, zstd level 9, a file cut at 256 MB.
 - **File formats**: a Python reader reads a Go writer's stream and the reverse; the test suite runs each against the other.
 
@@ -206,7 +206,7 @@ Three cores in C11 hold the rules, and each header is its specification:
 | Core | Header | What it decides |
 |---|---|---|
 | The ring | `src/core/arrow_ring.h` | Rows in memory: slots, commits, pins, record sets as Arrow. |
-| The checkpoint format | `src/core/pqc.h` | The bytes of a checkpoint and of the objects of an open file; checkpoint versions; the mirror of a file from a local copy to a remote one; the assembly of a finished file from its checkpoint (which version, the checks, the order of the deletes); the parts of a multipart assembly in a bucket. |
+| The checkpoint format | `src/core/pqc.h` | The bytes of a checkpoint and of the objects of an open file; checkpoint versions; the upload of a file from a local copy to a remote one; the assembly of a finished file from its checkpoint (which version, the checks, the order of the deletes); the parts of a multipart assembly in a bucket. |
 | The stream's rules | `src/core/sp.h` | The ticket, ownership, when a write is due, what the store holds, a reader's and a view's rules, the catalog. |
 
 A core does no input and no output, calls no function of its host, and never waits. A call returns a status; the reason for a failure and the lines for the host's log come back in a `Report` the caller passed ([`src/core/report.h`](src/core/report.h)). The host (Python, Go, the DuckDB extension) does the files, the network, the waiting and the logging. A test reads the three headers and holds them to this rule (`tests/core/run_header_tests.py`).

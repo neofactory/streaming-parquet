@@ -29,7 +29,7 @@ CORE = os.path.join(REPO, "src", "core")
 
 #: header -> the prefixes of the functions it declares
 HEADERS = {"arrow_ring.h": ("ar_",), "pqc.h": ("pqc_",), "sp.h": ("sp_",)}
-SOURCES = ("arrow_ring.c", "pqc.c", "pqc_mirror.c", "sp.c", "sp_catalog.c")
+SOURCES = ("arrow_ring.c", "pqc.c", "pqc_upload.c", "sp.c", "sp_catalog.c")
 
 #: Functions that return `int` and take no Report: each answers a
 #: question about a value the object holds, and cannot fail. A new one
@@ -39,7 +39,7 @@ INT_WITHOUT_REPORT = {
     "pqc_reader_chunk": "reads the idx-th entry; -1 past the last",
     "pqc_ckpt_object_parse": "a yes or no, with the parts of the name",
     "pqc_versions_names": "a yes or no",
-    "pqc_mirror_shipped": "1 and the values, or 0 for none",
+    "pqc_upload_version": "1 and the values, or 0 for none",
     "pqc_finish_source": "1 and the values, or 0 past the last",
     "pqc_sweep_local": "what to do with a file",
     "pqc_sweep_remote": "what to do with a file",
