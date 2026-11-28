@@ -4,12 +4,43 @@
  * catalog's bytes and each file's footer, and stores the bytes it gets
  * back. SQLite works in memory alone (temp_store is memory too), so it
  * opens no file. */
+
+/* SQLite is part of this file: sqlite3.inc is SQLite's own single-file
+ * source (sqlite3.c of the version it names, unchanged), compiled here
+ * with every one of its names private to this file. So the core needs
+ * no SQLite on the system, does not depend on the system's version, and
+ * shares nothing with another SQLite in the same process (Python's
+ * sqlite3 module, DuckDB's). To take a newer SQLite: replace
+ * sqlite3.inc with the sqlite3.c of its amalgamation. It comes before
+ * every other header: SQLite sets the system's feature macros itself. */
+#define SQLITE_API static
+#define SQLITE_OMIT_LOAD_EXTENSION 1    /* no dlopen */
+#define SQLITE_OMIT_DEPRECATED 1
+#define SQLITE_OMIT_SHARED_CACHE 1
+#define SQLITE_DEFAULT_MEMSTATUS 0
+#if defined(__GNUC__) || defined(__clang__)
+/* SQLite declares calls it does not define here. gcc says so at the
+ * end of the file, so this one is off for the whole file. */
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
+#pragma GCC diagnostic ignored "-Wcast-function-type"
+#endif
+#include "sqlite3.inc"
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
 #include "sp.h"
 
 double sp__wall(void);          /* sp.c: the core's clock */
 
 #include <math.h>
-#include <sqlite3.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>

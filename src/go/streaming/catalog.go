@@ -6,8 +6,8 @@ package streaming
 // and writes, the same way the Python host does (_catalog.py).
 //
 // sp_catalog.c is a CHECKED-IN COPY of ../../core/sp_catalog.c, as
-// sp_core.c is of sp.c. It needs the system's SQLite library and header
-// (Ubuntu: libsqlite3-dev).
+// sp_core.c is of sp.c. SQLite's own source is compiled inside it
+// (sqlite3.inc, a copy too): no SQLite of the system is used.
 //
 // A pass brings the catalog's bytes from the store, lists the stream's
 // finished files, reads the footer of each file the catalog lacks,
@@ -26,7 +26,6 @@ package streaming
 // published, and the next start's pass does the work.
 
 /*
-#cgo LDFLAGS: -lsqlite3
 #include <stdlib.h>
 #include "sp.h"
 */

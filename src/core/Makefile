@@ -17,6 +17,7 @@ SAN = -std=c11 -g -O1 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame
 # sets the same define for its Linux builds (#cgo linux CFLAGS).
 ifeq ($(shell uname -s),Linux)
 CFLAGS += -D_POSIX_C_SOURCE=200809L
+SAN += -D_POSIX_C_SOURCE=200809L
 endif
 OUT ?= .
 
@@ -33,10 +34,11 @@ $(OUT)/libarrow_ring.dylib: arrow_ring.c arrow_ring.h report.h
 $(OUT)/libpqc.dylib: pqc.c pqc_upload.c pqc.h report.h
 	$(CC) $(CFLAGS) -shared -o $@ pqc.c pqc_upload.c
 
-# The catalog (sp_catalog.c) is a SQLite database: the system's SQLite
-# library and its header (Ubuntu: libsqlite3-dev).
-$(OUT)/libsp.dylib: sp.c sp_catalog.c sp.h report.h
-	$(CC) $(CFLAGS) -shared -o $@ sp.c sp_catalog.c -lm -lsqlite3
+# The catalog (sp_catalog.c) is a SQLite database. SQLite's source
+# (sqlite3.inc) is compiled inside sp_catalog.c: no SQLite of the system
+# is used.
+$(OUT)/libsp.dylib: sp.c sp_catalog.c sqlite3.inc sp.h report.h
+	$(CC) $(CFLAGS) -shared -o $@ sp.c sp_catalog.c -lm -lpthread
 
 # ---- AddressSanitizer + UBSan runs (pure C, no Python in the loop) ----
 san: san-arrow_ring san-pqc san-sp
@@ -49,8 +51,8 @@ san-pqc: pqc.c pqc_upload.c pqc.h report.h pqc_test_calls.h pqc_san_test.c
 	$(CC) $(SAN) -o pqc_san_test_bin pqc.c pqc_upload.c pqc_san_test.c
 	./pqc_san_test_bin
 
-san-sp: sp.c sp_catalog.c sp.h report.h sp_test_calls.h sp_san_test.c
-	$(CC) $(SAN) -o sp_san_test_bin sp.c sp_catalog.c sp_san_test.c -lm -lsqlite3
+san-sp: sp.c sp_catalog.c sqlite3.inc sp.h report.h sp_test_calls.h sp_san_test.c
+	$(CC) $(SAN) -o sp_san_test_bin sp.c sp_catalog.c sp_san_test.c -lm -lpthread
 	./sp_san_test_bin
 
 # macOS leak check (LeakSanitizer is unavailable on Apple clang)
@@ -72,8 +74,8 @@ fuzz-pqc: pqc.c pqc_upload.c pqc.h report.h pqc_test_calls.h pqc_fuzz.c
 
 # sp's ticket reader takes text from the store, and its catalog takes
 # parquet footers: real tickets and footers (sp_corpus/), mutated.
-fuzz-sp: sp.c sp_catalog.c sp.h report.h sp_test_calls.h sp_fuzz.c
-	$(CC) $(SAN) -o sp_fuzz_bin sp.c sp_catalog.c sp_fuzz.c -lm -lsqlite3
+fuzz-sp: sp.c sp_catalog.c sqlite3.inc sp.h report.h sp_test_calls.h sp_fuzz.c
+	$(CC) $(SAN) -o sp_fuzz_bin sp.c sp_catalog.c sp_fuzz.c -lm -lpthread
 	./sp_fuzz_bin $${FUZZ_ITERS:-300000} sp_corpus/flat.footer sp_corpus/nested.footer
 
 # libFuzzer harnesses for pqc's parsers (clang only).

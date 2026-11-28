@@ -12,6 +12,7 @@ package streaming
 
 /*
 #cgo CFLAGS: -std=c11 -O2
+#cgo linux CFLAGS: -D_POSIX_C_SOURCE=200809L
 #cgo LDFLAGS: -lm
 #include <stdlib.h>
 #include "sp.h"

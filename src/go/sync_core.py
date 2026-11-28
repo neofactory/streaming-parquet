@@ -26,6 +26,7 @@ COPIES = [
     ("pqc.h", "pqc/pqc.h"),
     ("sp.c", "streaming/sp_core.c"),
     ("sp_catalog.c", "streaming/sp_catalog.c"),
+    ("sqlite3.inc", "streaming/sqlite3.inc"),
     ("sp.h", "streaming/sp.h"),
     ("report.h", "ring/report.h"),
     ("report.h", "pqc/report.h"),

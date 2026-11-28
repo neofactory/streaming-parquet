@@ -230,7 +230,7 @@ dependencies = ["streaming-parquet[duckdb]"]
 streaming-parquet = { path = "../streaming-parquet", editable = true }
 ```
 
-The packages load the C cores as libraries. `pip install` builds them with `make` and the system C compiler. The stream core also needs the SQLite library and header (on Ubuntu, `libsqlite3-dev`). In a checkout or an editable install, each package builds its library from `src/core/` into its own directory the first time it is imported, so that directory must be writable.
+The packages load the C cores as libraries. `pip install` builds them with `make` and the system C compiler. SQLite's source is part of the stream core (`src/core/sqlite3.inc`, compiled inside the catalog core), so no SQLite of the system is needed or used. In a checkout or an editable install, each package builds its library from `src/core/` into its own directory the first time it is imported, so that directory must be writable.
 
 Go: module `github.com/neofactory/streaming-parquet/src/go`, packages `ring`, `pqc` and `streaming`, built with cgo over checked-in copies of the same cores.
 
